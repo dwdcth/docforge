@@ -9,6 +9,18 @@
 //! - 防误判：确认边界 <2 且无强类型 → 整篇不分章；首边界出现在正文 60%
 //!   之后 → 视为误判放弃（正文里偶然的编号行）。
 //!
+//! 小节层级（章内结构增强）：章内再识别三类小节标题，产 level 2/3 结构
+//! 标记——`1.1` / `1.1.1` 阿拉伯点分层级（2 层 → level 2，3 层 → level 3）、
+//! `一、` 中文数字 + 顿号（level 2）、`（一）` 括号中文数字（level 3）。
+//! 小节是**弱类型**且**不是章边界**：不切段，只作为 body 内的行级标注
+//! （`Section::subheadings`）随章返回。弱类型的确认依据：
+//! - 技术文档与列表里 `1.1`、`一、` 太常见（步骤列举、时间线、小数/版本号
+//!   等正文形态），单个小节行不足以断言结构——沿用骨架的弱类型语义，
+//!   须相邻候选兼容确认（同类互证；`一、` 与 `（一）` 是中文文档经典的
+//!   大小节配对，互为兼容）；
+//! - 防误判加固：编号后必须跟非空标题文本（"1.1" 裸编号、"（一）" 裸括号
+//!   都不作小节）；点分层级 ≥2 才是小节，单数字点号 `1.` 仍是章级 Numbered。
+//!
 //! TXT 没有可靠结构，任何短行都不该被激进地认作标题——宁可不切。
 
 /// 一个确认的章边界：标题文本 + 行索引（0 起）。
@@ -16,6 +28,33 @@
 pub struct ChapterBoundary {
     pub title: String,
     pub line_index: usize,
+}
+
+/// 标题：文本 + 层级（1 = 章级边界；2/3 = 章内小节）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Heading {
+    pub title: String,
+    pub level: u8,
+}
+
+/// 章内小节标记：不切段，只作 body 内的行级结构标注。
+/// `line_index` 为全文行号（与 [`Section::body`] 同一坐标系）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subheading {
+    pub line_index: usize,
+    pub level: u8,
+    pub title: String,
+}
+
+/// 切分结果单元：章标题（`None` = 首个边界前的前言 / 无章文档的整篇）+
+/// 正文行区间 + 章内小节标记。正文区间为行的迭代边界
+/// （`lines[start..end]`）；章标题行不在区间内，小节行仍在区间内——
+/// 由 `subheadings` 标注行号，消费方（text.rs 的 parse）自行剥离。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    pub heading: Option<Heading>,
+    pub body: std::ops::Range<usize>,
+    pub subheadings: Vec<Subheading>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,52 +65,88 @@ enum HeadingKind {
     Part,
     /// 罗马数字编号：弱
     Roman,
-    /// 阿拉伯编号：弱
+    /// 阿拉伯编号（单层点号 `1.`）：弱
     Numbered,
+}
+
+/// 小节编号类型：弱类型确认时按"同类互证"分组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubKind {
+    /// `1.1` / `1.1.1` 阿拉伯点分层级
+    Dotted,
+    /// `一、` 中文数字 + 顿号
+    Dun,
+    /// `（一）` 括号中文数字
+    Paren,
 }
 
 /// 标题行长度上限（字符数）：超过则更可能是正文而非标题。
 const MAX_TITLE_CHARS: usize = 40;
 /// 首边界允许的最晚位置（占全文行数比例）：晚于此视为误判。
 const FIRST_BOUNDARY_MAX_RATIO: f64 = 0.6;
+/// 小节用中文数字字符集（1-3 位组合，如 十一 / 二十三）。
+const CHINESE_NUMERALS: &str = "一二三四五六七八九十";
 
-/// 把 TXT 全文切分为章节。返回 `(标题, 正文行区间)` 列表；无确认边界时
-/// 返回单个 `(None, 全文)`。
-///
-/// 返回的正文区间为行的迭代边界（`lines[start..end]`），标题行不在正文中。
-pub fn split_chapters(text: &str) -> Vec<(Option<String>, std::ops::Range<usize>)> {
+/// 把 TXT 切分为章级 [`Section`] 列表：章边界切段（heading = level 1），
+/// 章内小节（level 2/3）不切段，作为 `subheadings` 行级标注随章返回；
+/// 无确认边界时返回单个 `heading = None` 的全文 Section。
+pub fn split_chapters(text: &str) -> Vec<Section> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return Vec::new();
     }
     let boundaries = confirmed_boundaries(&lines);
     if boundaries.is_empty() {
-        return vec![(None, 0..lines.len())];
+        return vec![Section {
+            heading: None,
+            body: 0..lines.len(),
+            subheadings: confirmed_subheadings(&lines, 0),
+        }];
     }
-    let mut out = Vec::with_capacity(boundaries.len() + 1);
+    let mut out: Vec<Section> = Vec::with_capacity(boundaries.len() + 1);
     // 首个边界之前的正文（若非空）
     if boundaries[0].line_index > 0 {
-        out.push((None, 0..boundaries[0].line_index));
+        let body = 0..boundaries[0].line_index;
+        let subs = confirmed_subheadings(&lines[body.clone()], 0);
+        out.push(Section { heading: None, body, subheadings: subs });
     }
     for (i, b) in boundaries.iter().enumerate() {
         let start = b.line_index + 1; // 跳过标题行
         let end = boundaries.get(i + 1).map(|n| n.line_index).unwrap_or(lines.len());
-        out.push((Some(b.title.clone()), start..end));
+        if start >= end {
+            continue; // 空正文章丢弃
+        }
+        let subs = confirmed_subheadings(&lines[start..end], start);
+        out.push(Section {
+            heading: Some(Heading { title: b.title.clone(), level: 1 }),
+            body: start..end,
+            subheadings: subs,
+        });
     }
-    // 空正文章丢弃；全部为空（如只有标题行）时退回整篇不分章
-    out.retain(|(_, range)| range.start < range.end);
+    // 全部为空（如只有标题行）时退回整篇不分章
     if out.is_empty() {
-        return vec![(None, 0..lines.len())];
+        return vec![Section {
+            heading: None,
+            body: 0..lines.len(),
+            subheadings: confirmed_subheadings(&lines, 0),
+        }];
     }
     out
 }
 
-/// 候选行分类：返回 (规范化标题, 类型)。
-fn classify_line(raw: &str) -> Option<(String, HeadingKind)> {
+/// 标题行预处理：去首尾空白与 BOM；空行或超长（> [`MAX_TITLE_CHARS`]）→ None。
+fn normalize_title_line(raw: &str) -> Option<&str> {
     let s = raw.trim().trim_matches('\u{FEFF}').trim();
     if s.is_empty() || s.chars().count() > MAX_TITLE_CHARS {
-        return None;
+        None
+    } else {
+        Some(s)
     }
+}
+
+/// 候选行分类：返回 (规范化标题, 类型)。
+fn classify_line(raw: &str) -> Option<(String, HeadingKind)> {
+    let s = normalize_title_line(raw)?;
     // 中文特殊词（序言类）：整行即标题
     const SPECIALS: [&str; 11] = [
         "序章", "序言", "序幕", "楔子", "引子", "番外", "后记", "尾声", "终章", "附录", "前言",
@@ -116,18 +191,96 @@ fn classify_line(raw: &str) -> Option<(String, HeadingKind)> {
             return Some((s.to_string(), HeadingKind::Roman));
         }
     }
-    // 阿拉伯 1. / 1、/ 1 标题
+    // 阿拉伯 1. / 1、/ 1．（章级弱候选）。分隔符后仍是数字（"1.1"）说明是
+    // 点分层级 ≥2 的小节编号，归小节体系（classify_subsection），不在此列。
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() && digits.len() <= 3 {
-        let after: String = s.chars().skip(digits.len()).take(2).collect();
-        if after.starts_with('.') || after.starts_with('、') || after.starts_with('．') {
-            let title_tail = s.chars().skip(digits.len()).collect::<String>();
-            // "12." 裸编号也接受为候选（弱类型需邻居确认）
-            let _ = title_tail;
-            return Some((s.to_string(), HeadingKind::Numbered));
+        let sep = s.chars().nth(digits.len());
+        if matches!(sep, Some('.') | Some('、') | Some('．')) {
+            let after_sep = s.chars().nth(digits.len() + 1);
+            if !after_sep.is_some_and(|c| c.is_ascii_digit()) {
+                return Some((s.to_string(), HeadingKind::Numbered));
+            }
         }
     }
     None
+}
+
+/// 小节候选分类（弱类型）：返回 (规范化标题, 层级, 类型)。
+/// 只认"编号 + 非空标题文本"的行——裸编号（"1.1" / "（一）"）不作小节。
+fn classify_subsection(raw: &str) -> Option<(String, u8, SubKind)> {
+    let s = normalize_title_line(raw)?;
+    // 1) 阿拉伯点分层级 `1.1` / `1.1.1`：每层 1-3 位数字、最多 3 层，
+    //    点分层级即标题级别（2 层 → level 2，3 层 → level 3）
+    if let Some((level, rest)) = dotted_depth(s) {
+        let title = rest.trim_start_matches([' ', '\u{3000}']).trim();
+        if !title.is_empty() {
+            return Some((s.to_string(), level, SubKind::Dotted));
+        }
+        return None;
+    }
+    // 2) 中文数字（1-3 位）+ 顿号 `一、标题` → level 2
+    let numeral: String = s.chars().take_while(|c| CHINESE_NUMERALS.contains(*c)).collect();
+    let n = numeral.chars().count();
+    if (1..=3).contains(&n) {
+        if let Some(title) = s[numeral.len()..].strip_prefix('、') {
+            if !title.trim().is_empty() {
+                return Some((s.to_string(), 2, SubKind::Dun));
+            }
+        }
+    }
+    // 3) 括号中文数字 `（一）标题` → level 3（全角为主，兼容半角括号）
+    for (open, close) in [('（', '）'), ('(', ')')] {
+        if let Some(rest) = s.strip_prefix(open) {
+            let inner: String =
+                rest.chars().take_while(|c| CHINESE_NUMERALS.contains(*c)).collect();
+            let m = inner.chars().count();
+            if (1..=3).contains(&m) {
+                if let Some(title) = rest[inner.len()..].strip_prefix(close) {
+                    if !title.trim().is_empty() {
+                        return Some((s.to_string(), 3, SubKind::Paren));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析行首点分数字编号：返回 (层级, 编号后的剩余文本)。
+/// 每层 1-3 位数字、最多 3 层；层级 <2（单层点号 `1.`）返回 None——
+/// 那是章级 Numbered 的领地，不算点分小节。
+fn dotted_depth(s: &str) -> Option<(u8, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0u8;
+    let mut idx = 0usize;
+    loop {
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() && idx - start < 3 {
+            idx += 1;
+        }
+        if idx == start {
+            return None; // 这一层没有数字
+        }
+        depth += 1;
+        if depth > 3 {
+            return None; // 超过 3 层
+        }
+        if idx >= bytes.len() {
+            return None; // 编号到行尾：裸编号（"1.1"）无标题文本
+        }
+        if bytes[idx] != b'.' {
+            break; // 点分编号结束
+        }
+        idx += 1;
+    }
+    if idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        return None; // 某层数字超 3 位（"1.1234"）：更像小数/版本号，放弃
+    }
+    if depth < 2 {
+        return None; // 点分层级 ≥2 才是 Subsection
+    }
+    Some((depth, &s[idx..]))
 }
 
 /// 全部候选 → 确认边界（应用强弱与位置规则）。
@@ -184,20 +337,67 @@ fn confirmed_boundaries(lines: &[&str]) -> Vec<ChapterBoundary> {
         .collect()
 }
 
+/// 章内小节扫描：候选 → 相邻兼容确认（弱类型语义，见模块注释）。
+/// `base` 为 `lines[0]` 在全文中的行号，返回值换算回全文坐标系。
+/// 只看前/后候选的兼容性（前后都看，链尾编号同样能确认），无全局阈值——
+/// 小节标记不切段，误判代价远小于章边界，无需"确认数 <2"的整篇放弃规则。
+fn confirmed_subheadings(lines: &[&str], base: usize) -> Vec<Subheading> {
+    let candidates: Vec<(usize, u8, SubKind)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| classify_subsection(l).map(|(_, lv, k)| (i, lv, k)))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // 同类互证：点分与点分、顿号与顿号、括号与括号；顿号与括号是中文
+    // 文档经典的大小节配对（"一、大节" 下挂 "（一）小节"），互为兼容。
+    // 点分与中文数字体系不互证——两套编号并存时误判面更大。
+    let compatible = |a: SubKind, b: SubKind| match (a, b) {
+        (SubKind::Dotted, SubKind::Dotted)
+        | (SubKind::Dun, SubKind::Dun)
+        | (SubKind::Paren, SubKind::Paren)
+        | (SubKind::Dun, SubKind::Paren)
+        | (SubKind::Paren, SubKind::Dun) => true,
+        _ => false,
+    };
+    let mut confirmed = Vec::new();
+    for (idx, &(i, lv, k)) in candidates.iter().enumerate() {
+        let prev_ok = idx > 0
+            && candidates
+                .get(idx - 1)
+                .map(|(_, _, pk)| compatible(k, *pk))
+                .unwrap_or(false);
+        let next_ok = candidates
+            .get(idx + 1)
+            .map(|(_, _, nk)| compatible(k, *nk))
+            .unwrap_or(false);
+        if prev_ok || next_ok {
+            confirmed.push(Subheading {
+                line_index: base + i,
+                level: lv,
+                title: normalize_title_line(lines[i]).map(str::to_string).unwrap_or_default(),
+            });
+        }
+    }
+    confirmed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // 结构改为 Section 后适配：测试只关心 (章标题, 正文拼接)，断言语义不变。
     fn chapters(text: &str) -> Vec<(Option<String>, String)> {
         let lines: Vec<&str> = text.lines().collect();
         split_chapters(text)
             .into_iter()
-            .map(|(t, r)| {
+            .map(|s| {
                 let body = lines
-                    .get(r.start..r.end)
+                    .get(s.body.start..s.body.end)
                     .map(|ls| ls.join("\n"))
                     .unwrap_or_default();
-                (t, body)
+                (s.heading.map(|h| h.title), body)
             })
             .collect()
     }
@@ -274,5 +474,68 @@ mod tests {
         // 正文长行不是标题
         assert!(classify_line("这句话很长，虽然以第字开头第三个人走了，但它是正文而不是标题行。").is_none());
         assert!(classify_line("第二天他去了市场买菜回家做饭。").is_none());
+    }
+
+    #[test]
+    fn subsection_numeric_dotted() {
+        assert_eq!(classify_subsection("1.1 概述").map(|(_, lv, _)| lv), Some(2));
+        assert_eq!(classify_subsection("1.2 安装").map(|(_, lv, _)| lv), Some(2));
+        assert_eq!(classify_subsection("1.1.1 背景").map(|(_, lv, _)| lv), Some(3));
+        // 4 层超限；单层点号是章级 Numbered，不作小节
+        assert!(classify_subsection("1.1.1.1 太深").is_none());
+        assert!(classify_subsection("1. 单层点号").is_none());
+        // 点分层级 ≥2 不再是章级 Numbered 候选（Numbered/Subsection 的分界）
+        assert_eq!(classify_line("1.1 概述"), None);
+        assert_eq!(classify_line("1. 起点").map(|(_, k)| k), Some(HeadingKind::Numbered));
+        // 小节不切段：无章文档整篇一个 Section，小节是行级标记
+        let text = "1.1 概述\n\n说明文字。\n\n1.2 安装\n\n步骤内容。";
+        let secs = split_chapters(text);
+        assert_eq!(secs.len(), 1, "小节不是章边界：{secs:?}");
+        assert!(secs[0].heading.is_none());
+        assert_eq!(
+            secs[0]
+                .subheadings
+                .iter()
+                .map(|s| (s.line_index, s.level))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (4, 2)]
+        );
+    }
+
+    #[test]
+    fn chinese_ordinal_dun() {
+        assert_eq!(classify_subsection("一、绪论").map(|(_, lv, _)| lv), Some(2));
+        assert_eq!(classify_subsection("二十三、附则").map(|(_, lv, _)| lv), Some(2));
+        // 首字不在数字集 / 数字后无顿号：不是小节
+        assert!(classify_subsection("天人、合一").is_none());
+        assert!(classify_subsection("十一和弦").is_none());
+        // 小节不切段：整篇一个 Section，标记在 subheadings（全文行号）
+        let text = "一、绪论\n\n内容甲。\n\n二、方法\n\n内容乙。";
+        let secs = split_chapters(text);
+        assert_eq!(secs.len(), 1);
+        assert_eq!(secs[0].subheadings.len(), 2);
+        assert_eq!(secs[0].subheadings[1].line_index, 4);
+        assert_eq!(secs[0].subheadings[1].title, "二、方法");
+    }
+
+    #[test]
+    fn parenthesized_chinese() {
+        assert_eq!(classify_subsection("（一）研究背景").map(|(_, lv, _)| lv), Some(3));
+        assert_eq!(classify_subsection("（十二）研究方法").map(|(_, lv, _)| lv), Some(3));
+        // 裸括号编号（编号后无标题文本）不作小节
+        assert!(classify_subsection("（一）").is_none());
+    }
+
+    #[test]
+    fn bare_number_not_subsection() {
+        assert!(classify_subsection("1.1").is_none());
+        assert!(classify_subsection("1.1.1").is_none());
+        assert!(classify_subsection("1.1  ").is_none());
+        assert!(classify_subsection("一、").is_none());
+        // 弱类型语义：孤立小节候选无相邻同类佐证，不产出（防列表/版本号误判）
+        let lone = "第一章 部署\n\n1.1 孤立小节\n\n正文内容。";
+        let secs = split_chapters(lone);
+        assert_eq!(secs.len(), 1);
+        assert!(secs[0].subheadings.is_empty(), "{:?}", secs[0].subheadings);
     }
 }

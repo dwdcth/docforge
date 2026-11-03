@@ -1,6 +1,7 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① feature `encoding` 下 decode 增加 GB18030/Big5 回退（M2）；
-// ② parse 集成中文章节切分（chapter.rs，标题产 level=1 item）；
+// ② parse 集成中文章节切分（chapter.rs：章标题产 level=1 item；章内小节
+//    产 level=2/3 item，小节行从段落剥离，按行号回插保序）；
 // ③ assemble 将 level 映射为 Heading 块；④ feature `lang-detect` 下
 // default_process_chain 追加语言检测；⑤ register_defaults 注册 chapter 无需
 // （纯函数模块）。算法骨架另吸收 document-parser（见 chapter.rs 头）。
@@ -107,6 +108,22 @@ pub fn split_paragraphs(text: &str) -> Vec<String> {
     out
 }
 
+/// 段缓冲冲刷为段落 item（与 `split_paragraphs` 的 join/trim/去空语义一致）。
+fn flush_paragraph(buf: &mut Vec<&str>, items: &mut Vec<RawTextItem>) {
+    if buf.is_empty() {
+        return;
+    }
+    let para = buf.join("\n").trim().to_string();
+    buf.clear();
+    if !para.is_empty() {
+        items.push(RawTextItem {
+            text: para,
+            source: BlockSource::Native,
+            ..Default::default()
+        });
+    }
+}
+
 /// 单格式纯文本解析后端（txt）。
 pub struct TextParseCapability {
     pub id: &'static str,
@@ -123,28 +140,45 @@ impl ParseCapability for TextParseCapability {
     fn parse(&self, path: &str) -> Result<RawDoc> {
         let content = read_text(path)?;
         let mut items: Vec<RawTextItem> = Vec::new();
-        for (title, range) in super::chapter::split_chapters(&content) {
-            if let Some(t) = title {
-                // 章标题 → Heading level 1（assemble 映射为 Heading 块）
+        for section in super::chapter::split_chapters(&content) {
+            if let Some(h) = &section.heading {
+                // 章标题 → Heading（level=1；assemble 映射为 Heading 块）
                 items.push(RawTextItem {
-                    text: t,
-                    level: Some(1),
+                    text: h.title.clone(),
+                    level: Some(h.level),
                     source: BlockSource::Native,
                     ..Default::default()
                 });
             }
-            let body: String = content
+            // 章内小节（level 2/3）不切段：小节行从段落文本剥离，按行号
+            // 回插为 Heading item，保持与前后的段落相对顺序。
+            let subs: std::collections::BTreeMap<usize, &super::chapter::Subheading> = section
+                .subheadings
+                .iter()
+                .map(|s| (s.line_index, s))
+                .collect();
+            let mut buf: Vec<&str> = Vec::new();
+            for (i, line) in content
                 .lines()
                 .enumerate()
-                .filter(|(i, _)| range.contains(i))
-                .map(|(_, l)| l)
-                .collect::<Vec<_>>()
-                .join("\n");
-            items.extend(split_paragraphs(&body).into_iter().map(|t| RawTextItem {
-                text: t,
-                source: BlockSource::Native,
-                ..Default::default()
-            }));
+                .skip(section.body.start)
+                .take(section.body.end.saturating_sub(section.body.start))
+            {
+                if let Some(sub) = subs.get(&i) {
+                    flush_paragraph(&mut buf, &mut items);
+                    items.push(RawTextItem {
+                        text: sub.title.clone(),
+                        level: Some(sub.level),
+                        source: BlockSource::Native,
+                        ..Default::default()
+                    });
+                } else if line.trim().is_empty() {
+                    flush_paragraph(&mut buf, &mut items);
+                } else {
+                    buf.push(line);
+                }
+            }
+            flush_paragraph(&mut buf, &mut items);
         }
         Ok(RawDoc {
             pages: vec![RawPage {
@@ -406,6 +440,50 @@ mod m2_tests {
         assert_eq!(blocks[0].content, "第一章 出发");
         assert_eq!(blocks[1].content, "清晨他离开村庄。");
         assert_eq!(blocks[2].content, "第二章 归来");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subsection_inside_chapter_end_to_end() {
+        // 章内小节端到端：章标题 level 1、小节行 level 2 且从段落剥离，
+        // 小节 item 按行号回插，保持与段落的相对顺序
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("m2-txt-sub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("manual.txt");
+        std::fs::write(
+            &p,
+            "第一章 部署\n\n1.1 准备\n\n安装依赖。\n\n1.2 启动\n\n运行服务。\n\n第二章 验收\n\n全部通过。",
+        )
+        .unwrap();
+
+        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt" }
+            .parse(p.to_str().unwrap())
+            .unwrap();
+        let doc = TextPlugin.assemble(&raw);
+        let blocks = &doc.pages[0].blocks;
+        let contents: Vec<&str> = blocks.iter().map(|b| b.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "第一章 部署",
+                "1.1 准备",
+                "安装依赖。",
+                "1.2 启动",
+                "运行服务。",
+                "第二章 验收",
+                "全部通过。",
+            ]
+        );
+        assert_eq!(blocks[0].kind, crate::model::BlockKind::Heading);
+        assert_eq!(blocks[0].level, Some(1));
+        assert_eq!(blocks[1].kind, crate::model::BlockKind::Heading);
+        assert_eq!(blocks[1].level, Some(2));
+        assert_eq!(blocks[2].kind, crate::model::BlockKind::Paragraph);
+        assert_eq!(blocks[3].level, Some(2));
+        assert_eq!(blocks[5].level, Some(1));
+        assert_eq!(blocks[6].kind, crate::model::BlockKind::Paragraph);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
