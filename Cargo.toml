@@ -9,7 +9,7 @@ categories = ["parser-implementations", "text-processing"]
 
 [features]
 default = ["md", "csv", "html", "rtf"]
-md = []
+md = ["dep:pulldown-cmark"]
 csv = []
 html = []
 rtf = []
@@ -64,6 +64,11 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.pulldown-cmark]
+version = "0.13"
+default-features = false
 optional = true
 
 [dependencies.base64]
