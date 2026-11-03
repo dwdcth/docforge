@@ -63,7 +63,8 @@ pub use plugin::{
 pub use registry::{Registry, RegistryError};
 
 /// 便捷解析：默认 Registry 装配（文本族内置 + pdf feature 开启时注册
-/// `PdfOptions::default()`，引擎自动取 `ocr-oar` feature 的全局 oar 实例）。
+/// `PdfOptions::default()`）。发布版不内置 OCR 引擎（git 依赖不上 crates.io），
+/// 引擎一律注入：见 [`ocr::OcrEngine`]。
 ///
 /// 自定义装配（注入引擎/选项/后端）用 [`Registry`] + [`DocumentEngine`]。
 ///

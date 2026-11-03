@@ -13,6 +13,12 @@ categories = ["parser-implementations", "text-processing"]
 # 不进 crate（真件金测在仓库跑，包内优雅 skip）
 exclude = [".claude", "vendor", "docparse-plan.md", "docforge-spec-*.md", "tests/fixtures/chm"]
 
+[lints.rust]
+# ocr-oar：发布版不内置 oar 引擎（git 依赖不能上 crates.io，上游 crates.io
+# 0.1.1 缺 auto-download）——引擎一律走注入式 OcrEngine。src/ocr/oar.rs 与
+# 相关 cfg 分支保留，本地开发时在 Cargo.toml 恢复依赖与 feature 即可编译。
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("ocr-oar"))'] }
+
 [features]
 default = ["md", "csv", "html", "rtf"]
 md = ["dep:pulldown-cmark"]
@@ -30,8 +36,6 @@ lang-detect = ["dep:whatlang"]
 pdf = ["dep:pdf-inspector", "dep:image", "ocr"]
 # OCR 引擎抽象（trait + 类型）
 ocr = ["dep:image"]
-# oar-ocr 默认引擎（重依赖 ort 隔离于此；含 pdf 路由接线）
-ocr-oar = ["ocr", "pdf", "dep:oar-ocr"]
 # DOCX（docparser-office 吸收：zip + quick-xml 流式）
 docx = ["dep:zip", "dep:quick-xml", "dep:md-5", "dep:log"]
 # EPUB（docparser-epub 吸收：spine/OPF + HTML 块化，依赖 html 插件）
@@ -145,12 +149,6 @@ optional = true
 
 [dependencies.mobi]
 version = "0.8"
-optional = true
-
-# oar-ocr 必须 git 版：crates.io 0.1.1 是旧版，没有 auto-download（rumi 实测同款结论）
-[dependencies.oar-ocr]
-git = "https://github.com/GreatV/oar-ocr"
-features = ["auto-download"]
 optional = true
 
 [[example]]
