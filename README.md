@@ -62,6 +62,10 @@ println!("{}", emit::to_markdown(&doc));
 文本族（txt / md / csv / html / rtf / srt 等字幕）随 `default` feature 自带，无需声明；
 报「没有可处理该格式的插件: txt」说明 `default-features` 被裁了，把它加回来即可。
 
+## Roadmap
+
+- 超大文档流式消费：`Document` 目前全量驻留内存，千页 PDF + `keep_raster_pages`（PNG 进 IR）内存压力大——远期考虑消费者回调式或分页迭代 API（懒式管线已先解决算力截停）。
+
 ## 许可
 
 MIT OR Apache-2.0。吸收自 docparser 家族与 document-parser 的源码见
