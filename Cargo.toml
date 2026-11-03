@@ -30,9 +30,14 @@ ocr-oar = ["ocr", "pdf", "dep:oar-ocr"]
 docx = ["dep:zip", "dep:quick-xml", "dep:md-5", "dep:log"]
 # EPUB（docparser-epub 吸收：spine/OPF + HTML 块化，依赖 html 插件）
 epub = ["dep:zip", "dep:quick-xml", "html"]
-# xlsx/pptx：M3 吸收占位（当前空实现，注册块被 cfg 剔除）
-xlsx = []
-pptx = []
+# XLSX/PPTX（docparser-office 吸收；xlsx 含 chrono 日期单元格）
+xlsx = ["dep:chrono", "dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
+pptx = ["dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
+# ODF 家族（docparser-odf 吸收）
+odt = ["dep:quick-xml", "dep:zip"]
+ods = ["dep:quick-xml", "dep:zip"]
+odp = ["dep:quick-xml", "dep:zip"]
+odf = ["odt", "ods", "odp"]
 
 [dependencies.zip]
 version = "9"
@@ -51,6 +56,12 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["std"]
 optional = true
 
 [dependencies.serde]

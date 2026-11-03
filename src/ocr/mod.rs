@@ -7,6 +7,8 @@
 //!
 //! `ocr-oar` feature 提供 oar-ocr 默认实现（[`oar`] 模块）。
 
+pub mod images;
+
 #[cfg(feature = "ocr-oar")]
 pub mod oar;
 

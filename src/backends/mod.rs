@@ -6,5 +6,8 @@
 pub mod office;
 #[cfg(feature = "epub")]
 pub mod epub;
+
+#[cfg(any(feature = "odt", feature = "ods", feature = "odp"))]
+pub mod odf;
 #[cfg(feature = "pdf")]
 pub mod pdf;

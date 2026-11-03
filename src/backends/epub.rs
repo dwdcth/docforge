@@ -785,8 +785,13 @@ impl FormatPlugin for EpubPlugin {
     fn default_parse_chain(&self) -> Vec<&'static str> {
         vec!["epub.read"]
     }
-    fn default_process_chain(&self) -> Vec<&'static str> {
-        vec![]
+        fn default_process_chain(&self) -> Vec<&'static str> {
+        // opt-in 链：能力未注册时 resolve 静默跳过（registry filter_map 语义）
+        #[allow(unused_mut)]
+        let mut chain: Vec<&'static str> = vec!["ocr-images"];
+        #[cfg(feature = "lang-detect")]
+        chain.push("lang-detect");
+        chain
     }
     fn assemble(&self, raw: &RawDoc) -> Document {
         // Document 口径与 Python 一致：单节 chapter 坍缩成一整段文本

@@ -20,7 +20,12 @@ use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, RawDoc, RawPage};
 use crate::registry::Registry;
 
+#[cfg(feature = "docx")]
 pub mod docx;
+#[cfg(feature = "pptx")]
+pub mod pptx;
+#[cfg(feature = "xlsx")]
+pub mod xlsx;
 pub(crate) mod image;
 pub(crate) mod parallel;
 
@@ -233,7 +238,12 @@ impl FormatPlugin for OfficePlugin {
         vec!["office-raw"] // 当前只有 raw 后端；后续可增加 semantic 后端
     }
     fn default_process_chain(&self) -> Vec<&'static str> {
-        vec![]
+        // opt-in 链：能力未注册时 resolve 静默跳过（registry filter_map 语义）
+        #[allow(unused_mut)]
+        let mut chain: Vec<&'static str> = vec!["ocr-images"];
+        #[cfg(feature = "lang-detect")]
+        chain.push("lang-detect");
+        chain
     }
     fn assemble(&self, raw: &RawDoc) -> crate::model::Document {
         assemble(raw, &self.options)

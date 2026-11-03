@@ -858,6 +858,7 @@ dependencies = [
 name = "docforge"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "encoding_rs",
  "image",
  "log",

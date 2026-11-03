@@ -131,14 +131,54 @@ fn cp1252_char(b: u8) -> char {
     }
 }
 
-fn flush(buf: &mut Vec<u8>, pending_high: &mut Option<u32>, out: &mut Vec<String>) -> Result<()> {
+/// 段尾多字节解码（docforge M3）：ansicpg 936/950 的 `\'hh` 字节流在此统一解码。
+#[cfg(feature = "encoding")]
+fn decode_multibyte_tail(buf: &[u8], codepage: Option<i32>) -> Result<String> {
+    let cs = match codepage {
+        Some(936) => encoding_rs::GBK,
+        Some(950) => encoding_rs::BIG5,
+        _ => return Err(DocError::corrupt(
+            "RTF 正文含非法 UTF-8 字节（ansicpg65001 下 \\'hh 序列不完整）",
+        )),
+    };
+    let (s, _, had_err) = cs.decode(buf);
+    if had_err {
+        Err(DocError::corrupt(format!(
+            "RTF {} 字节序列非法（\'hh 不完整）",
+            cs.name()
+        )))
+    } else {
+        Ok(s.into_owned())
+    }
+}
+
+/// 未开 `encoding` feature：936/950 走收集路线后在此给出明确指引。
+#[cfg(not(feature = "encoding"))]
+fn decode_multibyte_tail(_buf: &[u8], codepage: Option<i32>) -> Result<String> {
+    if matches!(codepage, Some(936) | Some(950)) {
+        return Err(DocError::corrupt(
+            "RTF 声明了 GBK/Big5 代码页：需要 docforge 的 `encoding` feature（--features encoding）",
+        ));
+    }
+    Err(DocError::corrupt(
+        "RTF 正文含非法 UTF-8 字节（ansicpg65001 下 \\'hh 序列不完整）",
+    ))
+}
+
+fn flush(
+    buf: &mut Vec<u8>,
+    pending_high: &mut Option<u32>,
+    out: &mut Vec<String>,
+    codepage: Option<i32>,
+) -> Result<()> {
     if pending_high.is_some() {
         push_char(buf, '\u{FFFD}');
         *pending_high = None;
     }
-    let text = std::str::from_utf8(buf).map_err(|_| {
-        DocError::corrupt("RTF 正文含非法 UTF-8 字节（ansicpg65001 下 \\'hh 序列不完整）")
-    })?;
+    let text = match std::str::from_utf8(buf) {
+        Ok(t) => t.to_string(),
+        Err(_) => decode_multibyte_tail(buf, codepage)?,
+    };
     let trimmed = text.trim();
     let paragraph = trimmed.to_string();
     buf.clear();
@@ -257,7 +297,7 @@ pub fn extract_paragraphs(raw: &[u8]) -> Result<Vec<String>> {
 
                 match word.as_str() {
                     "par" | "row" | "sect" => {
-                        flush(&mut buf, &mut pending_high, &mut paragraphs)?;
+                        flush(&mut buf, &mut pending_high, &mut paragraphs, codepage)?;
                     }
                     "line" => buf.push(b'\n'),
                     "tab" | "cell" => buf.push(b'\t'),
@@ -316,7 +356,7 @@ pub fn extract_paragraphs(raw: &[u8]) -> Result<Vec<String>> {
                 }
                 i = j;
                 if skip_from.is_none() {
-                    flush(&mut buf, &mut pending_high, &mut paragraphs)?;
+                    flush(&mut buf, &mut pending_high, &mut paragraphs, codepage)?;
                 }
                 continue;
             }
@@ -339,10 +379,13 @@ pub fn extract_paragraphs(raw: &[u8]) -> Result<Vec<String>> {
                 }
                 let byte = hi * 16 + lo;
                 match codepage {
-                    Some(65001) => buf.push(byte), // UTF-8 字节流，段尾统一校验
+                    // 多字节族：收集原始字节，段尾（flush）统一解码校验。
+                    // 65001 = UTF-8；936/950 = GBK/Big5（docforge M3 补丁，
+                    // feature `encoding` 下支持，否则段尾报错并提示开 feature）
+                    Some(65001) | Some(936) | Some(950) => buf.push(byte),
                     Some(cp) if cp != 1252 => {
                         return Err(DocError::corrupt(format!(
-                            "RTF 声明了不支持的代码页 {cp}（仅支持 1252 / 65001）；请另存为 Unicode RTF"
+                            "RTF 声明了不支持的代码页 {cp}（仅支持 1252 / 65001 / 936 / 950）；请另存为 Unicode RTF"
                         )));
                     }
                     _ => push_char(&mut buf, cp1252_char(byte)),
@@ -399,7 +442,7 @@ pub fn extract_paragraphs(raw: &[u8]) -> Result<Vec<String>> {
         i += 1;
     }
 
-    flush(&mut buf, &mut pending_high, &mut paragraphs)?;
+    flush(&mut buf, &mut pending_high, &mut paragraphs, codepage)?;
     if paragraphs.is_empty() {
         return Err(DocError::corrupt("RTF 未找到任何正文文本"));
     }
@@ -539,10 +582,22 @@ first paragraph\par
 
     #[test]
     fn unsupported_codepage_with_raw_bytes_is_corrupt() {
-        // 声明 936 且正文含非法 UTF-8 字节：宁可报错也不吐乱码
-        let err = extract_paragraphs(br"{\rtf1\ansicpg936 \'d6\'d0\par}").unwrap_err();
+        // 不支持的代码页（1251）：显式 corrupt 而不是吐乱码
+        let err = extract_paragraphs(br"{\rtf1\ansicpg1251 \'e0\'e1\par}").unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
-        assert!(err.to_string().contains("936"));
+        assert!(err.to_string().contains("1251"));
+    }
+
+    /// docforge M3 补丁：ansicpg936（GBK）的 \'hh 字节流在段尾统一解码。
+    #[test]
+    #[cfg(feature = "encoding")]
+    fn gbk_codepage_decodes() {
+        let paras = extract_paragraphs(br"{\rtf1\ansicpg936 \'d6\'d0\'ce\'c4\'d5\'fd\'ce\'c4\par}")
+            .expect("合法 GBK 序列应解码成功");
+        assert_eq!(paras, vec!["中文正文"]);
+        // 非法 GBK 序列（孤立尾字节）：报 corrupt 不吐乱码
+        let err = extract_paragraphs(br"{\rtf1\ansicpg936 \'d6\par}").unwrap_err();
+        assert_eq!(err.code.as_str(), "corrupt");
     }
 
     #[test]
