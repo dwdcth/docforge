@@ -1,42 +1,54 @@
-//! MOBI 后端（Kindle 电子书 / Mobipocket，feature = "mobi"，docparse-plan §7 M5）。
+//! MOBI 后端（Kindle 电子书 / Mobipocket，feature = "mobi"，docparse-plan §7 M5；
+//! azw3/KF8 为用户需求增强轮）。
 //!
-//! 支持面（mobi crate 0.8.0 依源码核实，registry 缓存
-//! `~/.cargo/registry/src/mirrors.ustc.edu.cn-38d0e5eb5da2abae/mobi-0.8.0/`）：
-//! * **支持 MOBI7（含 kindlegen 混合件的 MOBI7 部分）**。API 形态：
-//!   `Mobi::from_path`（src/lib.rs L94-97）打开 → `title()/author()/language()`
+//! 支持面：
+//! * **MOBI7（含 kindlegen 混合件的 MOBI7 部分）走 mobi crate 0.8.0** 依源码
+//!   核实（registry 缓存 `~/.cargo/registry/src/mirrors.ustc.edu.cn-38d0e5eb5da2abae/mobi-0.8.0/`）：
+//!   `Mobi::from_read`（src/lib.rs L94-107）打开 → `title()/author()/language()`
 //!   等元数据访问（L130-177，EXTH 记录 → 缺省回落）→
 //!   `content_as_string_lossy()`（L321-327）按压缩类型（无压缩/PalmDoc/HUFF，
 //!   palmdoch.rs L20-28）解压 readable 记录区间（L216-219，
 //!   `first_content_record..first_non_book_index`）拼出**整篇 HTML**。
-//! * **不支持 azw3/KF8，`formats` 不含 "azw3"**（保守裁定）：
-//!   ① `MobiType` 枚举无 KF8 变体、`format_version`（KF8=8）不公开
-//!   （mobih.rs L22-63 / L153）；② PalmDOC 解压不做逐记录 trailing-entry
-//!   剥离——`extra_record_data_flags`（mobih.rs L317 解析后从未消费），
-//!   记录切分只按 PDB 头 gap 字段统一截断（record.rs L143-167，真实文件
-//!   该字段=0），KF8 记录的尾部标记字节会以垃圾字符混进正文；
-//!   ③ 混合件（MOBI7+KF8 同包）不受影响：readable 区间止于 MOBI7 的
-//!   `first_non_book_index`，KF8 段不参与——翻译场景按 MOBI7 正文降级正确。
-//!   后续若接 KF8，需换带 per-record trailing 剥离的读取器再开 "azw3"。
+//! * **azw3/KF8 走自研解析（子模块 [`kf8`]）**：mobi crate 对 KF8 文件
+//!   **打开不报错但正文是乱码**（`MobiMetadata::from_reader` 对记录 0 无版本
+//!   校验，headers/mod.rs L60-128；KF8 记录是 RESC/SKELETON/fragment 结构且
+//!   每条带 trailing bytes，crate 无对应处理）——比报错更糟，故 azw3 必须
+//!   自研。混合件（MOBI7+KF8 同包）按 **EXTH 121 boundary** 剥离取 KF8 部分
+//!   （翻译场景新格式优先；取舍详见 kf8 模块头）。
+//! * 已知缺陷族（mobi crate）：① `MobiType` 枚举无 KF8 变体、`format_version`
+//!   （KF8=8）不公开（mobih.rs L22-63/L153）；② PalmDOC 解压不做逐记录
+//!   trailing-entry 剥离（`extra_record_data_flags`，mobih.rs L317 解析后从未
+//!   消费）；③ `RawRecords::range` 双重差一（record.rs L88：`end = (b-1).min(len-1)`，
+//!   任何 range 都覆盖不到末条记录，小书会坍缩为空集；真实书籍记录数远大于
+//!   区间边界、不受影响，构造件以尾部哨兵记录绕过）。KF8 支路不依赖该 crate，
+//!   三项缺陷均不受累。
 //!
 //! 数据流（epub.rs 同款"原文整体交插件"模式）：
 //! `MobiRawBackend`（ParseCapability）→ 元数据进 `RawDoc.meta`
-//! （`mobi.title` / `mobi.authors` / `mobi.language`）+ 整篇 HTML 进
-//! `items[0]` → `MobiPlugin`（FormatPlugin）`assemble` 用
-//! `plugins::html::parse_blocks` 块化为单页结构化文档。
+//! （`mobi.title` / `mobi.authors` / `mobi.language`，KF8 与 MOBI7 同键名）
+//! + 整篇 HTML 进 `items[0]` → `MobiPlugin`（FormatPlugin）`assemble` 用
+//!   `plugins::html::parse_blocks` 块化为单页结构化文档。
 //!
-//! 吸收来源：document-parser 0.1.0-alpha.18 的 mobi loader
-//! （vendor/document-parser-0.1.0-alpha.18/src/formats/mobi/loader.rs）仅作
-//! 模式参考——语言规范化口径（枚举 Debug 小写，其 loader.rs L164-174）与
-//! "整篇 HTML 交上层"；其块化用 scraper（html5ever 全家桶，docparse-plan
-//! §2.4 明确不引入），本模块改喂自有 HTML 扫描器。mobi crate（MIT，
-//! crates.io 存档）为直接依赖，feature `time`（chrono）不开。
+//! 吸收/参考来源（合规详情见 kf8 模块头与 THIRD_PARTY_NOTICES.md）：
+//! * document-parser 0.1.0-alpha.18 的 mobi loader（vendor/document-parser-
+//!   0.1.0-alpha.18/src/formats/mobi/loader.rs）仅作模式参考——语言规范化口径
+//!   （枚举 Debug 小写，其 loader.rs L164-174）与"整篇 HTML 交上层"；其块化用
+//!   scraper（html5ever 全家桶，docparse-plan §2.4 明确不引入），本模块改喂
+//!   自有 HTML 扫描器。
+//! * KF8 支路：PalmDoc 解压例程吸收自 ebook-rs 0.18.0（MIT）；记录语义依
+//!   KindleUnpack 家族（GPL-3.0）格式规范参考、独立实现（不吸收代码）。
+//! * mobi crate（MIT，crates.io 存档）为 MOBI7 通路直接依赖，feature `time`
+//!   （chrono）不开。
 //!
-//! DRM：encrypted 是终止码不回退（docparse-plan §6）——PalmDoc 头
-//! encryption 字段或 MOBI 头 drm_offset 任一命中即拒绝，不做解密。
+//! DRM：encrypted 是终止码不回退（docparse-plan §6）——MOBI7：PalmDoc 头
+//! encryption 字段或 MOBI 头 drm_offset 任一命中即拒绝；KF8：同款双判定，
+//! 且已识别为 KF8 后失败不回落 mobi crate（防混合件静默降级）。不做解密。
 //!
 //! 测试件：mobi-0.8.0 存档无 tests/ 目录与 .mobi/.azw3 样例（核实于
-//! registry 缓存），故构造最小 MOBI7 二进制金测（手工编字节，构造法与
-//! mobi-rs 自带 src/book.rs 同源），另留 #[ignore] 真件集成测试位。
+//! registry 缓存），故构造最小 MOBI7/KF8 二进制金测（手工编字节；MOBI7
+//! 构造法与 mobi-rs 自带 src/book.rs 同源，KF8 按 kf8 模块头语义构造，
+//! 含 EXTH 121 boundary、SKEL/FRAG INDX、FDST、multibyte trailing），
+//! 另留 #[ignore] 真件集成测试位。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,6 +61,8 @@ use crate::model::{Document, Page};
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawPage, RawTextItem};
 use crate::plugins::html::parse_blocks;
 use crate::registry::Registry;
+
+mod kf8;
 
 // ── 元数据归一 ──────────────────────────────────────────────────────
 
@@ -105,11 +119,21 @@ impl ParseCapability for MobiRawBackend {
         "mobi.read"
     }
     fn formats(&self) -> &[&str] {
-        // azw3 不在支持面（见模块头裁定）；prc 是 MOBI/PalmDoc 的同构扩展名
-        &["mobi", "prc"]
+        // azw3 走 kf8 自研支路（见模块头）；prc 是 MOBI/PalmDoc 的同构扩展名
+        &["mobi", "prc", "azw3"]
     }
     fn parse(&self, path: &str) -> Result<RawDoc> {
-        let book = Mobi::from_path(path)
+        // 整件读入一次：KF8 侦测与 mobi crate 通路共用同一份字节
+        let bytes =
+            std::fs::read(path).map_err(|e| DocError::corrupt(format!("MOBI 读取失败: {e}")))?;
+        // KF8（azw3）优先：混合件按 EXTH 121 boundary 剥离取 KF8 部分
+        // （翻译场景新格式优先，取舍见模块头与 kf8 模块头）。
+        // Ok(None) = 非 KF8 → 回落 mobi crate 的 MOBI7 通路；
+        // Err = encrypted/corrupt 终止码（已识别 KF8 不再回落）。
+        if let Some(raw) = kf8::try_parse(&bytes)? {
+            return Ok(raw);
+        }
+        let book = Mobi::from_read(std::io::Cursor::new(&bytes))
             .map_err(|e| DocError::corrupt(format!("MOBI 打开失败: {e}")))?;
 
         // 加密件是终止码不回退（docparse-plan §6）：PalmDoc 头 encryption 字段
@@ -172,7 +196,7 @@ impl FormatPlugin for MobiPlugin {
         "mobi"
     }
     fn formats(&self) -> &[&str] {
-        &["mobi", "prc"]
+        &["mobi", "prc", "azw3"]
     }
     fn default_parse_chain(&self) -> Vec<&'static str> {
         vec!["mobi.read"]
@@ -512,12 +536,451 @@ mod tests {
         assert_eq!(err.code.as_str(), "corrupt");
     }
 
-    /// 真实语料金测位：mobi-0.8.0 存档无自带样例（无 tests/ 目录，核实于
-    /// registry 缓存）。人工放入 tests/fixtures/mobi/（.mobi/.prc，注明来源
-    /// 与许可）后运行 `cargo test --features mobi -- --ignored`。逐件断言：
-    /// 打开成功 + 书名非空 + 正文有非空块。
+    // ── KF8/azw3 测试件（手工编字节；语义来源见 kf8 模块头）──
+
+    /// 变长 7 位编码（INDX tag 值）：高位组在前、终止字节高位置 1
+    /// （v=0 → [0x80]）。
+    fn vwi(v: u64, out: &mut Vec<u8>) {
+        let mut groups = Vec::new();
+        let mut x = v;
+        loop {
+            groups.push((x & 0x7F) as u8);
+            x >>= 7;
+            if x == 0 {
+                break;
+            }
+        }
+        // 输出高位组在前（无高位），末字节（最低组）高位置 1 终止
+        for i in (0..groups.len()).rev() {
+            let mut b = groups[i];
+            if i == 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+        }
+    }
+
+    /// KF8 测试件参数。
+    struct Kf8Fixture {
+        /// PalmDoc 头 encryption 字段：0=无 / 2=加密
+        encryption: u16,
+        /// KF8 头 drm_offset：false=0xFFFFFFFF / true=100
+        drm: bool,
+        /// 骨架 HTML（尾部必须含 `</body></html>`，默认插入点在其前）
+        skel: &'static str,
+        /// 片段 HTML（各为一条记录）
+        frags: &'static [&'static str],
+        /// 各片段插入位置（相对骨架起点；None = `</body></html>` 之前）
+        insert_positions: Option<Vec<usize>>,
+        /// 正文记录压缩：false=无压缩 / true=PalmDoc（内容须为 ASCII）
+        palmdoc: bool,
+    }
+
+    impl Kf8Fixture {
+        fn positions(&self) -> Vec<usize> {
+            self.insert_positions.clone().unwrap_or_else(|| {
+                vec![self.skel.len() - "</body></html>".len(); self.frags.len()]
+            })
+        }
+    }
+
+    /// 默认 KF8 件：骨架 h1 + 单片段两段（UTF-8 中文，无压缩）。
+    fn kf8_fixture() -> Kf8Fixture {
+        Kf8Fixture {
+            encryption: 0,
+            drm: false,
+            skel: "<html><head><title>内页标题</title></head><body><h1>第一章 标题</h1></body></html>",
+            frags: &["<p>正文一段。</p><p>正文二段。</p>"],
+            insert_positions: None,
+            palmdoc: false,
+        }
+    }
+
+    /// INDX 主记录：13×u32 头（len=56，count=1）+ TAGX 段（cbc=1）。
+    fn indx_main(tags: &[(u8, u8, u8, u8)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"INDX");
+        be32(56, &mut out); // len（TAGX 在 56）
+        for v in [0u32, 0, 0, 0, 1, 65001, 0, 1, 0, 0, 0, 0] {
+            be32(v, &mut out); // nul1,type,gen,start,count,code,lng,total,ordt,ligt,nligt,nctoc
+        }
+        out.extend_from_slice(b"TAGX");
+        be32(12 + (tags.len() * 4) as u32, &mut out); // first_entry_offset
+        be32(1, &mut out); // control_byte_count
+        for t in tags {
+            out.extend_from_slice(&[t.0, t.1, t.2, t.3]);
+        }
+        out
+    }
+
+    /// INDX 条目记录：条目 = [u8 label 长度][label][控制字节][tag 值...]，
+    /// IDXT 段在头 start 字段偏移（魔数 + u16 条目起点表）。
+    fn indx_entry_rec(entries: &[(String, u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"INDX");
+        for _ in 0..13 {
+            be32(0, &mut out);
+        }
+        let mut body = Vec::new();
+        let mut starts = Vec::new();
+        for (label, cb, values) in entries {
+            starts.push(56 + body.len());
+            body.push(label.len() as u8);
+            body.extend_from_slice(label.as_bytes());
+            body.push(*cb);
+            body.extend_from_slice(values);
+        }
+        let idxt_pos = 56 + body.len();
+        out[4..8].copy_from_slice(&56u32.to_be_bytes());
+        out[20..24].copy_from_slice(&(idxt_pos as u32).to_be_bytes());
+        out[24..28].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(b"IDXT");
+        for s in &starts {
+            be16(*s as u16, &mut out);
+        }
+        out
+    }
+
+    /// FDST 记录：1 组 (0, rawML 长度) → flow 0 = 整个 rawML。
+    fn fdst_record(raw_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FDST");
+        be32(0, &mut out); // 保留位
+        be32(1, &mut out); // 组数
+        be32(0, &mut out); // flow0 起点
+        be32(raw_len as u32, &mut out); // flow0 终点
+        out
+    }
+
+    /// KF8 部分记录序列（相对记录号 0..）：0=KF8 头（header_length 0xF8，
+    /// EXTH 503/100/524），1=骨架（带 multibyte trailing `41 01`，
+    /// extra_flags=0x1），2..=片段，随后 SKEL INDX 主、SKEL 条目、
+    /// FRAG INDX 主、FRAG 条目、FDST。
+    fn build_kf8_records(f: &Kf8Fixture) -> Vec<Vec<u8>> {
+        let skel_content = f.skel.as_bytes();
+        let mut raw_ml: Vec<u8> = skel_content.to_vec();
+        let mut frag_spans = Vec::new(); // 片段在 rawML 中的 (起点, 长度)
+        for fr in f.frags {
+            frag_spans.push((raw_ml.len(), fr.len()));
+            raw_ml.extend_from_slice(fr.as_bytes());
+        }
+        let n_text = (1 + f.frags.len()) as u32; // 骨架 + 片段记录数
+
+        // ── 记录 0：PalmDoc 头 + MOBI 头（header_length 248）+ EXTH + 全名 ──
+        let mut rec0 = Vec::new();
+        be16(if f.palmdoc { 2 } else { 1 }, &mut rec0); // compression
+        be16(0, &mut rec0); // unused
+        be32(raw_ml.len() as u32, &mut rec0); // text_length
+        be16(n_text as u16, &mut rec0); // record_count = rawML 记录数
+        be16(4096, &mut rec0); // record_size
+        be16(f.encryption, &mut rec0); // encryption
+        be16(0, &mut rec0); // unused
+        rec0.extend_from_slice(b"MOBI");
+        be32(248, &mut rec0); // header_length（KF8 = 0xF8；EXTH 在 16+248=264）
+        let mut body = vec![0u8; 240]; // 字段体 [24, 264)
+        body[0..4].copy_from_slice(&2u32.to_be_bytes()); // mobi_type @24
+        body[4..8].copy_from_slice(&65001u32.to_be_bytes()); // text_encoding = UTF-8 @28
+        body[12..16].copy_from_slice(&6u32.to_be_bytes()); // gen_version @36
+        body[56..60].copy_from_slice(&((n_text + 1) as u32).to_be_bytes()); // first_non_book @80
+        body[80..84].copy_from_slice(&8u32.to_be_bytes()); // format_version = 8 @104
+        body[104..108].copy_from_slice(&0x40u32.to_be_bytes()); // exth_flags @128
+        body[144..148].copy_from_slice(&(if f.drm { 100 } else { !0u32 }).to_be_bytes()); // drm_offset @168
+        body[168..172].copy_from_slice(&((n_text + 5) as u32).to_be_bytes()); // fdst 记录号 @192（相对）
+        body[172..176].copy_from_slice(&2u32.to_be_bytes()); // fdst_cnt @196（>1 才采信）
+        body[216..220].copy_from_slice(&1u32.to_be_bytes()); // extra_flags = 0x1（multibyte）@240
+        body[220..224].copy_from_slice(&(!0u32).to_be_bytes()); // first_index @244
+        body[224..228].copy_from_slice(&((n_text + 3) as u32).to_be_bytes()); // frag_idx @248（相对）
+        body[228..232].copy_from_slice(&((n_text + 1) as u32).to_be_bytes()); // skel_idx @252（相对）
+        body[232..236].copy_from_slice(&(!0u32).to_be_bytes()); // guide @256
+        rec0.extend_from_slice(&body);
+
+        // EXTH（KF8 头自带元数据：作者/书名/语言）
+        let mut exth = Vec::new();
+        let mut count = 0u32;
+        let mut put = |ty: u32, data: &[u8]| {
+            be32(ty, &mut exth);
+            be32(8 + data.len() as u32, &mut exth);
+            exth.extend_from_slice(data);
+            count += 1;
+        };
+        put(100, "作者甲; 作者乙".as_bytes()); // Author
+        put(503, "KF8测试书".as_bytes()); // Updated Title
+        put(524, b"zh-cn"); // Language
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"EXTH");
+        be32(12 + exth.len() as u32, &mut hdr);
+        be32(count, &mut hdr);
+        rec0.extend_from_slice(&hdr);
+        rec0.extend_from_slice(&exth);
+        // 4 字节对齐后挂全名（name_offset 相对记录 0 起点 @84，长度 @88）
+        while rec0.len() % 4 != 0 {
+            rec0.push(0);
+        }
+        let name_offset = rec0.len() as u32;
+        rec0.extend_from_slice(b"kf8book");
+        rec0[84..88].copy_from_slice(&name_offset.to_be_bytes());
+        rec0[88..92].copy_from_slice(&7u32.to_be_bytes());
+
+        // ── 正文记录：骨架（multibyte trailing）+ 片段 ──
+        let mut recs = vec![rec0];
+        let mut skel_rec = skel_content.to_vec();
+        skel_rec.extend_from_slice(b"A\x01"); // multibyte trailing：末字节 0x01 → 剥 2 字节
+        recs.push(skel_rec);
+        // 片段记录同样带 multibyte trailing（extra_flags=0x1 对所有正文
+        // 记录生效，解析端逐记录剥离）
+        for fr in f.frags {
+            let mut rec = fr.as_bytes().to_vec();
+            rec.extend_from_slice(b"A\x01");
+            recs.push(rec);
+        }
+
+        // ── SKEL INDX：tag1 = 片段个数，tag6 = [起点 0, 骨架长度] ──
+        // TAGX：数据 tag endFlag=0；末位 tag0 = 控制字节边界标记（endFlag=1）
+        recs.push(indx_main(&[(1, 1, 0x02, 0x00), (6, 2, 0x04, 0x00), (0, 0, 0x08, 0x01)]));
+        let mut skel_vals = Vec::new();
+        vwi(1, &mut skel_vals); // fragment 个数
+        vwi(0, &mut skel_vals); // 骨架起点
+        vwi(skel_content.len() as u64, &mut skel_vals); // 骨架长度
+        recs.push(indx_entry_rec(&[("part00000".to_string(), 0x06, skel_vals)]));
+
+        // ── FRAG INDX：label = 十进制插入位置，tag3/4 = 文件号/序号，
+        //    tag6 = [rawML 起点, 长度]，tag2 = ctoc 偏移（解析端不消费）──
+        recs.push(indx_main(&[
+            (3, 1, 0x02, 0x00),
+            (4, 1, 0x04, 0x00),
+            (6, 2, 0x08, 0x00),
+            (2, 1, 0x10, 0x00),
+            (0, 0, 0x20, 0x01),
+        ]));
+        let positions = f.positions();
+        let frag_entries: Vec<(String, u8, Vec<u8>)> = f
+            .frags
+            .iter()
+            .enumerate()
+            .map(|(j, _)| {
+                let mut v = Vec::new();
+                vwi(0, &mut v); // 文件号
+                vwi(j as u64, &mut v); // 序号
+                vwi(frag_spans[j].0 as u64, &mut v); // rawML 起点
+                vwi(frag_spans[j].1 as u64, &mut v); // 长度
+                vwi(0, &mut v); // ctoc 偏移
+                (positions[j].to_string(), 0x1E, v)
+            })
+            .collect();
+        recs.push(indx_entry_rec(&frag_entries));
+
+        // ── FDST ──
+        recs.push(fdst_record(raw_ml.len()));
+        recs
+    }
+
+    /// PDB 容器装配：78B 头 + 记录表 + 2B gap + 记录体。
+    fn assemble_pdb(pdb_name: &str, recs: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut name = pdb_name.as_bytes().to_vec();
+        name.resize(32, 0);
+        out.extend_from_slice(&name);
+        be16(0, &mut out); // attributes
+        be16(0, &mut out); // version
+        be32(0, &mut out); // created
+        be32(0, &mut out); // modified
+        be32(0, &mut out); // backup
+        be32(0, &mut out); // modnum
+        be32(0, &mut out); // app_info_id
+        be32(0, &mut out); // sort_info_id
+        out.extend_from_slice(b"BOOK"); // type
+        out.extend_from_slice(b"MOBI"); // creator
+        be32(2, &mut out); // unique_id_seed
+        be32(0, &mut out); // next_record_list_id
+        be16(recs.len() as u16, &mut out); // num_records
+        let rec0_off = (out.len() + recs.len() * 8 + 2) as u32;
+        let mut off = rec0_off;
+        for (i, r) in recs.iter().enumerate() {
+            be32(off, &mut out);
+            be32(i as u32, &mut out);
+            off += r.len() as u32;
+        }
+        be16(0, &mut out); // gap
+        debug_assert_eq!(out.len() as u32, rec0_off);
+        for r in &recs {
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    fn write_fixture(dir_name: &str, file_name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mobi-{dir_name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// 纯 KF8 件（.azw3，无 EXTH 121，format_version=8 → 整文件按 KF8 解析）。
+    fn build_azw3(dir_name: &str, f: &Kf8Fixture) -> PathBuf {
+        write_fixture(dir_name, "book.azw3", &assemble_pdb("kf8book", build_kf8_records(f)))
+    }
+
+    /// 混合件（.mobi）：MOBI7 头（EXTH 121 → KF8 起始记录号）+ 1 条
+    /// MOBI7 正文 + KF8 部分。断言 KF8 部分胜出。
+    fn build_hybrid_mobi(dir_name: &str) -> PathBuf {
+        let kf8_recs = build_kf8_records(&kf8_fixture());
+        let mobi7_html = b"<html><body><p>MOBI7 OLD TEXT</p></body></html>";
+        let boundary = 2u32; // KF8 头从记录 2 开始（rec0 + MOBI7 正文之后）
+
+        let mut rec0 = Vec::new();
+        be16(1, &mut rec0); // compression = 无压缩
+        be16(0, &mut rec0);
+        be32(mobi7_html.len() as u32, &mut rec0);
+        be16(1, &mut rec0); // record_count = 1（MOBI7 正文一条）
+        be16(4096, &mut rec0);
+        be16(0, &mut rec0); // encryption
+        be16(0, &mut rec0);
+        rec0.extend_from_slice(b"MOBI");
+        be32(232, &mut rec0); // header_length（MOBI7 口径）
+        let mut body = vec![0u8; 224];
+        body[0..4].copy_from_slice(&2u32.to_be_bytes()); // mobi_type @24
+        body[4..8].copy_from_slice(&65001u32.to_be_bytes()); // text_encoding @28
+        body[12..16].copy_from_slice(&6u32.to_be_bytes()); // gen_version @36
+        body[56..60].copy_from_slice(&2u32.to_be_bytes()); // first_non_book @80
+        body[80..84].copy_from_slice(&6u32.to_be_bytes()); // format_version = 6 @104
+        body[104..108].copy_from_slice(&0x40u32.to_be_bytes()); // exth_flags @128
+        body[144..148].copy_from_slice(&(!0u32).to_be_bytes()); // drm_offset @168
+        body[216..220].copy_from_slice(&0u32.to_be_bytes()); // extra_flags @240
+        body[220..224].copy_from_slice(&(!0u32).to_be_bytes()); // first_index @244
+        rec0.extend_from_slice(&body);
+        // EXTH：503 书名 + 121 boundary（KF8 起始记录号）
+        let mut exth = Vec::new();
+        be32(503, &mut exth);
+        be32(8 + "混合书".len() as u32, &mut exth);
+        exth.extend_from_slice("混合书".as_bytes());
+        be32(121, &mut exth);
+        be32(12, &mut exth);
+        exth.extend_from_slice(&boundary.to_be_bytes());
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"EXTH");
+        be32(12 + exth.len() as u32, &mut hdr);
+        be32(2, &mut hdr);
+        rec0.extend_from_slice(&hdr);
+        rec0.extend_from_slice(&exth);
+        while rec0.len() % 4 != 0 {
+            rec0.push(0);
+        }
+
+        let mut recs = vec![rec0, mobi7_html.to_vec()];
+        recs.extend(kf8_recs);
+        write_fixture(dir_name, "hybrid.mobi", &assemble_pdb("hybrid", recs))
+    }
+
+    /// KF8 金测（构造真件走真读取路径）：骨架+片段装配出整篇 HTML，
+    /// 元数据取 KF8 头 EXTH（503/100/524）。
     #[test]
-    #[ignore = "缺 .mobi/.prc 真实语料测试件（放入 tests/fixtures/mobi/ 后运行 --ignored）"]
+    fn reads_azw3_kf8_content_and_metadata() {
+        let p = build_azw3("kf8-full", &kf8_fixture());
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+
+        assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("KF8测试书"));
+        assert_eq!(
+            raw.meta.get("mobi.authors").map(String::as_str),
+            Some("作者甲; 作者乙")
+        );
+        assert_eq!(raw.meta.get("mobi.language").map(String::as_str), Some("zh-cn"));
+        assert_eq!(raw.pages.len(), 1);
+        let html = &raw.pages[0].items[0].text;
+        assert!(html.contains("正文一段。"), "{html}");
+        assert!(html.contains("</body></html>"));
+        assert!(html.starts_with("<html>"));
+        assert!(!raw.needs_ocr);
+    }
+
+    /// azw3 HTML 块化路径：骨架 h1 + 片段两段；元数据透传 meta.extra。
+    #[test]
+    fn assembles_azw3_into_structured_blocks() {
+        let p = build_azw3("kf8-asm", &kf8_fixture());
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let doc = MobiPlugin.assemble(&raw);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert_eq!(doc.pages.len(), 1);
+        let kinds: Vec<BlockKind> = doc.pages[0].blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Heading, BlockKind::Paragraph, BlockKind::Paragraph]
+        );
+        assert_eq!(doc.pages[0].blocks[0].content, "第一章 标题");
+        assert_eq!(doc.pages[0].text, "第一章 标题\n\n正文一段。\n\n正文二段。");
+        assert_eq!(doc.meta.extra.get("mobi.title").map(String::as_str), Some("KF8测试书"));
+        assert_eq!(doc.meta.extra.get("mobi.language").map(String::as_str), Some("zh-cn"));
+    }
+
+    /// 混合件（MOBI7+KF8 同包）：按 EXTH 121 剥离取 KF8 部分
+    /// （翻译场景新格式优先），MOBI7 旧正文不出现。
+    #[test]
+    fn hybrid_mobi_prefers_kf8_part() {
+        let p = build_hybrid_mobi("kf8-hybrid");
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        let html = &raw.pages[0].items[0].text;
+        assert!(html.contains("正文一段。"), "{html}");
+        assert!(!html.contains("MOBI7 OLD TEXT"));
+        assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("KF8测试书"));
+    }
+
+    /// PalmDoc 压缩正文（ASCII 内容走字面量路径）正确解压 + trailing 剥离。
+    #[test]
+    fn reads_palmdoc_compressed_azw3() {
+        let f = Kf8Fixture {
+            skel: "<html><body><h1>Chapter One</h1></body></html>",
+            frags: &["<p>Para one.</p>"],
+            palmdoc: true,
+            ..kf8_fixture()
+        };
+        let p = build_azw3("kf8-palmdoc", &f);
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        let html = &raw.pages[0].items[0].text;
+        assert!(html.contains("<p>Para one.</p>"), "{html}");
+        assert!(!html.contains('\u{0}'), "无残留 trailing 字节");
+    }
+
+    /// KF8 加密件是终止码（encrypted），不回落 MOBI7：encryption 字段与
+    /// drm_offset 两条判定路径分别验证。
+    #[test]
+    fn encrypted_kf8_is_encrypted_error() {
+        let p = build_azw3("kf8-enc", &Kf8Fixture { encryption: 2, ..kf8_fixture() });
+        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert_eq!(err.code.as_str(), "encrypted");
+
+        let p = build_azw3("kf8-drm", &Kf8Fixture { drm: true, ..kf8_fixture() });
+        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert_eq!(err.code.as_str(), "encrypted");
+    }
+
+    /// 垃圾 .azw3：PDB 不可读 → kf8 判非 KF8 → 回落 mobi crate → corrupt。
+    #[test]
+    fn garbage_azw3_is_corrupt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mobi-garbage-azw3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.azw3");
+        std::fs::write(&path, b"definitely not an azw3 document at all........").unwrap();
+        let err = MobiRawBackend.parse(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err.code.as_str(), "corrupt");
+    }
+
+    /// 真实语料金测位：mobi-0.8.0 存档无自带样例（无 tests/ 目录，核实于
+    /// registry 缓存）。人工放入 tests/fixtures/mobi/（.mobi/.prc/.azw3，
+    /// 注明来源与许可）后运行 `cargo test --features mobi -- --ignored`。
+    /// 逐件断言：打开成功 + 书名非空 + 正文有非空块。
+    #[test]
+    #[ignore = "缺 .mobi/.prc/.azw3 真实语料测试件（放入 tests/fixtures/mobi/ 后运行 --ignored）"]
     fn real_corpus_golden() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mobi");
         let entries = std::fs::read_dir(&dir).expect("tests/fixtures/mobi/ 目录应存在");
@@ -525,7 +988,7 @@ mod tests {
         for e in entries.flatten() {
             let path = e.path();
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if !matches!(ext.to_ascii_lowercase().as_str(), "mobi" | "prc") {
+            if !matches!(ext.to_ascii_lowercase().as_str(), "mobi" | "prc" | "azw3") {
                 continue;
             }
             let raw = MobiRawBackend

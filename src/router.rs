@@ -74,7 +74,7 @@ pub fn sniff(path: &str) -> Result<&'static str> {
 
     // MOBI/PalmDOC：PalmDB 容器（BOOKMOBI magic 在 offset 60），按扩展名
     // 直连、头部校验由后端判（加密/DRM 在后端报 encrypted 终止码）
-    if ext == "mobi" || ext == "prc" {
+    if ext == "mobi" || ext == "prc" || ext == "azw3" {
         return Ok("mobi");
     }
 

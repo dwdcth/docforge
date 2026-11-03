@@ -14,7 +14,8 @@ docforge 吸收了下表 crate 的源码（吸收文件头部均有标注）。�
 | docparser-odf | 0.2.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/docparser-odf/docparser-odf-0.2.1.crate | （未吸收；M3 吸收） | 同上 |
 | docparser-sdk | 0.2.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/docparser-sdk/docparser-sdk-0.2.1.crate | （facade，仅架构参考） | 同上 |
 | document-parser | 0.1.0-alpha.18 | MIT OR Apache-2.0 | https://static.crates.io/crates/document-parser/document-parser-0.1.0-alpha.18.crate | TXT 分章算法骨架/EPUB 五件套（M2）、md pulldown 事件映射参考（增强轮）、FB2/DjVu 页级分治模式（M5/M4）、MOBI 参考 | 上游 LiiChar/document-parse 活跃；其 DOCX 因中文内容丢失级缺陷不采（docparse-plan §2.4） |
-| ebook-rs | 0.18.0 | （未吸收代码） | https://static.crates.io/crates/ebook-rs/ebook-rs-0.18.0.crate | 仅设计参考：md frontmatter 元数据思路（增强轮，src/plugins/markdown.rs 头部声明） | 上游活跃；方向为电子书引擎（CFI/LCP/TTS），非同类 |
+| ebook-rs | 0.18.0 | MIT | https://static.crates.io/crates/ebook-rs/ebook-rs-0.18.0.crate | PalmDoc LZ77 解压例程 decompress_palmdoc（azw3 增强，src/backends/mobi/kf8.rs，含 256 MiB 输出上界，原样吸收）；md frontmatter 思路（设计参考） | 其 AZW3/KF8 支持经核实不存在（描述夸大）；方向为电子书引擎，非同类 |
+| mobi（KindleUnpack 家族） | 0.4.1（PyPI；上游 kevinhendricks/KindleUnpack） | GPL-3.0 | https://files.pythonhosted.org/packages/7f/fc/efbab42351ebdd594e23f069934bff882f1c15129f61cbff13d1990243b5/mobi-0.4.1.tar.gz | （未吸收代码）KF8 记录语义参考：EXTH 121 boundary、trailing entry 编码、SKEL/FRAG INDX/TAGX、FDST、skeleton/fragment 装配（azw3，src/backends/mobi/kf8.rs 独立实现） | GPL 一票否决吸收（djvu 0.1.0 先例）；仅格式事实参考，代码零复制 |
 
 其余依赖（serde 及后续 pdf-inspector / oar-ocr / encoding_rs 等）按各自许可
 正常依赖，随 cargo metadata 自动携带。
