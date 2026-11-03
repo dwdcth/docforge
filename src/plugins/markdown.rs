@@ -2,8 +2,9 @@
 // THIRD_PARTY_NOTICES.md）。本版以 pulldown-cmark 0.13 事件流重写（CommonMark +
 // GFM 表格 / 删除线 / 任务列表），事件流→结构映射方式参考 vendor 的
 // document-parser 0.1.0-alpha.18 formats/markdown/loader.rs（同见声明表）。
-// frontmatter 剥离思路取自 ebook-rs 0.18（vendor 存档）：只剥不解，元数据
-// 进 DocMeta 需插件 trait 扩展，列为遗留（见下方模块注释）。
+// frontmatter 剥离思路取自 ebook-rs 0.18（vendor 存档）；本版补上手写键值
+// 解析，title/authors/language 经 FormatPlugin::enrich_meta 后置钩子进
+// DocMeta.extra（原「trait 扩展」遗留项就此清账，见下方模块注释）。
 //! Markdown → 块级 IR：pulldown-cmark 事件流直接映射，不渲染成 HTML 再反推。
 //!
 //! 覆盖 CommonMark + GFM（表格 / 删除线 / 任务列表）。映射规则（与旧手写版
@@ -24,18 +25,19 @@
 //! * 图片：顶层段落内产 `Image` 块（alt/src 进 `meta`，对齐 html.rs 的
 //!   on_img 形态）；列表 / 引用 / 表格内图片拍平为 alt 文本（URL 丢弃）。
 //! * frontmatter（首行 `---` 且 50 行内闭合）解析前剥离，不进正文块与页文本；
-//!   title/authors/language 暂无通道进 `DocMeta.extra`（`FormatPlugin::assemble`
-//!   只返回 `Document`，trait 扩展列为遗留项）。
+//!   title/authors/language 经 `FormatPlugin::enrich_meta` 后置钩子写入
+//!   `DocMeta.extra`（键 `md.title` / `md.authors` / `md.language`）。engine 在
+//!   assemble 与 finalize 之间调钩子；原文仍完整留在 raw 里，钩子独立定位解析，
+//!   与剥离阶段互不依赖、不重复处理正文。
 
 use crate::model::{Block, BlockKind, Document, MetaValue, Page, TableData};
 use crate::plugin::{FormatPlugin, RawDoc};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-/// frontmatter 剥离：首行恰为 `---` 且前 50 行内出现闭合 `---` → 返回其后正文；
-/// 否则原样返回（未闭合的 `---` 按 Rule / setext 交给 pulldown 正常处理）。
-/// 手写 `key: value` 提取（title / authors / language）暂缓：插件 trait 没有
-/// DocMeta 通道，只剥不解（不为此引 yaml 依赖）。
-fn strip_frontmatter(text: &str) -> &str {
+/// frontmatter 定位：首行恰为 `---` 且前 50 行内出现闭合 `---` → 返回
+/// `(元数据区切片, 正文起点字节偏移)`；否则 None（未闭合的 `---` 按 Rule /
+/// setext 交给 pulldown 正常处理）。
+fn frontmatter_span(text: &str) -> Option<(&str, usize)> {
     // 开头必须是一个独立的 `---` 行（容许 CRLF）
     let first_ok = text.starts_with("---")
         && text
@@ -43,23 +45,87 @@ fn strip_frontmatter(text: &str) -> &str {
             .get(3)
             .map_or(text.len() == 3, |b| *b == b'\n' || *b == b'\r');
     if !first_ok {
-        return text;
+        return None;
     }
+    // 元数据区从首行换行符之后开始（恰为三个字节的 `"---"` 时为空区）
+    let meta_start = 3
+        + usize::from(text.as_bytes().get(3) == Some(&b'\r'))
+        + usize::from(text.as_bytes().get(3) == Some(&b'\n'));
     let mut off = 0usize;
     for (idx, line) in text.lines().enumerate() {
         if idx >= 50 {
-            return text; // 50 行内未闭合：不当 frontmatter，原样保留
+            return None; // 50 行内未闭合：不当 frontmatter
         }
         if idx > 0 && line.trim_end() == "---" {
             // 正文从闭合行的换行符之后开始
             let mut end = off + line.len();
             end += usize::from(text.as_bytes().get(end) == Some(&b'\r'));
             end += usize::from(text.as_bytes().get(end) == Some(&b'\n'));
-            return &text[end..];
+            return Some((&text[meta_start..off], end));
         }
-        off += line.len() + 1;
+        // 行推进按实际行尾回填 `\n` / `\r\n`（固定 +1 会在 CRLF 文件上漂移，
+        // 正文切片随之错位）
+        off += line.len();
+        if text.as_bytes().get(off) == Some(&b'\r') {
+            off += 1;
+        }
+        if text.as_bytes().get(off) == Some(&b'\n') {
+            off += 1;
+        }
     }
-    text
+    None
+}
+
+/// frontmatter 剥离：有闭合区则返回其后正文；否则原样返回。
+fn strip_frontmatter(text: &str) -> &str {
+    frontmatter_span(text).map_or(text, |(_, body)| &text[body..])
+}
+
+/// 去掉一层成对包裹引号（`"x"` / `'x'` → `x`；非包裹形态原样返回）。
+fn unquote(value: &str) -> &str {
+    for q in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+/// authors 值 → `"; "` 连接串（对齐 fb2 的 `fb2.authors` 口径）：
+/// `张三, 李四` 逗号列表，或 `[a, b]` / `["a", "b"]` 方括号列表形态；
+/// 条目各自去引号去空白，空条目丢弃。
+fn authors_joined(value: &str) -> String {
+    let v = value.trim();
+    let inner = if v.len() >= 2 && v.starts_with('[') && v.ends_with(']') {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    };
+    inner
+        .split(',')
+        .map(|s| unquote(s.trim()).trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// frontmatter 键值提取（手写 `key: value`，不为此引 yaml 依赖）：
+/// * 键大小写不敏感（归一为小写），键 / 值两侧空白容忍；
+/// * 值去掉一层成对包裹引号；
+/// * 无冒号的行跳过（注释 / 列表项等不在支持形态内）。
+fn parse_frontmatter_kv(meta_region: &str) -> std::collections::BTreeMap<String, String> {
+    let mut kv = std::collections::BTreeMap::new();
+    for line in meta_region.lines() {
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        kv.insert(key, unquote(value.trim()).to_string());
+    }
+    kv
 }
 
 /// 顶层列表累积器：整列表一块，项以 `\n` 连接（对齐旧版逐 run 产出粒度）。
@@ -375,7 +441,8 @@ impl Walker {
 }
 
 /// 解析 Markdown 文本为块序列（frontmatter 在此统一剥离，正文块不含 `---`
-/// 元数据区；调用方拿不到剥出物——DocMeta 通道为遗留项）。
+/// 元数据区；剥出物的键值不经此函数——`MarkdownPlugin::enrich_meta` 从原文
+/// 另行定位解析，写入 `DocMeta.extra`）。
 pub fn parse(text: &str) -> Vec<Block> {
     let body = strip_frontmatter(text);
     let mut options = Options::empty();
@@ -421,6 +488,39 @@ impl FormatPlugin for MarkdownPlugin {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    /// 组装后置钩子：frontmatter 元数据 → `DocMeta.extra`。原文取自 **raw**
+    /// （`assemble` 已把 frontmatter 从正文剥掉，而 `raw.pages[0].items[0].text`
+    /// 仍是原文），这里独立定位解析——两阶段互不依赖、不重复剥离正文。
+    /// frontmatter 不存在或未闭合时不产键；空值键同样不进 extra。
+    fn enrich_meta(&self, raw: &RawDoc, doc: &mut Document) {
+        let Some(text) = raw
+            .pages
+            .first()
+            .and_then(|p| p.items.first())
+            .map(|i| i.text.as_str())
+        else {
+            return;
+        };
+        let Some((meta_region, _)) = frontmatter_span(text) else {
+            return;
+        };
+        let kv = parse_frontmatter_kv(meta_region);
+        if let Some(title) = kv.get("title").map(String::as_str).filter(|s| !s.is_empty()) {
+            doc.meta.extra.insert("md.title".to_string(), title.to_string());
+        }
+        if let Some(authors) = kv.get("authors").map(String::as_str) {
+            let joined = authors_joined(authors);
+            if !joined.is_empty() {
+                doc.meta.extra.insert("md.authors".to_string(), joined);
+            }
+        }
+        if let Some(lang) = kv.get("language").map(String::as_str).filter(|s| !s.is_empty()) {
+            doc.meta
+                .extra
+                .insert("md.language".to_string(), lang.to_string());
         }
     }
 }
@@ -645,5 +745,117 @@ mod pulldown_tests {
         assert_eq!(doc.pages.len(), 1);
         assert!(!doc.pages[0].text.contains("---"), "{:#?}", doc.pages[0].text);
         assert_eq!(kinds(&doc.pages[0].blocks), vec![BlockKind::Heading, BlockKind::Paragraph]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// frontmatter → DocMeta 通道测试（enrich_meta 后置钩子）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod frontmatter_meta_tests {
+    use super::*;
+    use crate::engine::DocumentEngine;
+    use crate::plugins::text::register_defaults;
+    use crate::registry::Registry;
+    use crate::plugin::{RawPage, RawTextItem};
+
+    /// md 文本 → 单页单 item 的 RawDoc（enrich_meta 直调用）。
+    fn raw_with_text(text: &str) -> RawDoc {
+        RawDoc {
+            pages: vec![RawPage {
+                items: vec![RawTextItem {
+                    text: text.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// engine 全链（register_defaults + DocumentEngine）：含 title/authors/
+    /// language 的 md 文件 → extra 三键到位。键名大小写不敏感（`Title` /
+    /// `AUTHORS` 照认）、值去包裹引号、authors 逗号拆分后 `"; "` 连接
+    /// （对齐 fb2.authors）；正文只剥一次，元数据不进页文本。
+    #[test]
+    fn frontmatter_metadata_reaches_doc_meta() {
+        let p = std::env::temp_dir().join("docforge_md_meta.md");
+        std::fs::write(
+            &p,
+            "---\nTitle: 静夜思\nAUTHORS: 李白, 杜甫\nlanguage: 'zh'\n---\n\n# 题\n正文\n",
+        )
+        .unwrap();
+        let path = p.to_string_lossy().into_owned();
+        let mut reg = Registry::new();
+        register_defaults(&mut reg);
+        let doc = DocumentEngine::new(reg).parse(&path).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(
+            doc.meta.extra.get("md.title").map(String::as_str),
+            Some("静夜思")
+        );
+        assert_eq!(
+            doc.meta.extra.get("md.authors").map(String::as_str),
+            Some("李白; 杜甫")
+        );
+        assert_eq!(
+            doc.meta.extra.get("md.language").map(String::as_str),
+            Some("zh")
+        );
+        assert!(!doc.pages[0].text.contains("静夜思"), "{:?}", doc.pages[0].text);
+    }
+
+    /// authors 的方括号列表形态（`[a, b]`，条目可各自带引号）同样拆分连接。
+    #[test]
+    fn frontmatter_authors_bracket_list_form() {
+        let raw = raw_with_text("---\nauthors: [张三, \"李 四\"]\n---\n正文\n");
+        let mut doc = MarkdownPlugin.assemble(&raw);
+        MarkdownPlugin.enrich_meta(&raw, &mut doc);
+        assert_eq!(
+            doc.meta.extra.get("md.authors").map(String::as_str),
+            Some("张三; 李 四")
+        );
+    }
+
+    /// 无 frontmatter 的 md：extra 不产任何 `md.*` 键（正文里的 `title: …`
+    /// 字样只是段落文本，engine 全链验证）。
+    #[test]
+    fn no_frontmatter_no_extra_keys() {
+        let p = std::env::temp_dir().join("docforge_md_no_meta.md");
+        std::fs::write(&p, "# 题\n正文，title: 假键也不认\n").unwrap();
+        let path = p.to_string_lossy().into_owned();
+        let mut reg = Registry::new();
+        register_defaults(&mut reg);
+        let doc = DocumentEngine::new(reg).parse(&path).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(
+            !doc.meta.extra.keys().any(|k| k.starts_with("md.")),
+            "unexpected md.* keys: {:?}",
+            doc.meta.extra
+        );
+    }
+
+    /// 未闭合（50 行内无 `---` 闭合行）：不剥也不取——元数据行留在页文本，
+    /// extra 不产键（engine 全链验证钩子与剥离同口径）。
+    #[test]
+    fn unterminated_frontmatter_not_parsed() {
+        let mut content = String::from("---\ntitle: 静夜思\nauthors: 李白\nlanguage: zh\n");
+        for i in 0..50 {
+            content.push_str(&format!("第{i}行正文\n"));
+        }
+        let p = std::env::temp_dir().join("docforge_md_unterminated.md");
+        std::fs::write(&p, &content).unwrap();
+        let path = p.to_string_lossy().into_owned();
+        let mut reg = Registry::new();
+        register_defaults(&mut reg);
+        let doc = DocumentEngine::new(reg).parse(&path).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(doc.pages[0].text.contains("title: 静夜思"), "{:?}", doc.pages[0].text);
+        assert!(
+            !doc.meta.extra.keys().any(|k| k.starts_with("md.")),
+            "unexpected md.* keys: {:?}",
+            doc.meta.extra
+        );
     }
 }

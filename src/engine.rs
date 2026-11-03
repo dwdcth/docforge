@@ -1,5 +1,6 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
-// docforge 改动：仅 crate 名引用替换。
+// docforge 改动：① crate 名引用替换；② 组装段在 finalize 前挂
+// FormatPlugin::enrich_meta 后置钩子（格式特有元数据 → DocMeta.extra）。
 //! 文档引擎：sniff → 解析链（回退保留原始错误码）→ 处理链（失败仅记录）→ assemble。
 
 use crate::error::{DocError, ErrorCode, Result};
@@ -76,8 +77,10 @@ impl DocumentEngine {
             raw.meta.insert("warnings".into(), warnings.join("; "));
         }
 
-        // ③ 组装 IR
+        // ③ 组装 IR（后置钩子：插件把 frontmatter / 书籍元数据写入 extra；
+        // 必须在 finalize 统计回填之前完成）
         let mut doc = plugin.assemble(&raw);
+        plugin.enrich_meta(&raw, &mut doc);
         doc.meta.file_type = fmt.to_string();
         // 处理链告警此前只留在 RawDoc.meta 里（随 raw 丢弃），落到 doc.meta.extra 才可见
         if let Some(w) = raw.meta.get("warnings") {

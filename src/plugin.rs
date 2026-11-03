@@ -1,6 +1,7 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① RawTextItem 新增 source/confidence；② RawPage 新增 coord_units
-// （M1：pdf 页级路由把 OCR 语义透传到 IR，docforge-spec-m1.md §4）。
+// （M1：pdf 页级路由把 OCR 语义透传到 IR，docforge-spec-m1.md §4）；
+// ③ FormatPlugin 新增 enrich_meta 组装后置钩子（格式特有元数据 → DocMeta.extra）。
 //! 能力抽象（与 Python `capability.py` 对齐）：
 //! 解析能力（格式绑定）→ RawDoc；处理能力（全局共享，就地增强）。
 
@@ -175,4 +176,14 @@ pub trait FormatPlugin: Send + Sync {
     fn default_parse_chain(&self) -> Vec<&'static str>;
     fn default_process_chain(&self) -> Vec<&'static str>;
     fn assemble(&self, raw: &RawDoc) -> crate::model::Document;
+
+    /// 组装后置钩子：插件把格式特有元数据（frontmatter / 书籍元数据）写入
+    /// `doc.meta.extra`。默认空实现（既有插件零改动）；engine 在 `assemble`
+    /// 与 `finalize` 之间调用。
+    ///
+    /// 设计依据：`assemble(&self, raw: &RawDoc) -> Document` 按值返回、返回前
+    /// 无处回填元数据；`parse` 阶段（ParseCapability）只有 RawDoc 这层无格式
+    /// 语义的载体，拿不到插件对 title/authors/language 的解释权——因此最小
+    /// 侵入面是这个后置钩子：raw（原文未剥）与 doc（已组装）此刻都在手上。
+    fn enrich_meta(&self, _raw: &RawDoc, _doc: &mut crate::model::Document) {}
 }
