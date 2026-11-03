@@ -1,5 +1,7 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
-// docforge 改动：① feature `encoding` 下 decode 增加 GB18030/Big5 回退（M2）；
+// docforge 改动：① feature `encoding` 下 decode 增加编码回退——chardetng
+//    概率探测（置信闸门，覆盖 Big5/Shift-JIS/EUC-KR/Windows-125x 等）
+//    + GB18030/Big5 固定回退（M2）；
 // ② parse 集成中文章节切分（chapter.rs：章标题产 level=1 item；章内小节
 //    产 level=2/3 item，小节行从段落剥离，按行号回插保序）；
 // ③ assemble 将 level 映射为 Heading 块；④ feature `lang-detect` 下
@@ -31,7 +33,7 @@ use super::html;
 use super::markdown;
 
 /// 编码健壮读取：UTF-8（含 BOM）→ UTF-16（BOM）→ UTF-8 strict →
-/// （feature `encoding`）GB18030 → Big5 → lossy。
+/// （feature `encoding`）chardetng 概率探测（置信闸门）→ GB18030 → Big5 → lossy。
 pub fn read_text(path: &str) -> Result<String> {
     let raw =
         std::fs::read(path).map_err(|e| DocError::corrupt(format!("cannot read {path}: {e}")))?;
@@ -53,9 +55,29 @@ pub fn decode(raw: Vec<u8>) -> String {
         Ok(s) => s,
         Err(e) => {
             let bytes = e.as_bytes();
-            // 中文编码回退（GBK 家族优先，Big5 次之；各自要求全程无解码错误）
+            // 中文/多编码回退链（GBK 家族优先，Big5 次之；各自要求全程无解码错误）
             #[cfg(feature = "encoding")]
             {
+                // —— chardetng 概率探测段（md/txt/csv/html 共用 read_text
+                //    一条链，先于固定链）：——
+                // 置信闸门两道：
+                //   ① guess_assess 的 bool（探测编码须胜过至少一个候选，
+                //      false = 探测"多半是错的"）；
+                //   ② 最小样本量 8 字节（频率模型要统计证据；实测 <8 字节
+                //      GBK 高频被 windows-1252/EUC-KR 劫持且解码无错，
+                //      ≥8 字节 CJK 判别稳定）。
+                // 探测命中 UTF-8 直接弃（strict 已失败 = 非法 UTF-8 混合件，
+                // 探测只是认出字节骨架）；闸门放行但探测编码解码有错也弃。
+                let mut det = chardetng::EncodingDetector::new();
+                det.feed(bytes, true);
+                let (enc, confident) = det.guess_assess(None, true);
+                if confident && bytes.len() >= 8 && enc != encoding_rs::UTF_8 {
+                    let (s, _, had_errors) = enc.decode(bytes);
+                    if !had_errors {
+                        return s.into_owned();
+                    }
+                }
+                // —— 固定链段（探测未采纳时兜底，M2 行为保持）：——
                 let (s_gb, _, err) = encoding_rs::GB18030.decode(bytes);
                 if !err {
                     return s_gb.into_owned();
@@ -415,6 +437,61 @@ mod m2_tests {
         assert_eq!(decode(gbk), "你好，世界");
         // UTF-8 优先不受影响
         assert_eq!(decode("常规".as_bytes().to_vec()), "常规");
+    }
+
+    #[test]
+    #[cfg(feature = "encoding")]
+    fn gbk_markdown_decoded() {
+        // GBK 字节的 md（非 UTF-8，无 BOM）：md 走 WholeTextParseCapability，
+        // 与 txt/csv/html 共用同一条 read_text → decode 链
+        let md = "# 中文标题\n\n正文段落。";
+        let (bytes, _, had_errors) = encoding_rs::GB18030.encode(md);
+        let bytes = bytes.into_owned();
+        assert!(!had_errors);
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("enc-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("note.md");
+        std::fs::write(&p, &bytes).unwrap();
+
+        let raw = WholeTextParseCapability { id: "text.read.md", fmt: "md" }
+            .parse(p.to_str().unwrap())
+            .unwrap();
+        assert_eq!(raw.pages[0].items[0].text, md);
+        // decode 直连同链：BOM 无、UTF-16 无、UTF-8 strict 失败 → 编码回退
+        assert_eq!(decode(bytes.clone()), md);
+        assert_eq!(decode(bytes), md);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "encoding")]
+    fn big5_text_detected_via_chardet() {
+        // Big5 长文本（≥200 字符）：Big5 字节同样能被 GB18030 无错解码成
+        // 乱码，所以固定链拿不到正确结果——逐字还原只能来自 chardetng
+        // 探测命中 Big5（置信闸门放行）
+        let line = "這是一份測試文件，用來驗證編碼自動識別對繁體中文內容的效果。";
+        let text = line.repeat(8);
+        assert!(text.chars().count() >= 200);
+        let (bytes, _, had_errors) = encoding_rs::BIG5.encode(&text);
+        assert!(!had_errors);
+        assert_eq!(decode(bytes.into_owned()), text);
+    }
+
+    #[test]
+    #[cfg(feature = "encoding")]
+    fn short_ambiguous_falls_back_to_fixed_chain() {
+        // 短且歧义的 GBK 字节：低于最小探测样本量（8 字节），置信闸门不放行
+        // → 固定链 GB18030 行为与 M2 保持一致
+        // "你好瞒" 的 GBK（6 字节）
+        assert_eq!(
+            decode(vec![0xC4, 0xE3, 0xBA, 0xC3, 0xC2, 0xF7]),
+            "你好瞒"
+        );
+        // "你" 的 GBK（2 字节）
+        assert_eq!(decode(vec![0xC4, 0xE3]), "你");
     }
 
     #[test]

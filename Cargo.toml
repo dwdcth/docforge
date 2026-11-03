@@ -14,7 +14,7 @@ csv = []
 html = []
 rtf = []
 # TXT 中文编码链（GB18030/Big5 回退；中文场景推荐开启）
-encoding = ["dep:encoding_rs"]
+encoding = ["dep:encoding_rs", "dep:chardetng"]
 # to_json / to_json_pretty emit（cli 需要）
 json = ["dep:serde_json"]
 # 语言检测处理能力（whatlang，翻译管线源语言）
@@ -93,6 +93,10 @@ features = ["derive"]
 
 [dependencies.encoding_rs]
 version = "0.8"
+optional = true
+
+[dependencies.chardetng]
+version = "0.1"
 optional = true
 
 [dependencies.serde_json]
