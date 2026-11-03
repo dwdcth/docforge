@@ -1,6 +1,7 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① Block 新增 confidence/source；② Page 新增 coord_units；
-// ③ 新增 BlockSource/CoordUnits 类型；④ 新增 6 个对应单测。其余逐字保留。
+// ③ 新增 BlockSource/CoordUnits 类型；④ 新增 6 个对应单测；
+// ⑤ Document 新增 blocks() 跨页扁平迭代（+ 对应单测）。其余逐字保留。
 //! 统一 IR（含 serde 便于 JSON/CLI 往返；块/元信息语义与 docparser 的
 //! Python 参考实现一致，docforge 在其上扩展 OCR 语义字段）。
 
@@ -220,6 +221,12 @@ impl Document {
             .sum();
         self
     }
+
+    /// 跨页扁平迭代所有块（页序×页内序）。最常见的遍历形态一行化：
+    /// `for b in doc.blocks()` 取代手写双层 `pages` × `blocks` 循环。
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        self.pages.iter().flat_map(|p| p.blocks.iter())
+    }
 }
 
 /// 渲染块序列为页文本（表格展开全部行，逗号分列——与 Python `blocks_to_text` 一致）。
@@ -269,6 +276,33 @@ mod tests {
         assert_eq!(doc.meta.text_length, 7); // "你好world"
         assert_eq!(doc.meta.image_count, 1);
         assert_eq!(doc.meta.image_text_length, 1);
+    }
+
+    /// `Document::blocks()`：跨页扁平迭代按 页序×页内序 排列，不乱序；
+    /// 只借用 `&self`，迭代后文档本体仍可用。
+    #[test]
+    fn blocks_flattens_pages_in_order() {
+        let block = |c: &str| Block {
+            kind: BlockKind::Paragraph,
+            content: c.into(),
+            ..Default::default()
+        };
+        let doc = Document {
+            pages: vec![
+                Page {
+                    blocks: vec![block("页1b0"), block("页1b1")],
+                    ..Default::default()
+                },
+                Page {
+                    blocks: vec![block("页2b0"), block("页2b1")],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let contents: Vec<&str> = doc.blocks().map(|b| b.content.as_str()).collect();
+        assert_eq!(contents, ["页1b0", "页1b1", "页2b0", "页2b1"]);
+        assert_eq!(doc.pages.len(), 2);
     }
 
     #[test]
