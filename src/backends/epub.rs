@@ -116,6 +116,15 @@ struct Item {
     id: String,
     href: String,
     props: String,
+    /// manifest media-type（docforge 五件套：图片提取按 image/* 过滤）
+    media_type: String,
+}
+
+/// spine 引用（docforge 五件套：linear="no" 跳过，缺省视为 yes）。
+#[derive(Debug, Clone)]
+struct SpineRef {
+    idref: String,
+    linear: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,7 +135,7 @@ struct Opf {
     publisher: String,
     date: String,
     items: Vec<Item>,
-    spine: Vec<String>,
+    spine: Vec<SpineRef>,
     toc: Option<String>,
     cover_id: Option<String>,
 }
@@ -196,10 +205,13 @@ fn on_opf_element(
             id: a.get("id").cloned().unwrap_or_default(),
             href: a.get("href").cloned().unwrap_or_default(),
             props: a.get("properties").cloned().unwrap_or_default(),
+            media_type: a.get("media-type").cloned().unwrap_or_default(),
         }),
         "itemref" => {
             if let Some(id) = a.get("idref") {
-                opf.spine.push(id.clone());
+                // docforge 五件套：linear="no" 的项不进阅读流（B 语义）
+                let linear = a.get("linear").map(|v| v != "no").unwrap_or(true);
+                opf.spine.push(SpineRef { idref: id.clone(), linear });
             }
         }
         "spine" => {
@@ -435,17 +447,66 @@ fn open_zip(path: &str) -> Result<zip::ZipArchive<std::fs::File>> {
 }
 
 fn read_entry(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Option<String>> {
+    match read_entry_bytes(zip, name)? {
+        Some(bytes) => Ok(Some(decode_entry(&bytes))),
+        None => Ok(None),
+    }
+}
+
+/// 读原始字节（图片提取用）。
+fn read_entry_bytes(
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
     match zip.by_name(name) {
         Ok(mut f) => {
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)
                 .map_err(|e| DocError::corrupt(format!("读取 {name} 失败: {e}")))?;
-            // EPUB 正文常含非法字节：解码失败按替换字符处理，不整体失败
-            Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            Ok(Some(buf))
         }
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}"))),
     }
+}
+
+/// 条目解码：UTF-8（绝大多数）→ XML 声明嗅探的非 UTF-8（docforge 五件套，
+/// feature `encoding` 下用 encoding_rs；未开则 lossy）→ lossy 兜底。
+fn decode_entry(bytes: &[u8]) -> String {
+    if std::str::from_utf8(bytes).is_ok() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    // XML 声明嗅探：前 1KB 内找 encoding="..."
+    let head = &bytes[..bytes.len().min(1024)];
+    let head_lossy = String::from_utf8_lossy(head);
+    if let Some(enc) = head_lossy
+        .split("encoding")
+        .nth(1)
+        .and_then(|rest| {
+            rest.trim_start()
+                .strip_prefix('=')
+                .map(|r| r.trim_start().trim_start_matches('"').trim_start_matches('\''))
+        })
+        .and_then(|r| r.split(['"', '\'', ' ', '?']).next())
+        .map(str::to_ascii_lowercase)
+    {
+        #[cfg(feature = "encoding")]
+        {
+            for label in [&enc, &enc.replace('_', "-")] {
+                if let Some(cs) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+                    if cs == encoding_rs::UTF_8 {
+                        break; // 声明 UTF-8 但字节非法：走 lossy
+                    }
+                    let (s, _, had_err) = cs.decode(bytes);
+                    if !had_err {
+                        return s.into_owned();
+                    }
+                }
+            }
+        }
+        let _ = enc; // 未开 encoding feature：嗅探结果仅供参考，lossy 兜底
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn year_of(date: &str) -> String {
@@ -531,7 +592,17 @@ fn build_page(title: &str, blocks: Vec<Block>) -> Page {
 // ── 能力 / 插件 ─────────────────────────────────────────────────────
 
 /// 原始读取：把 spine 顺序的 XHTML 原文放进 `RawPage.items[0]`，书籍元数据进 `RawDoc.meta`。
-pub struct EpubRawBackend;
+pub struct EpubRawBackend {
+    /// 提取 manifest 图片字节进首页 `images`（docforge 五件套，opt-in；
+    /// M3 的图像 OCR 处理能力消费 `RawPage.images`）。
+    pub ocr_images: bool,
+}
+
+impl Default for EpubRawBackend {
+    fn default() -> Self {
+        Self { ocr_images: false }
+    }
+}
 
 impl ParseCapability for EpubRawBackend {
     fn id(&self) -> &str {
@@ -590,7 +661,9 @@ impl ParseCapability for EpubRawBackend {
             }
         }
 
-        // 封面：properties="cover-image" 优先，其次 <meta name="cover">
+        // 封面三级 fallback（docforge 五件套）：properties="cover-image" →
+        // <meta name="cover"> → href 含 "cover" 的首个图片项
+        let is_image = |it: &Item| it.media_type.starts_with("image/");
         let cover = opf
             .items
             .iter()
@@ -603,11 +676,22 @@ impl ParseCapability for EpubRawBackend {
                         .find(|it| &it.id == id)
                         .map(|it| resolve(&opf_dir, &it.href))
                 })
+            })
+            .or_else(|| {
+                // B 的第三级：manifest 里 href 文件名含 "cover" 的图片
+                opf.items
+                    .iter()
+                    .filter(|it| is_image(it) && it.href.to_lowercase().contains("cover"))
+                    .map(|it| resolve(&opf_dir, &it.href))
+                    .next()
             });
 
         let mut pages = Vec::new();
-        for idref in &opf.spine {
-            let Some(item) = opf.items.iter().find(|it| &it.id == idref) else {
+        for sr in &opf.spine {
+            if !sr.linear {
+                continue; // docforge 五件套：linear="no" 不进阅读流
+            }
+            let Some(item) = opf.items.iter().find(|it| it.id == sr.idref) else {
                 continue;
             };
             let full = resolve(&opf_dir, &item.href);
@@ -630,6 +714,33 @@ impl ParseCapability for EpubRawBackend {
                 }],
                 ..Default::default()
             });
+        }
+
+        // docforge 五件套：图片字节提取（opt-in）。文档级资源放首页 images
+        //（EPUB 无物理页概念；首页 images 通常为空，无信息损失）。
+        if self.ocr_images {
+            let mut images = Vec::new();
+            for it in &opf.items {
+                if !is_image(it) {
+                    continue;
+                }
+                let full = resolve(&opf_dir, &it.href);
+                if let Some(bytes) = read_entry_bytes(&mut zip, &full)? {
+                    let ext = it
+                        .href
+                        .rsplit_once('.')
+                        .map(|(_, e)| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    images.push(crate::plugin::RawImage {
+                        data: bytes,
+                        ext,
+                        ..Default::default()
+                    });
+                }
+            }
+            if let Some(first) = pages.first_mut() {
+                first.images = images;
+            }
         }
 
         let mut meta: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -767,7 +878,7 @@ impl EpubPlugin {
 
 /// 注册 EPUB 后端与插件。
 pub fn register_defaults(reg: &mut Registry) {
-    let _ = reg.register_parse(Arc::new(EpubRawBackend), None);
+    let _ = reg.register_parse(Arc::new(EpubRawBackend::default()), None);
     reg.register_plugin(Arc::new(EpubPlugin));
 }
 
@@ -775,7 +886,7 @@ pub fn register_defaults(reg: &mut Registry) {
 
 /// 一次读完：元数据 + 分章（含结构化块）。
 pub fn read_epub(path: &str) -> Result<EpubBook> {
-    let raw = EpubRawBackend.parse(path)?;
+    let raw = EpubRawBackend::default().parse(path)?;
     // 书 API 保留结构化块（Heading/List），不按 Document 口径坍缩
     let doc = EpubPlugin.assemble_impl(&raw, false);
     let get = |k: &str| raw.meta.get(k).cloned().unwrap_or_default();
@@ -805,7 +916,7 @@ pub fn read_epub(path: &str) -> Result<EpubBook> {
 
 /// 只取封面路径与书名（不解析正文），供书库/缩略图场景使用。
 pub fn epub_cover_href(path: &str) -> (Option<String>, String) {
-    match EpubRawBackend.parse(path) {
+    match EpubRawBackend::default().parse(path) {
         Ok(raw) => (
             raw.meta.get("epub.cover_href").cloned(),
             raw.meta.get("epub.title").cloned().unwrap_or_default(),
@@ -993,5 +1104,127 @@ mod tests {
         let m = ncx_titles(ncx);
         assert_eq!(m.get("ch1.xhtml").map(|s| s.as_str()), Some("卷首"));
         assert_eq!(m.get("ch2.xhtml").map(|s| s.as_str()), Some("卷尾"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// docforge 五件套测试（M2 收尾）：linear=no / 封面第三级 / 图片提取 / 编码嗅探
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod five_piece_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 最小 EPUB（可指定 spine 与 manifest 追加项）。
+    fn build_epub(
+        dir_name: &str,
+        spine_xml: &str,
+        manifest_extra: &str,
+        extra_files: &[(&str, &[u8])],
+    ) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("epub5-{dir_name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.epub");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("META-INF/container.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(
+            br#"<container><rootfiles><rootfile full-path="content.opf" media-type="a"/></rootfiles></container>"#,
+        )
+        .unwrap();
+        let opf = format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf">
+<manifest>
+<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+{manifest_extra}
+</manifest>
+<spine>{spine_xml}</spine>
+</package>"#
+        );
+        zw.start_file("content.opf", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(opf.as_bytes()).unwrap();
+        zw.start_file("c1.xhtml", zip::write::SimpleFileOptions::default()).unwrap();
+        zw.write_all(b"<html><body><p>chapter one</p></body></html>").unwrap();
+        for (name, data) in extra_files {
+            zw.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn nonlinear_spine_items_skipped() {
+        let p = build_epub(
+            "linear",
+            r#"<itemref idref="c1"/><itemref idref="nx" linear="no"/>"#,
+            r#"<item id="nx" href="nx.xhtml" media-type="application/xhtml+xml"/>"#,
+            &[("nx.xhtml", b"<html><body><p>hidden</p></body></html>")],
+        );
+        let raw = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        assert_eq!(raw.pages.len(), 1, "linear=no 不进阅读流");
+        assert!(raw.pages[0].items[0].text.contains("chapter one"));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn cover_fallback_to_filename() {
+        // 无 cover-image 属性、无 meta cover，但文件名含 cover → 第三级命中
+        let p = build_epub(
+            "cover3",
+            r#"<itemref idref="c1"/>"#,
+            r#"<item id="cv" href="my-cover-image.png" media-type="image/png"/>"#,
+            &[],
+        );
+        let (href, _) = epub_cover_href(p.to_str().unwrap());
+        assert_eq!(href.as_deref(), Some("my-cover-image.png"));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn ocr_images_extracts_manifest_images() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]; // PNG 头即可
+        let p = build_epub(
+            "imgs",
+            r#"<itemref idref="c1"/>"#,
+            r#"<item id="i1" href="pic.png" media-type="image/png"/>"#,
+            &[("pic.png", &png)],
+        );
+        let raw = EpubRawBackend { ocr_images: true }
+            .parse(p.to_str().unwrap())
+            .unwrap();
+        assert_eq!(raw.pages[0].images.len(), 1);
+        assert_eq!(raw.pages[0].images[0].ext, "png");
+        assert_eq!(&raw.pages[0].images[0].data[..4], &png[..4]);
+        // 默认关：不提取
+        let raw_off = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        assert!(raw_off.pages[0].images.is_empty());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn gbk_xhtml_decoded_via_declaration() {
+        // 非 UTF-8 的 GBK XHTML，带 XML 声明 encoding="gbk"
+        let gbk_bytes: Vec<u8> = vec![0xD6, 0xD0, 0xCE, 0xC4]; // "中文"
+        let mut xhtml = br#"<?xml version="1.0" encoding="gbk"?><html><body><p>"#.to_vec();
+        xhtml.extend_from_slice(&gbk_bytes);
+        xhtml.extend_from_slice(b"</p></body></html>");
+        let p = build_epub(
+            "gbk",
+            r#"<itemref idref="c1"/><itemref idref="g"/>"#,
+            r#"<item id="g" href="gbk.xhtml" media-type="application/xhtml+xml"/>"#,
+            &[("gbk.xhtml", &xhtml)],
+        );
+        let raw = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        assert_eq!(raw.pages.len(), 2);
+        let got = &raw.pages[1].items[0].text;
+        #[cfg(feature = "encoding")]
+        assert!(got.contains("中文"), "GBK 应解码：{got:?}");
+        #[cfg(not(feature = "encoding"))]
+        assert!(!got.contains("中文"), "未开 encoding feature 应保持 lossy");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

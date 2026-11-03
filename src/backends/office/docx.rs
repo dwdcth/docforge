@@ -83,8 +83,13 @@ impl ParseCapability for DocxRawBackend {
         } else {
             Numbering::default()
         };
+        // styles.xml 的 styleId→标题层级映射（docforge 补丁：zh-CN 数字 styleId）；
+        // 缺失/损坏按空表，pStyle 直接判定不受影响
+        let styles = zip_read_str(&mut zip, "word/styles.xml")?
+            .map(|x| parse_styles_heading_map(&x))
+            .unwrap_or_default();
 
-        let nodes = docx_raw_text(&xml, &numbering)?;
+        let nodes = docx_raw_text(&xml, &numbering, &styles)?;
 
         // 内嵌图（opt-in）：rels 只在需要时读；按部件名去重（同 Python `media_seen`），
         // 去重先于「是否过小」判定——同一张太小的图不会被二次尝试。
@@ -228,7 +233,7 @@ fn region_texts(xml: &str) -> Result<Vec<String>> {
             Ok(Event::Start(ref e)) => {
                 if e.name().local_name().as_ref() == super::tags::W_P {
                     // extract_para 内部消费到 `</w:p>`，嵌套段（文本框）不会重复计数
-                    if let Ok((t, _props, _rids)) = extract_para(&mut reader) {
+                    if let Ok((t, _props, _rids)) = extract_para(&mut reader, &HashMap::new()) {
                         let trimmed = t.trim();
                         if !trimmed.is_empty() {
                             out.push(trimmed.to_string());
@@ -269,7 +274,11 @@ fn extend_rids(rids: &mut Vec<String>, more: Vec<String>) {
     }
 }
 
-fn docx_raw_text(xml: &str, numbering: &Numbering) -> Result<Vec<DocxNode>> {
+fn docx_raw_text(
+    xml: &str,
+    numbering: &Numbering,
+    styles: &HashMap<String, u8>,
+) -> Result<Vec<DocxNode>> {
     let mut reader = Reader::from_str(xml);
     // 不裁剪文本：空白由消费者 trim（实体两侧空格需保留，见 GeneralRef 分支）
     let mut buf = Vec::new();
@@ -296,7 +305,7 @@ fn docx_raw_text(xml: &str, numbering: &Numbering) -> Result<Vec<DocxNode>> {
                 let name = e.name().local_name();
                 let name = name.as_ref();
                 if name == super::tags::W_P {
-                    let (t, props, rids) = extract_para(&mut reader)?;
+                    let (t, props, rids) = extract_para(&mut reader, styles)?;
                     let trimmed = t.trim().to_string();
                     if !trimmed.is_empty() {
                         nodes.push(DocxNode::Item(raw_item(trimmed, &props, numbering)));
@@ -305,7 +314,7 @@ fn docx_raw_text(xml: &str, numbering: &Numbering) -> Result<Vec<DocxNode>> {
                         nodes.push(DocxNode::ImageRids(rids));
                     }
                 } else if name == super::tags::W_TBL {
-                    let (rows, rids) = extract_table_rows(&mut reader)?;
+                    let (rows, rids) = extract_table_rows(&mut reader, styles)?;
                     if !rows.is_empty() {
                         nodes.push(DocxNode::Item(super::table_item(rows)));
                     }
@@ -313,7 +322,7 @@ fn docx_raw_text(xml: &str, numbering: &Numbering) -> Result<Vec<DocxNode>> {
                         nodes.push(DocxNode::ImageRids(rids));
                     }
                 } else if name == super::tags::W_SDT {
-                    extract_sdt_items(&mut reader, &mut nodes, numbering)?;
+                    extract_sdt_items(&mut reader, &mut nodes, numbering, styles)?;
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -336,6 +345,7 @@ fn extract_sdt_items<R: std::io::BufRead>(
     reader: &mut Reader<R>,
     nodes: &mut Vec<DocxNode>,
     numbering: &Numbering,
+    styles: &HashMap<String, u8>,
 ) -> Result<()> {
     let mut buf = Vec::new();
     let mut depth = 1;
@@ -344,7 +354,7 @@ fn extract_sdt_items<R: std::io::BufRead>(
             Ok(Event::Start(ref e)) => {
                 depth += 1;
                 if e.name().local_name().as_ref() == super::tags::W_P {
-                    let (t, props, rids) = extract_para(reader)?;
+                    let (t, props, rids) = extract_para(reader, styles)?;
                     let trimmed = t.trim().to_string();
                     if !trimmed.is_empty() {
                         nodes.push(DocxNode::Item(raw_item(trimmed, &props, numbering)));
@@ -374,6 +384,7 @@ fn extract_sdt_items<R: std::io::BufRead>(
 /// 第三个返回值是段落内出现的图片关系 id（`a:blip` / `v:imagedata`，文档序）。
 fn extract_para<R: std::io::BufRead>(
     reader: &mut Reader<R>,
+    styles: &HashMap<String, u8>,
 ) -> Result<(String, ParaProps, Vec<String>)> {
     let mut out = String::new();
     let mut props = ParaProps::default();
@@ -393,7 +404,7 @@ fn extract_para<R: std::io::BufRead>(
                 }
                 match e.name().local_name().as_ref() {
                     // 段落属性在跑文本之前：由 para_props 整个消费掉，深度不增减
-                    super::tags::W_PPR => props = para_props(reader)?,
+                    super::tags::W_PPR => props = para_props_with(reader, styles)?,
                     super::tags::W_T => {
                         in_t = true;
                         depth += 1;
@@ -559,12 +570,15 @@ impl PPrScan {
         }
     }
 
-    fn into_props(self) -> ParaProps {
-        // 与 Python `_docx_para_level` 同序：pStyle 命中优先，否则看 outlineLvl
+    fn into_props_with(self, styles: &HashMap<String, u8>) -> ParaProps {
+        // 与 Python `_docx_para_level` 同序：pStyle 命中优先，否则看 outlineLvl。
+        // docforge 补丁：styleId 直接判定不中时查 styles.xml 的 name 映射
+        //（zh-CN 数字 styleId → "heading N"）。
         let level = self
             .style_id
             .as_deref()
             .and_then(heading_level_from_style)
+            .or_else(|| self.style_id.as_deref().and_then(|id| styles.get(id).copied()))
             .or(self.outline);
         let num = self.saw_numpr.then(|| {
             (
@@ -579,7 +593,10 @@ impl PPrScan {
 /// 解析 `<w:pPr>` 子树：标题层级（`w:pStyle` / `w:outlineLvl`）与编号（`w:numPr`）。
 ///
 /// 调用时 reader 刚读过 `<w:pPr>` Start，退出时处于 `</w:pPr>` End 之后。
-fn para_props<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<ParaProps> {
+fn para_props_with<R: std::io::BufRead>(
+    reader: &mut Reader<R>,
+    styles: &HashMap<String, u8>,
+) -> Result<ParaProps> {
     let mut scan = PPrScan::default();
     let mut buf = Vec::new();
     let mut depth = 1usize;
@@ -605,7 +622,7 @@ fn para_props<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<ParaProps> 
         buf.clear();
     }
 
-    Ok(scan.into_props())
+    Ok(scan.into_props_with(styles))
 }
 
 /// `word/numbering.xml`：`numId` + `ilvl` → 是否有序（`bullet` / `none` 视为无序）。
@@ -743,6 +760,48 @@ fn attr_val(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
     attr_by(e, super::tags::VAL)
 }
 
+/// `word/styles.xml` 的 styleId → 标题层级映射（docforge M2 收尾补丁）。
+///
+/// zh-CN Word 常用**数字 styleId**（`<w:pStyle w:val="1"/>`，样式名才是
+/// `heading 1`）——只看 styleId 会漏判。此表以 `<w:name w:val>` 判定，
+/// 与 [`heading_level_from_style`] 同语义。解析失败按空表处理（不阻断）。
+fn parse_styles_heading_map(xml: &str) -> HashMap<String, u8> {
+    let mut map = HashMap::new();
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    let mut cur_id: Option<String> = None;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let local_name = e.name().local_name();
+                let local = local_name.as_ref();
+                if local == super::tags::W_PSTYLE || local == "style" {
+                    // style 声明元素（w:style）；pStyle 不会出现在 styles.xml 顶层，双保险跳过
+                    if let Some(id) = attr_by(e, "styleId") {
+                        if local == "style" {
+                            cur_id = Some(id);
+                        }
+                    }
+                } else if local == "name" {
+                    if let (Some(id), Some(name)) = (cur_id.clone(), attr_val(e)) {
+                        if let Some(level) = heading_level_from_style(&name) {
+                            map.insert(id, level);
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) if e.name().local_name().as_ref() == "style" => {
+                cur_id = None;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    map
+}
+
 /// 从段落样式 id 推断标题级别，语义对齐 Python `_docx_para_level`：
 /// 样式名含 `heading`（大小写无关）或 `标题` 才算标题，级别取其中第一段数字，取不到按 1 级。
 fn heading_level_from_style(id: &str) -> Option<u8> {
@@ -759,6 +818,7 @@ fn heading_level_from_style(id: &str) -> Option<u8> {
 /// 调用时 reader 刚读过 `<w:tbl>` Start 事件，退出时 reader 处于 `</w:tbl>` End 事件之后。
 fn extract_table_rows<R: std::io::BufRead>(
     reader: &mut Reader<R>,
+    styles: &HashMap<String, u8>,
 ) -> Result<(Vec<Vec<String>>, Vec<String>)> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
@@ -780,7 +840,7 @@ fn extract_table_rows<R: std::io::BufRead>(
                     super::tags::W_P => {
                         // extract_para 在内部消费了 </w:p>，需补偿深度；
                         // 单元格内的段落不参与标题/列表判定（只在正文层有意义）
-                        let (t, _props, inner_rids) = extract_para(reader)?;
+                        let (t, _props, inner_rids) = extract_para(reader, styles)?;
                         tbl_depth -= 1;
                         extend_rids(&mut rids, inner_rids);
                         if !t.trim().is_empty() {
@@ -794,7 +854,7 @@ fn extract_table_rows<R: std::io::BufRead>(
                     }
                     super::tags::W_TBL => {
                         // 嵌套表：递归提取，其内部也消费了 </w:tbl>
-                        let (nested, nested_rids) = extract_table_rows(reader)?;
+                        let (nested, nested_rids) = extract_table_rows(reader, styles)?;
                         tbl_depth -= 1;
                         extend_rids(&mut rids, nested_rids);
                         if !nested.is_empty() {
@@ -866,7 +926,7 @@ mod tests {
     /// 无 numbering.xml 的提取（带 `w:numPr` 的段落一律无序列表）。
     /// 图片节点在这里被丢弃（需要 ZIP 才能解出字节）。
     fn parse_items(xml: &str) -> Vec<crate::plugin::RawTextItem> {
-        docx_raw_text(xml, &Numbering::default())
+        docx_raw_text(xml, &Numbering::default(), &HashMap::new())
             .unwrap()
             .into_iter()
             .filter_map(|n| match n {
@@ -878,7 +938,7 @@ mod tests {
 
     /// 文档序的图片 rid 列表（跳过文本项）。
     fn parse_rids(xml: &str) -> Vec<String> {
-        docx_raw_text(xml, &Numbering::default())
+        docx_raw_text(xml, &Numbering::default(), &HashMap::new())
             .unwrap()
             .into_iter()
             .flat_map(|n| match n {
@@ -973,7 +1033,7 @@ mod tests {
             r#"</w:body>"#
         );
         let numbering = Numbering::parse(NUMBERING_XML);
-        let items = docx_raw_text(xml, &numbering)
+        let items = docx_raw_text(xml, &numbering, &HashMap::new())
             .unwrap()
             .into_iter()
             .filter_map(|n| match n {
@@ -1008,7 +1068,7 @@ mod tests {
             r#"</w:body>"#
         );
         let numbering = Numbering::parse(NUMBERING_XML);
-        let items = docx_raw_text(xml, &numbering)
+        let items = docx_raw_text(xml, &numbering, &HashMap::new())
             .unwrap()
             .into_iter()
             .filter_map(|n| match n {
@@ -1041,7 +1101,7 @@ mod tests {
             r#"</w:body>"#
         );
         let numbering = Numbering::parse(NUMBERING_XML);
-        let items = docx_raw_text(xml, &numbering)
+        let items = docx_raw_text(xml, &numbering, &HashMap::new())
             .unwrap()
             .into_iter()
             .filter_map(|n| match n {
@@ -1639,5 +1699,58 @@ mod tests {
                 .count(),
             2
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// docforge 补丁测试：styles.xml 中文数字 styleId → 标题层级
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod styles_map_tests {
+    use super::*;
+
+    #[test]
+    fn styles_map_from_names() {
+        let xml = r#"<?xml version="1.0"?>
+<w:styles xmlns:w="urn:x">
+  <w:style w:type="paragraph" w:styleId="1"><w:name w:val="heading 1"/><w:basedOn w:val="a"/></w:style>
+  <w:style w:type="paragraph" w:styleId="2"><w:name w:val="heading 2"/></w:style>
+  <w:style w:type="paragraph" w:styleId="a"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="4"><w:name w:val="标题 4"/></w:style>
+</w:styles>"#;
+        let map = parse_styles_heading_map(xml);
+        assert_eq!(map.get("1"), Some(&1), "zh-CN 数字 styleId 经 name 判定");
+        assert_eq!(map.get("2"), Some(&2));
+        assert_eq!(map.get("4"), Some(&4), "中文样式名同样入表");
+        assert!(!map.contains_key("a"), "Normal 不入表");
+    }
+
+    #[test]
+    fn numeric_pstyle_resolved_via_styles_map() {
+        // document.xml 用数字 styleId（zh-CN Word 风格），样式名在 styles.xml
+        let styles = parse_styles_heading_map(
+            r#"<w:styles xmlns:w="urn:x"><w:style w:styleId="2"><w:name w:val="heading 2"/></w:style></w:styles>"#,
+        );
+        let doc = r#"<w:document xmlns:w="urn:x"><w:body>
+<w:p><w:pPr><w:pStyle w:val="2"/></w:pPr><w:r><w:t>数字样式标题</w:t></w:r></w:p>
+<w:p><w:r><w:t>正文段落。</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let nodes = docx_raw_text(doc, &Numbering::default(), &styles).unwrap();
+        let items: Vec<_> = nodes
+            .into_iter()
+            .filter_map(|n| match n {
+                DocxNode::Item(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items[0].level, Some(2), "数字 styleId 经 styles 映射出层级");
+        assert_eq!(items[1].level, None);
+    }
+
+    #[test]
+    fn styles_map_corrupt_xml_yields_empty() {
+        let map = parse_styles_heading_map("<w:styles 未闭合");
+        assert!(map.is_empty());
     }
 }

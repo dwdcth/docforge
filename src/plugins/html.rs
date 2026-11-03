@@ -269,11 +269,15 @@ impl Collector {
 
     /// img（void 元素）：直接产 Image 块（docforge 修补 ②）。
     /// `content` 语义是 OCR 文本故保持空；alt 进 `meta["alt"]` 供检索。
-    fn on_img(&mut self, alt: Option<String>) {
+    fn on_img(&mut self, alt: Option<String>, src: Option<String>) {
         self.flush(BlockKind::Paragraph);
         let mut meta = std::collections::BTreeMap::new();
         if let Some(a) = alt {
             meta.insert("alt".to_string(), crate::model::MetaValue::Str(a));
+        }
+        // 资源定位（docforge 五件套的块级形态：EPUB 图片经 src 与 manifest 关联）
+        if let Some(s) = src {
+            meta.insert("src".to_string(), crate::model::MetaValue::Str(s));
         }
         self.blocks.push(Block {
             kind: BlockKind::Image,
@@ -354,7 +358,7 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
                     let name = tag_name(trimmed);
                     if name == "img" {
                         // img 是 void 元素：不进开闭栈，直接产块（修补 ②）
-                        collector.on_img(extract_attr(trimmed, "alt"));
+                        collector.on_img(extract_attr(trimmed, "alt"), extract_attr(trimmed, "src"));
                     } else {
                         collector.start_tag(&name);
                     }
