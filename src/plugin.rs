@@ -1,7 +1,8 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① RawTextItem 新增 source/confidence；② RawPage 新增 coord_units
 // （M1：pdf 页级路由把 OCR 语义透传到 IR，docforge-spec-m1.md §4）；
-// ③ FormatPlugin 新增 enrich_meta 组装后置钩子（格式特有元数据 → DocMeta.extra）。
+// ③ FormatPlugin 新增 enrich_meta 组装后置钩子（格式特有元数据 → DocMeta.extra）；
+// ④ RawTextItem 新增 quad（OCR 旋转保真四点框直通，rumi 集成增强）。
 //! 能力抽象（与 Python `capability.py` 对齐）：
 //! 解析能力（格式绑定）→ RawDoc；处理能力（全局共享，就地增强）。
 
@@ -17,6 +18,10 @@ use crate::model::{BlockSource, CoordUnits, MetaValue, Rect, TableData};
 pub struct RawTextItem {
     pub text: String,
     pub bbox: Option<Rect>,
+    /// 旋转保真四点框（顺时针自左上）：OCR 行直通 `RecognizedLine.quad`，
+    /// 轴对齐文本为 None。`assemble` 透传至 `Block.quad`；`bbox` 恒为轴对齐
+    /// 包围盒（quad 的超集补充），坐标语义随 `RawPage.coord_units`。
+    pub quad: Option<[[f32; 2]; 4]>,
     /// 块来源（pdf 页级路由标 `TextLayer`/`Ocr`；其余格式缺省 `Native`）。
     /// `assemble` 透传至 `Block.source`。
     pub source: BlockSource,

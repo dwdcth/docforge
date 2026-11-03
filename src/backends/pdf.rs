@@ -23,6 +23,19 @@
 //
 // 已知限制：`/Rotate ≠ 0` 页的混合分治本轮不判旋转（文字行 rotation 本轮
 // 不读），此类页 OCR 块坐标可能失真，后续版本补。
+//
+// # rumi 集成增强
+//
+// - `Block.quad` 四点框直通：扫描页 OCR 行 `RecognizedLine.quad` 原样进
+//   RawTextItem/Block（旋转保真）；文字层路径恒 None。页内分治（M4）的
+//   OCR 行也不出 quad——其四点框在裁剪图局部 px 系，直通会与混合页统一
+//   Pt 的 `coord_units` 语义冲突（见 crop_and_ocr_region 注释）。
+// - `PdfOptions.on_progress` 页级进度/取消：组装循环按页序逐页完成时回调
+//   （文字层页在批量提取后的组装点、扫描页在其渲染+OCR 已完成的组装点
+//   各计一次），false 中止——已组装页照常返回，余页出空占位保持页号对齐，
+//   warnings 记中止标记（Ok 语义，不报错）。
+// - `PdfOptions.keep_raster_pages` 扫描页渲染图保留：与 OCR 消费同一渲染
+//   图，PNG 字节进该页 RawPage.images（assemble 透传 Page.images）。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,7 +49,7 @@ use crate::error::{DocError, ErrorCode, Result};
 use crate::model::{blocks_to_text, Block, BlockKind, BlockSource, CoordUnits, Document, Page,
     Rect};
 use crate::ocr::OcrEngine;
-use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawPage, RawTextItem};
+use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawImage, RawPage, RawTextItem};
 use crate::registry::Registry;
 
 /// 默认渲染 DPI（A4 @200dpi ≈ 1654×2339，与 rumi 实践一致）。
@@ -66,11 +79,26 @@ pub struct PdfOptions {
     /// 整页渲染 + 分区域 OCR。仅 `OcrMode::Auto` 且存在引擎时生效；
     /// 默认 false，行为与现状（纯页级路由）完全等价。
     pub intra_page: bool,
+    /// 页级进度回调：每页处理完成时回调 (已处理页数, 总页数)；返回 false
+    /// 中止解析（已产出页保留，warnings 附"用户中止于第 N 页"）。全同步，
+    /// 实现方不得在回调里再调本引擎。
+    pub on_progress: Option<std::sync::Arc<dyn Fn(u32, u32) -> bool + Send + Sync>>,
+    /// 扫描页渲染图保留：true 时渲染页的 PNG 字节进该页 Page.images
+    ///（Image.data，ext="png"）——原文/译文对照预览类需求。默认 false。
+    /// 注意 IR 的 JSON 序列化会 base64 编码图片字节，输出体积随之增大。
+    pub keep_raster_pages: bool,
 }
 
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { mode: OcrMode::Auto, dpi: DEFAULT_DPI, engine: None, intra_page: false }
+        Self {
+            mode: OcrMode::Auto,
+            dpi: DEFAULT_DPI,
+            engine: None,
+            intra_page: false,
+            on_progress: None,
+            keep_raster_pages: false,
+        }
     }
 }
 
@@ -155,6 +183,8 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
 
     // 扫描页：连续区间合并渲染（一次 pdftoppm -f/-l），逐页识别
     let mut raster_lines: Vec<Vec<RawTextItem>> = vec![Vec::new(); page_count as usize];
+    // keep_raster_pages：与 OCR 消费同一渲染图，逐页编码 PNG 待组装时挂页
+    let mut raster_page_images: Vec<Option<RawImage>> = vec![None; page_count as usize];
     if !raster_pages.is_empty() {
         let engine = opts.engine.as_ref().ok_or_else(|| DocError {
             code: ErrorCode::Unsupported,
@@ -187,11 +217,15 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
                         RawTextItem {
                             text: l.text,
                             bbox: Some(bbox),
+                            quad: Some(l.quad),
                             source: BlockSource::Ocr,
                             confidence: Some(l.score),
                             ..Default::default()
                         }
                     }).collect();
+                if opts.keep_raster_pages {
+                    raster_page_images[page_no as usize - 1] = Some(encode_page_png(&img)?);
+                }
             }
         }
     }
@@ -255,19 +289,24 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
         }
     }
 
-    // 组装：页序 = 文档序；每页取对应来源的 items
+    // 组装：页序 = 文档序；每页取对应来源的 items。页级进度回调在各页组装
+    // 完成时触发：文字层页的批量提取、扫描页的渲染+OCR 都先于组装，此刻该页
+    // 全部工作已完成，故回调序 = 页序、(已处理页数) 单调。返回 false 中止：
+    // 已组装页照常返回，余页出空占位（页号对齐，warnings 区分"未处理"）。
     let mut pages = Vec::with_capacity(page_count as usize);
+    let mut cancelled_at: Option<u32> = None;
     for (idx, p) in (1..=page_count).enumerate() {
         let is_raster = raster_pages.contains(&p);
-        let items = if is_raster {
-            std::mem::take(&mut raster_lines[idx])
+        let (items, page_images) = if is_raster {
+            (std::mem::take(&mut raster_lines[idx]), raster_page_images[idx].take())
         } else {
-            std::mem::take(&mut lines_by_page[idx])
+            (std::mem::take(&mut lines_by_page[idx]), None)
         };
         let dims = split_dims.get(&p);
         pages.push(RawPage {
             name: Some(p.to_string()),
             items,
+            images: page_images.into_iter().collect(),
             coord_units: Some(if is_raster {
                 CoordUnits::Px { dpi: opts.dpi as f32 }
             } else {
@@ -278,6 +317,21 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
             height: dims.map(|d| d.1),
             ..Default::default()
         });
+        if let Some(cb) = opts.on_progress.as_ref() {
+            if !cb(p, page_count) {
+                cancelled_at = Some(p);
+                break;
+            }
+        }
+    }
+    if let Some(done) = cancelled_at {
+        for q in (done + 1)..=page_count {
+            pages.push(RawPage {
+                name: Some(q.to_string()),
+                ..Default::default()
+            });
+        }
+        warnings.push(format!("用户中止于第 {done} 页（共 {page_count} 页）"));
     }
 
     let needs_ocr = !raster_pages.is_empty() || (opts.mode == OcrMode::Off && !scan_detected.is_empty());
@@ -450,6 +504,9 @@ fn crop_and_ocr_region(
             let px_x1 = ix0 as f32 + r.x1;
             let px_top = iy0 as f32 + r.y0;
             let px_bottom = iy0 as f32 + r.y1;
+            // quad 恒 None（缺省）：l.quad 在裁剪图局部 px 系（左上原点），
+            // 直通会与混合页统一 Pt 的 Page.coord_units 语义冲突；旋转保真
+            // 四点框只在页级路由的扫描页直通（页坐标系即渲染图坐标系）。
             RawTextItem {
                 text: l.text,
                 bbox: Some(Rect {
@@ -576,6 +633,27 @@ fn io_to_docerror(e: std::io::Error) -> DocError {
     DocError { code: ErrorCode::Unknown, message: format!("I/O 错误：{e}"), attempts: vec![] }
 }
 
+/// 渲染页图 → PNG 字节（`keep_raster_pages` 用：与 OCR 消费**同一渲染图**，
+/// 不二次渲染）。`RawImage.px` 记录渲染像素尺寸，供消费者换算/校验。
+fn encode_page_png(img: &image::RgbaImage) -> Result<RawImage> {
+    use image::codecs::png::PngEncoder;
+    use image::{ExtendedColorType, ImageEncoder};
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(img.as_raw(), img.width(), img.height(), ExtendedColorType::Rgba8)
+        .map_err(|e| DocError {
+            code: ErrorCode::Unknown,
+            message: format!("渲染页 PNG 编码失败：{e}"),
+            attempts: vec![],
+        })?;
+    Ok(RawImage {
+        data: png,
+        ext: "png".to_string(),
+        px: Some((img.width(), img.height())),
+        ..Default::default()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 文档插件：RawDoc → IR（行块透传 OCR 语义字段）
 // ---------------------------------------------------------------------------
@@ -612,16 +690,30 @@ impl FormatPlugin for PdfPlugin {
                         kind: BlockKind::Paragraph,
                         content: i.text.clone(),
                         bbox: i.bbox,
+                        quad: i.quad,
                         confidence: i.confidence,
                         source: i.source,
                         ..Default::default()
                     })
                     .collect();
                 let text = blocks_to_text(&blocks, "\n");
+                // RawImage（plugin 层）→ Image（IR 层）：字节/框/图内 OCR 文本
+                // 保留（keep_raster_pages 的渲染页图由此进 Page.images）
+                let images: Vec<crate::model::Image> = rp
+                    .images
+                    .iter()
+                    .map(|im| crate::model::Image {
+                        data: im.data.clone(),
+                        bbox: im.bbox,
+                        ocr_text: im.ocr_text.clone(),
+                        ..Default::default()
+                    })
+                    .collect();
                 Page {
                     name: rp.name.clone(),
                     blocks,
                     text,
+                    images,
                     coord_units: rp.coord_units,
                     ..Default::default()
                 }
@@ -1028,6 +1120,7 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
             for it in &rp.items {
                 assert_eq!(it.source, BlockSource::TextLayer);
                 assert!(it.confidence.is_none(), "文字层行不带置信度");
+                assert!(it.quad.is_none(), "文字层行不带四点框");
                 let Some(b) = it.bbox else { panic!("文字层行应有 bbox") };
                 assert!(b.x0 <= b.x1 && b.y0 <= b.y1, "bbox 自洽：{b:?}");
                 assert!(b.x0 > 0.0 && b.y1 > 0.0, "PDF 点空间坐标应为正：{b:?}");
@@ -1225,6 +1318,7 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         );
         for it in &ocr {
             assert!(it.confidence.unwrap_or(0.0) > 0.0, "OCR 行应带正置信度");
+            assert!(it.quad.is_none(), "混合页 OCR 行不出 quad（裁剪局部系，见 crop_and_ocr_region）");
             let b = it.bbox.expect("OCR 行应有 bbox");
             // 图区 pt：x 40–460、y 40–340，±30pt 容差粗断言
             assert!(b.x0 > 10.0 && b.x1 < 490.0, "OCR 行 x 越出图区±30pt：{b:?}");
@@ -1279,6 +1373,141 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         );
         let w = raw.meta.get("warnings").expect("应有告警");
         assert!(w.contains("未 OCR") && w.contains("无引擎"), "实际告警：{w}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 页级进度回调：2 页件按页序逐页回调 (1,2)(2,2)（文字层件无渲染依赖，
+    /// 回调点 = 各页组装完成点，计数单调）。
+    #[test]
+    fn progress_callback_counts_all_pages() {
+        let dir = probe_dir("progress");
+        let pdf = dir.join("sample.pdf");
+        if sample::generate_text_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<(u32, u32)>>> = std::sync::Arc::default();
+        let cb_calls = calls.clone();
+        let opts = PdfOptions {
+            on_progress: Some(std::sync::Arc::new(move |done, total| {
+                cb_calls.lock().unwrap().push((done, total));
+                true
+            })),
+            ..Default::default()
+        };
+        let raw = parse_pdf(&pdf, &opts).expect("解析失败");
+        assert_eq!(raw.pages.len(), 2);
+        assert_eq!(*calls.lock().unwrap(), [(1, 2), (2, 2)], "回调序 = 页序");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 进度回调取消：页 1 完成后返回 false → Ok 返回（不是 Err）、页 1 保留
+    /// 块、页 2 出空占位（页号对齐）、warnings 含中止标记。
+    #[test]
+    fn progress_cancel_keeps_done_pages() {
+        let dir = probe_dir("cancel");
+        let pdf = dir.join("sample.pdf");
+        if sample::generate_text_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let opts = PdfOptions {
+            on_progress: Some(std::sync::Arc::new(|done, _total| done < 1)),
+            ..Default::default()
+        };
+        let raw = parse_pdf(&pdf, &opts).expect("中止是 Ok 语义，不应报错");
+        assert_eq!(raw.pages.len(), 2, "空占位保持页号对齐");
+        assert!(!raw.pages[0].items.is_empty(), "已完成的页 1 保留块");
+        assert!(raw.pages[1].items.is_empty(), "页 2 未处理，出空占位");
+        assert_eq!(raw.pages[1].name.as_deref(), Some("2"));
+        let w = raw.meta.get("warnings").expect("应有中止告警");
+        assert!(w.contains("用户中止于第 1 页"), "实际告警：{w}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// keep_raster_pages：扫描页渲染图以 PNG 进 Page.images（assemble 透传），
+    /// 与 OCR 消费同一渲染图；默认关闭时 images 为空。渲染依赖同 intra 用例
+    ///（真 pdftoppm 或 gs shim 顶替）；顺带断言扫描页 OCR 行 quad 直通
+    ///（RawTextItem → assemble → Block.quad 全程保留）。
+    #[test]
+    fn keep_raster_pages_attaches_png() {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let shim = match prepare_renderer() {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("skip：{msg}");
+                return;
+            }
+        };
+        let dir = probe_dir("keep-raster");
+        let pdf = dir.join("mixed.pdf");
+        if sample::generate_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let mk_opts = |keep: bool| PdfOptions {
+            engine: Some(std::sync::Arc::new(MockRegionEngine)),
+            keep_raster_pages: keep,
+            ..Default::default()
+        };
+        // shim 目录前插 PATH（PATH_LOCK 保证与 PATH 操纵用例互斥），两轮解析
+        //（开/关）跑完统一还原
+        let old = std::env::var_os("PATH");
+        if let Some(d) = &shim {
+            let new = match old.as_ref() {
+                Some(p) => format!("{}:{}", d.display(), p.to_string_lossy()),
+                None => d.display().to_string(),
+            };
+            std::env::set_var("PATH", new);
+        }
+        let on = parse_pdf(&pdf, &mk_opts(true));
+        let off = parse_pdf(&pdf, &mk_opts(false));
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let on = on.expect("开启解析失败");
+        let off = off.expect("关闭解析失败");
+
+        // RawPage 层：渲染页图 ext="png"、px 记录渲染尺寸；OCR 行 quad 直通
+        let raw_page = &on.pages[1];
+        assert_eq!(raw_page.images.len(), 1, "扫描页恰一张渲染页图");
+        let raw_im = &raw_page.images[0];
+        assert_eq!(raw_im.ext, "png");
+        let (pw, ph) = raw_im.px.expect("渲染页图应带像素尺寸");
+        assert!(pw > 0 && ph > 0);
+        assert!(
+            raw_page.items.iter().all(|i| i.quad.is_some()),
+            "扫描页 OCR 行四点框直通"
+        );
+        assert!(on.pages[0].images.is_empty(), "文字层页不产渲染页图");
+
+        // IR 层：assemble 透传 → Page.images[0] 为 PNG（magic 头）
+        let doc = PdfPlugin.assemble(&on);
+        assert!(doc.pages[0].images.is_empty());
+        assert_eq!(doc.pages[1].images.len(), 1);
+        let im = &doc.pages[1].images[0];
+        assert!(!im.data.is_empty(), "渲染页字节非空");
+        assert!(
+            im.data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            "应为 PNG 头"
+        );
+        assert_eq!(im.bbox, None, "整页渲染图无定位框");
+        // OCR 行 quad 经 assemble 透传至 Block.quad
+        let ocr_block = doc.pages[1]
+            .blocks
+            .iter()
+            .find(|b| b.source == BlockSource::Ocr)
+            .expect("应有 Ocr 块");
+        assert_eq!(
+            ocr_block.quad,
+            Some([[100.0, 120.0], [500.0, 120.0], [500.0, 160.0], [100.0, 160.0]]),
+            "MockRegionEngine 首行四点框原样保留"
+        );
+
+        // 关：默认不保留渲染页图
+        let doc_off = PdfPlugin.assemble(&off);
+        assert!(doc_off.pages[1].images.is_empty(), "默认不保留渲染页图");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

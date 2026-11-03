@@ -35,6 +35,9 @@
 // 注意：zone rect 在页**原生（未旋转）**像素空间；`Page.rotation` 已透传
 // INFO 旋转角，旋转页的文字层 bbox 与渲染 pixmap（显示方向）存在轴交换，
 // 消费者按 rotation 换算（旋转 DjVu 罕见，不预先展开）。
+//
+// rumi 集成增强：无字页 OCR 行的 `RecognizedLine.quad` 直通 RawTextItem/
+// Block（旋转保真，与 pdf 后端扫描页路径一致）；文字层路径恒 None。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -155,6 +158,7 @@ fn parse_djvu(path: &Path, opts: &DjVuOptions) -> Result<RawDoc> {
                         RawTextItem {
                             text: l.text,
                             bbox: Some(bbox),
+                            quad: Some(l.quad),
                             source: BlockSource::Ocr,
                             confidence: Some(l.score),
                             ..Default::default()
@@ -324,6 +328,7 @@ impl FormatPlugin for DjvuPlugin {
                         kind: BlockKind::Paragraph,
                         content: i.text.clone(),
                         bbox: i.bbox,
+                        quad: i.quad,
                         confidence: i.confidence,
                         source: i.source,
                         ..Default::default()
@@ -523,6 +528,7 @@ mod tests {
             assert_eq!(it.text, *exp, "第 {} 行文本应逐字还原", i + 1);
             assert_eq!(it.source, BlockSource::TextLayer);
             assert!(it.confidence.is_none(), "文字层行不带置信度");
+            assert!(it.quad.is_none(), "文字层行不带四点框");
             let b = it.bbox.expect("Line zone 应有 bbox");
             // 编码往返后坐标应精确回到构造值（左上原点像素，dpi=300）
             assert_eq!((b.x0, b.y0, b.x1, b.y1), (*x as f32, *y as f32, (x + 600) as f32, (y + 40) as f32),
@@ -566,6 +572,11 @@ mod tests {
         let b = it.bbox.expect("OCR 行应有 bbox");
         // quad 并集：x 10..620，y 96..148（左上原点像素，渲染原生分辨率）
         assert_eq!((b.x0, b.y0, b.x1, b.y1), (10.0, 96.0, 620.0, 148.0));
+        // quad 直通：mock 四点框原样保留（旋转保真，bbox 是其轴对齐包围盒）
+        assert_eq!(
+            it.quad,
+            Some([[12.0, 96.0], [620.0, 98.0], [618.0, 148.0], [10.0, 146.0]])
+        );
         // 渲染恒为原生 scale=1 → dpi = 页 dpi
         assert_eq!(rp.coord_units, Some(CoordUnits::Px { dpi: sample::PAGE_DPI as f32 }));
         assert!(raw.needs_ocr, "存在识别文本页应标记 needs_ocr");
@@ -662,6 +673,11 @@ mod tests {
         assert_eq!(p2.blocks.len(), 1);
         assert_eq!(p2.blocks[0].source, BlockSource::Ocr);
         assert_eq!(p2.blocks[0].confidence, Some(sample::MOCK_SCORE));
+        assert_eq!(
+            p2.blocks[0].quad,
+            Some([[12.0, 96.0], [620.0, 98.0], [618.0, 148.0], [10.0, 146.0]]),
+            "assemble 透传 quad 至 Block"
+        );
         assert_eq!(p2.text, sample::MOCK_TEXT);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

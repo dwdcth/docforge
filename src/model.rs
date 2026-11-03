@@ -1,7 +1,8 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① Block 新增 confidence/source；② Page 新增 coord_units；
 // ③ 新增 BlockSource/CoordUnits 类型；④ 新增 6 个对应单测；
-// ⑤ Document 新增 blocks() 跨页扁平迭代（+ 对应单测）。其余逐字保留。
+// ⑤ Document 新增 blocks() 跨页扁平迭代（+ 对应单测）；
+// ⑥ Block 新增 quad（OCR 旋转保真四点框，rumi 集成增强）+ 对应单测。其余逐字保留。
 //! 统一 IR（含 serde 便于 JSON/CLI 往返；块/元信息语义与 docparser 的
 //! Python 参考实现一致，docforge 在其上扩展 OCR 语义字段）。
 
@@ -126,6 +127,11 @@ pub struct Block {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Rect>,
+    /// 旋转保真四点框（顺时针自左上）。轴对齐文本为 None；OCR 旋转/倾斜行有值。
+    /// bbox 恒为轴对齐包围盒，quad 是它的超集补充（PaddleOCR det polys 天然形态）。
+    /// 坐标语义随 `Page.coord_units`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quad: Option<[[f32; 2]; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,6 +433,28 @@ mod tests {
         assert!(json.contains("\"confidence\":0.87"), "{json}");
         let back: Block = serde_json::from_str(&json).unwrap();
         assert_eq!(back.confidence, Some(0.87));
+    }
+
+    /// `Block.quad`：None 不出键（docparser 旧 JSON wire 兼容）；Some 完整
+    /// 往返（顺时针自左上的四点框按数组形态逐点还原）。
+    #[test]
+    fn block_quad_wire_omitted_and_roundtrip() {
+        let plain = serde_json::to_string(&Block::default()).unwrap();
+        assert!(!plain.contains("quad"), "{plain}");
+        // 旧 JSON（无 quad 键）读入默认 None
+        let old: Block = serde_json::from_str(r#"{"kind":"paragraph"}"#).unwrap();
+        assert_eq!(old.quad, None);
+
+        let quad = [[10.0, 5.0], [20.0, 6.0], [19.0, 15.0], [9.0, 14.0]];
+        let block = Block {
+            quad: Some(quad),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"quad\":[[10.0,5.0]"), "{json}");
+        let back: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, block);
+        assert_eq!(back.quad.as_ref().unwrap()[2], [19.0, 15.0]);
     }
 
     /// `CoordUnits` 的 wire 形态：内部标签 type + snake_case 变体名。
