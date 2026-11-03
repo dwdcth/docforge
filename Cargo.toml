@@ -35,6 +35,8 @@ xlsx = ["dep:chrono", "dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
 pptx = ["dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
 # DjVu（djvu-rs 0.44：文字层直提 + 无字页渲染接 OCR；否决 djvu 0.1.0——GPL）
 djvu = ["dep:djvu-rs", "ocr"]
+# FB2（document-parser fb2 loader 吸收：单 XML 电子书；fb2.zip 解包内层 .fb2）
+fb2 = ["dep:quick-xml", "dep:base64", "dep:zip"]
 # CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
 cbz = ["dep:zip", "dep:image"]
 # MOBI（Kindle 电子书：mobi-rs 读 MOBI7 正文 HTML，azw3/KF8 不支持；M5）
@@ -62,6 +64,10 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.base64]
+version = "0.23"
 optional = true
 
 [dependencies.djvu-rs]

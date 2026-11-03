@@ -134,7 +134,20 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
             })?
     };
     let mut lines_by_page: Vec<Vec<RawTextItem>> = vec![Vec::new(); page_count as usize];
-    for line in group_into_lines_preserving_all_text(items_by_page) {
+    // M4 页内混合路由：行分组前 partition——Image 占位（pdf-inspector 已给
+    // 真实页框几何：PDF pt、左下原点，y = 图框下缘）单独收集，供分治判定
+    // 与区域裁剪；其余进常规行分组（text_line_to_item 里的 Image 过滤保留
+    // 作防御）
+    let mut img_items: Vec<pdf_inspector::TextItem> = Vec::new();
+    let mut plain_items: Vec<pdf_inspector::TextItem> = Vec::new();
+    for it in items_by_page {
+        if matches!(it.item_type, ItemType::Image) {
+            img_items.push(it);
+        } else {
+            plain_items.push(it);
+        }
+    }
+    for line in group_into_lines_preserving_all_text(plain_items) {
         if let Some(item) = text_line_to_item(&line) {
             lines_by_page[line.page as usize - 1].push(item);
         }
@@ -195,6 +208,53 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
         ));
     }
 
+    // M4 页内混合路由（实验特性 intra_page，仅 Auto 模式）：文字层页里未被
+    // 文字覆盖的大图区做整页渲染 + 分区域 OCR，OCR 行与文字层行按阅读序并
+    // 回同一页（coord_units 统一 Pt）。有引擎才执行；无引擎时判定为真也不
+    // 失败，仅记告警。/Rotate≠0 页本轮不判旋转（模块头契约已注明）。
+    let mut split_dims: std::collections::HashMap<u32, (f32, f32)> = std::collections::HashMap::new();
+    if opts.intra_page && opts.mode == OcrMode::Auto {
+        for p in 1..=page_count {
+            if !text_pages.contains(&p) {
+                continue;
+            }
+            let idx = p as usize - 1;
+            let page_imgs: Vec<pdf_inspector::TextItem> =
+                img_items.iter().filter(|it| it.page == p).cloned().collect();
+            let Some(engine) = opts.engine.as_ref() else {
+                // 无引擎降级：分治判定为真也不报错（任务书 §6）
+                if needs_intra_page_split(&lines_by_page[idx], &page_imgs) {
+                    warnings.push(format!("页 {p} 检测到未覆盖大图区，未 OCR（无引擎）"));
+                }
+                continue;
+            };
+            let targets = intra_ocr_targets(&lines_by_page[idx], &page_imgs);
+            if targets.is_empty() {
+                continue;
+            }
+            // 整页渲染单页（复用页级渲染；失败同页级路由一致，致命）
+            let Some(page_img) = render_pages(path, p, p, opts.dpi)?.into_iter().next() else {
+                continue;
+            };
+            // 由渲染图尺寸反推页面 pt 尺寸（pdf-inspector 公开 API 不暴露页框
+            // 大小；混合页 items 坐标统一 Pt，顺手填 RawPage.width/height）
+            let h_pt = page_img.height() as f32 * 72.0 / opts.dpi as f32;
+            let w_pt = page_img.width() as f32 * 72.0 / opts.dpi as f32;
+            let mut ocr_items = Vec::new();
+            for t in &targets {
+                let rect =
+                    Rect { x0: t.x, y0: t.y, x1: t.x + t.width, y1: t.y + t.height };
+                match crop_and_ocr_region(&page_img, rect, opts.dpi, h_pt, engine.as_ref()) {
+                    Ok(mut items) => ocr_items.append(&mut items),
+                    Err(e) => warnings.push(format!("页 {p} 大图区 OCR 失败：{e}")),
+                }
+            }
+            lines_by_page[idx] =
+                merge_by_reading_order(std::mem::take(&mut lines_by_page[idx]), ocr_items);
+            split_dims.insert(p, (w_pt, h_pt));
+        }
+    }
+
     // 组装：页序 = 文档序；每页取对应来源的 items
     let mut pages = Vec::with_capacity(page_count as usize);
     for (idx, p) in (1..=page_count).enumerate() {
@@ -204,6 +264,7 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
         } else {
             std::mem::take(&mut lines_by_page[idx])
         };
+        let dims = split_dims.get(&p);
         pages.push(RawPage {
             name: Some(p.to_string()),
             items,
@@ -212,6 +273,9 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
             } else {
                 CoordUnits::Pt
             }),
+            // 混合分治页：整页渲染反推的页面 pt 尺寸（其余页维持 None）
+            width: dims.map(|d| d.0),
+            height: dims.map(|d| d.1),
             ..Default::default()
         });
     }
@@ -288,6 +352,136 @@ fn text_line_to_item(line: &pdf_inspector::extractor::TextLine) -> Option<RawTex
         source: BlockSource::TextLayer,
         ..Default::default()
     })
+}
+
+// ---------------------------------------------------------------------------
+// M4 页内混合路由：文字层页大图区判定 + 区域裁剪 OCR + 阅读序合并
+// ---------------------------------------------------------------------------
+
+/// 大图判定下限：面积 ≥ 96_000 pt²（≈ 0.2 × A4 页面 595×842）。
+const INTRA_BIG_IMAGE_MIN_AREA: f32 = 96_000.0;
+/// 大图判定下限：高 ≥ 60 pt（排除横幅/装饰条）。
+const INTRA_BIG_IMAGE_MIN_HEIGHT: f32 = 60.0;
+/// 文字行与图重叠超图面积此比例即视为"文字层已覆盖"，不再对该图 OCR（防双份）。
+const INTRA_TEXT_COVER_RATIO: f32 = 0.3;
+
+/// 页内分治判定：文字层页里是否存在"未被文字覆盖的大图区"需要区域 OCR。
+///
+/// 设计依据：文字行 < 3 的页直接判否——文字太少的页本就该由页级路由抓去
+/// 整页 OCR，页内分治不越权（防重复路径）。
+fn needs_intra_page_split(
+    text_items: &[RawTextItem],
+    img_items: &[pdf_inspector::TextItem],
+) -> bool {
+    !intra_ocr_targets(text_items, img_items).is_empty()
+}
+
+/// 分治目标集：大图占位中**没有**任一文字行 bbox 与图 bbox 重叠超图面积
+/// [`INTRA_TEXT_COVER_RATIO`] 的那些（`needs_intra_page_split` 的数据面，
+/// parse_pdf 复用同一份目标做裁剪，保证判定与执行一致）。
+fn intra_ocr_targets<'a>(
+    text_items: &[RawTextItem],
+    img_items: &'a [pdf_inspector::TextItem],
+) -> Vec<&'a pdf_inspector::TextItem> {
+    if text_items.len() < 3 {
+        return Vec::new();
+    }
+    let mut targets = Vec::new();
+    for img in img_items.iter().filter(|it| {
+        it.width * it.height >= INTRA_BIG_IMAGE_MIN_AREA
+            && it.height >= INTRA_BIG_IMAGE_MIN_HEIGHT
+    }) {
+        let img_rect = Rect { x0: img.x, y0: img.y, x1: img.x + img.width, y1: img.y + img.height };
+        let img_area = img.width * img.height;
+        let covered = text_items.iter().any(|line| match line.bbox {
+            Some(b) => bbox_overlap_area(&b, &img_rect) > img_area * INTRA_TEXT_COVER_RATIO,
+            None => false,
+        });
+        if !covered {
+            targets.push(img);
+        }
+    }
+    targets
+}
+
+/// 两轴对齐矩形重叠面积（不相交为 0；坐标语义由调用方保证同系）。
+fn bbox_overlap_area(a: &Rect, b: &Rect) -> f32 {
+    let w = (a.x1.min(b.x1) - a.x0.max(b.x0)).max(0.0);
+    let h = (a.y1.min(b.y1) - a.y0.max(b.y0)).max(0.0);
+    w * h
+}
+
+/// 页内分治：整页渲染图上裁出 pt 矩形区域交 OCR，识别行坐标换算回整页 PDF 点。
+///
+/// 设计依据：混合页统一 Pt 坐标（文字层零损耗），OCR 行由渲染像素精确缩放
+/// 翻转（x_pt = px·72/dpi；y_pt = h_pt − px·72/dpi，±1px 取整误差）；裁剪区
+/// 两边 < 8px 视为无内容返回空；引擎错误原样上抛（调用方降级为告警）。
+fn crop_and_ocr_region(
+    page_img: &image::RgbaImage,
+    rect_pt: Rect,
+    dpi: u32,
+    h_pt: f32,
+    engine: &dyn OcrEngine,
+) -> std::result::Result<Vec<RawTextItem>, String> {
+    let to_px = dpi as f32 / 72.0;
+    // pt（左下原点）→ px（左上原点）：rect 上缘 = h_pt − y1_pt
+    let x_px = rect_pt.x0 * to_px;
+    let y_px = (h_pt - rect_pt.y1) * to_px;
+    let w_px = (rect_pt.x1 - rect_pt.x0) * to_px;
+    let h_px = (rect_pt.y1 - rect_pt.y0) * to_px;
+    // clamp 到整页图边界；取整后 <8px 的碎片不进引擎（装饰噪声）
+    let (iw, ih) = (page_img.width(), page_img.height());
+    let ix0 = (x_px.floor().max(0.0) as u32).min(iw);
+    let iy0 = (y_px.floor().max(0.0) as u32).min(ih);
+    let ix1 = ((x_px + w_px).ceil().max(0.0) as u32).min(iw);
+    let iy1 = ((y_px + h_px).ceil().max(0.0) as u32).min(ih);
+    if ix1 <= ix0 || iy1 <= iy0 || ix1 - ix0 < 8 || iy1 - iy0 < 8 {
+        return Ok(Vec::new());
+    }
+    let crop = image::imageops::crop_imm(page_img, ix0, iy0, ix1 - ix0, iy1 - iy0).to_image();
+    let lines = engine.recognize(&crop)?;
+    let to_pt = 72.0 / dpi as f32;
+    Ok(lines
+        .into_iter()
+        .map(|l| {
+            let r = l.axis_rect(); // 裁剪图局部 px（左上原点）
+            // 局部 px + 裁剪偏移 → 整页 px → 整页 pt（y 翻转：像素上缘 = PDF 大 y）
+            let px_x0 = ix0 as f32 + r.x0;
+            let px_x1 = ix0 as f32 + r.x1;
+            let px_top = iy0 as f32 + r.y0;
+            let px_bottom = iy0 as f32 + r.y1;
+            RawTextItem {
+                text: l.text,
+                bbox: Some(Rect {
+                    x0: px_x0 * to_pt,
+                    y0: h_pt - px_bottom * to_pt, // 像素下缘 → PDF 小 y（下缘）
+                    x1: px_x1 * to_pt,
+                    y1: h_pt - px_top * to_pt, // 像素上缘 → PDF 大 y（上缘）
+                }),
+                source: BlockSource::Ocr,
+                confidence: Some(l.score),
+                ..Default::default()
+            }
+        })
+        .collect())
+}
+
+/// 混合页阅读序合并：文字层 items 与 OCR items 按 bbox.y1 降序（PDF 左下
+/// 原点，y1 大 = 页面上方）、同 y 按 x0 升序；无 bbox 的项排末尾（防御：
+/// 正常流程两种来源都带 bbox）。设计依据：混合页统一 Pt 后两来源可直接排序。
+fn merge_by_reading_order(mut a: Vec<RawTextItem>, mut b: Vec<RawTextItem>) -> Vec<RawTextItem> {
+    a.append(&mut b);
+    a.sort_by(|x, y| match (x.bbox, y.bbox) {
+        (Some(bx), Some(by)) => by
+            .y1
+            .partial_cmp(&bx.y1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| bx.x0.partial_cmp(&by.x0).unwrap_or(std::cmp::Ordering::Equal)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    a
 }
 
 /// `pdftoppm -png -r {dpi} -f {first} -l {last}` 渲染闭区间页（1 起始）。
@@ -512,6 +706,53 @@ pub(crate) mod sample {
         let mut page = Page::a4();
         page.add_image("scan", scan);
         page.draw_image("scan", 40.0, 40.0, 515.0, 762.0).ok()?;
+        doc.add_page(page);
+
+        doc.save(path).ok()?;
+        Some(used)
+    }
+
+    /// 生成页内混合样例（M4）：单页 A4，上半页 12 行文字层（循环复用
+    /// SAMPLE_PAGES 两页文本，y 780→615），下半页嵌一个**部分区域**大图
+    /// （400×300pt @ (60,40)，与文字层无重叠）。与 generate_mixed_pdf 的
+    /// 整页图不同：整页图会被页级分类抓走整页 OCR，本件的关键是图只占
+    /// 部分区域——页级分类应判为文字层页，图区交给页内分治。
+    /// 位图 800×600px（480K < pdf-inspector template-image 阈值 500K）+
+    /// 文字算子 12（≥ 分类器门槛 max(3,10)），双保险确保页不被判扫描页。
+    pub fn generate_intra_mixed_pdf(path: &Path) -> Option<String> {
+        let (mut doc, used) = doc_with_cjk_font()?;
+        let mut page = Page::a4();
+        let ctx = page.text();
+        let mut lines: Vec<&str> = Vec::new();
+        for _ in 0..2 {
+            lines.extend_from_slice(SAMPLE_PAGES[0]);
+            lines.extend_from_slice(SAMPLE_PAGES[1]);
+        }
+        for (i, line) in lines.iter().enumerate() {
+            let _ = ctx
+                .set_font(Font::Custom("CJK".into()), 12.0)
+                .at(60.0, 780.0 - 15.0 * i as f64)
+                .write(line);
+        }
+        // 部分区域大图：白底 + 深灰条带（给 OCR 留可识别纹理），内存 JPEG
+        let mut img = image::RgbImage::new(800, 600);
+        for (_, _, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([248, 248, 244]);
+        }
+        for (x0, y0, w, h) in [(80, 80, 640, 36), (80, 200, 500, 36), (80, 320, 640, 220)] {
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    img.put_pixel(x, y, image::Rgb([40, 40, 40]));
+                }
+            }
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .ok()?;
+        let region = Image::from_jpeg_data(jpeg).ok()?;
+        page.add_image("region", region);
+        page.draw_image("region", 60.0, 40.0, 400.0, 300.0).ok()?;
         doc.add_page(page);
 
         doc.save(path).ok()?;

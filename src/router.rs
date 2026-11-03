@@ -48,6 +48,11 @@ pub fn sniff(path: &str) -> Result<&'static str> {
             "OLE 容器但扩展名不支持: {ext}"
         )));
     }
+    // FB2：XML 文本无稳定 magic，按扩展名直连（根元素校验由后端判）
+    if ext == "fb2" {
+        return Ok("fb2");
+    }
+
     if h.starts_with(DJVU_MAGIC) {
         return Ok("djvu");
     }
@@ -59,6 +64,10 @@ pub fn sniff(path: &str) -> Result<&'static str> {
         // CBZ：ZIP + 图片条目（扩展名分流，条目白名单由后端校验）
         if ext == "cbz" {
             return Ok("cbz");
+        }
+        // fb2.zip：ZIP 容器内层单 .fb2（后端解包；内层校验由后端判）
+        if ext == "zip" && path.to_ascii_lowercase().ends_with(".fb2.zip") {
+            return Ok("fb2");
         }
         // ODF（ODT/ODS/ODP）同样是 ZIP 容器（内层 content.xml），按扩展名分流；
         // 真实类型由 docparser-odf 后端读 mimetype/content.xml 进一步校验

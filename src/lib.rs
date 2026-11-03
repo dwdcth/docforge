@@ -78,6 +78,8 @@ pub fn parse(path: &str) -> Result<Document> {
     crate::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "cbz")]
     crate::backends::cbz::register_defaults(&mut registry);
+    #[cfg(feature = "fb2")]
+    crate::backends::fb2::register_defaults(&mut registry);
     #[cfg(feature = "djvu")]
     {
         let opts = crate::backends::djvu::DjVuOptions {

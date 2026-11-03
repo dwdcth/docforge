@@ -13,6 +13,8 @@ pub mod odf;
 pub mod cbz;
 #[cfg(feature = "djvu")]
 pub mod djvu;
+#[cfg(feature = "fb2")]
+pub mod fb2;
 #[cfg(feature = "mobi")]
 pub mod mobi;
 #[cfg(feature = "pdf")]
