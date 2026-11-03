@@ -72,6 +72,10 @@ pub use registry::{Registry, RegistryError};
 pub fn parse(path: &str) -> Result<Document> {
     let mut registry = Registry::new();
     plugins::text::register_defaults(&mut registry);
+    #[cfg(feature = "docx")]
+    crate::backends::office::register_defaults(&mut registry);
+    #[cfg(feature = "epub")]
+    crate::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "pdf")]
     {
         let opts = crate::backends::pdf::PdfOptions {

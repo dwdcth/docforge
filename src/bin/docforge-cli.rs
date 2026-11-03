@@ -60,9 +60,13 @@ fn main() {
     }
     let Some(input) = input else { usage() };
 
-    // 装配：文本族 + （pdf feature 时）PDF 路由
+    // 装配：文本族 + 各 feature 后端
     let mut registry = docforge::Registry::new();
     docforge::plugins::text::register_defaults(&mut registry);
+    #[cfg(feature = "docx")]
+    docforge::backends::office::register_defaults(&mut registry);
+    #[cfg(feature = "epub")]
+    docforge::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "pdf")]
     {
         use docforge::backends::pdf::{OcrMode, PdfOptions};

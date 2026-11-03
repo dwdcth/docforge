@@ -96,6 +96,46 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
+/// 引号感知的标签结束查找：属性值内的 `>` 不算标签边界（docforge 修补 ①）。
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// 从原始标签文本提取属性值（`alt="x"` / `alt='x'`；无引号单 token）。
+fn extract_attr(raw: &str, name: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let pos = lower.find(&key)?;
+    let rest = raw[pos + key.len()..].trim_start();
+    // 带引号：取到闭合引号（值可含空格）；无引号：取到空白/标签边界
+    let (v, end_ch): (&str, &[char]) = if rest.starts_with('"') {
+        (&rest[1..], &['"'])
+    } else if rest.starts_with('\'') {
+        (&rest[1..], &['\''])
+    } else {
+        (rest, &[' ', '\t', '>'])
+    };
+    let end = v.find(end_ch).unwrap_or(v.len());
+    let v = v[..end].trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(decode_entities(v))
+    }
+}
+
 fn tag_name(raw: &str) -> String {
     raw.split(|c: char| c.is_whitespace() || c == '/')
         .next()
@@ -112,6 +152,8 @@ struct Collector {
     table: Option<Vec<Vec<String>>>,
     heading: Option<u8>,
     skip_depth: usize,
+    /// 列表嵌套栈（docforge 修补 ③）：ol→true / ul→false，li 的 ordered 取栈顶
+    list_stack: Vec<bool>,
 }
 
 impl Collector {
@@ -132,7 +174,7 @@ impl Collector {
         // 与 Python `_flush_text(BlockKind.LIST, ordered=False)` 一致：
         // `li` 不区分 ol/ul，一律按无序列表标记
         if kind == BlockKind::List {
-            block.ordered = Some(false);
+            block.ordered = Some(self.list_stack.last().copied().unwrap_or(false));
         }
         self.blocks.push(block);
     }
@@ -151,6 +193,8 @@ impl Collector {
             return;
         }
         match name {
+            "ol" => self.list_stack.push(true),
+            "ul" => self.list_stack.push(false),
             "p" | "div" | "br" | "li" | "blockquote" => self.flush(BlockKind::Paragraph),
             "pre" => {
                 self.flush(BlockKind::Paragraph);
@@ -184,6 +228,9 @@ impl Collector {
             return;
         }
         match name {
+            "ol" | "ul" => {
+                self.list_stack.pop();
+            }
             "pre" => self.flush(BlockKind::Code),
             "li" => self.flush(BlockKind::List),
             "td" | "th" => {
@@ -218,6 +265,21 @@ impl Collector {
             "blockquote" => self.flush(BlockKind::Quote),
             _ => {}
         }
+    }
+
+    /// img（void 元素）：直接产 Image 块（docforge 修补 ②）。
+    /// `content` 语义是 OCR 文本故保持空；alt 进 `meta["alt"]` 供检索。
+    fn on_img(&mut self, alt: Option<String>) {
+        self.flush(BlockKind::Paragraph);
+        let mut meta = std::collections::BTreeMap::new();
+        if let Some(a) = alt {
+            meta.insert("alt".to_string(), crate::model::MetaValue::Str(a));
+        }
+        self.blocks.push(Block {
+            kind: BlockKind::Image,
+            meta,
+            ..Default::default()
+        });
     }
 
     fn on_text(&mut self, data: &str) {
@@ -279,7 +341,7 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
             text_start = i;
             continue;
         }
-        match text[i..].find('>') {
+        match find_tag_end(&text[i..]) {
             Some(rel) => {
                 let raw = &text[i + 1..i + rel];
                 let trimmed = raw.trim();
@@ -289,7 +351,13 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
                     && !trimmed.starts_with('!')
                     && !trimmed.starts_with('?')
                 {
-                    collector.start_tag(&tag_name(trimmed));
+                    let name = tag_name(trimmed);
+                    if name == "img" {
+                        // img 是 void 元素：不进开闭栈，直接产块（修补 ②）
+                        collector.on_img(extract_attr(trimmed, "alt"));
+                    } else {
+                        collector.start_tag(&name);
+                    }
                 }
                 i = i + rel + 1;
             }
@@ -432,5 +500,47 @@ mod tests {
         let _ = parse_blocks("<p>unclosed <b>bold");
         let _ = parse_blocks("<");
         let _ = parse_blocks("<<>>");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// docforge 三修补的测试（M2b）：引号内 >、img→Image、ol 有序
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod m2b_tests {
+    use super::*;
+
+    #[test]
+    fn attribute_value_with_gt_not_truncated() {
+        // 属性值里的 > 不能截断标签（修补 ①）
+        let html = r#"<p title="a>b">正文</p><p>第二段</p>"#;
+        let blocks = parse_blocks(html);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].content, "正文");
+        assert_eq!(blocks[1].content, "第二段");
+    }
+
+    #[test]
+    fn img_produces_image_block_with_alt() {
+        let html = r#"<p>前文</p><img src="x.png" alt="山景 图"><p>后文</p>"#;
+        let blocks = parse_blocks(html);
+        let img = blocks.iter().find(|b| b.kind == BlockKind::Image).expect("应有 Image 块");
+        assert_eq!(img.content, "");
+        assert_eq!(
+            img.meta.get("alt"),
+            Some(&crate::model::MetaValue::Str("山景 图".to_string()))
+        );
+    }
+
+    #[test]
+    fn ol_list_items_ordered() {
+        let html = r#"<ol><li>甲</li><li>乙</li></ol><ul><li>子</li></ul>"#;
+        let blocks = parse_blocks(html);
+        let lists: Vec<&Block> = blocks.iter().filter(|b| b.kind == BlockKind::List).collect();
+        assert_eq!(lists.len(), 3);
+        assert_eq!(lists[0].ordered, Some(true), "ol 内 li 有序");
+        assert_eq!(lists[1].ordered, Some(true));
+        assert_eq!(lists[2].ordered, Some(false), "ul 内 li 无序");
     }
 }

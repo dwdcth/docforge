@@ -26,6 +26,32 @@ pdf = ["dep:pdf-inspector", "dep:image", "ocr"]
 ocr = ["dep:image"]
 # oar-ocr 默认引擎（重依赖 ort 隔离于此；含 pdf 路由接线）
 ocr-oar = ["ocr", "pdf", "dep:oar-ocr"]
+# DOCX（docparser-office 吸收：zip + quick-xml 流式）
+docx = ["dep:zip", "dep:quick-xml", "dep:md-5", "dep:log"]
+# EPUB（docparser-epub 吸收：spine/OPF + HTML 块化，依赖 html 插件）
+epub = ["dep:zip", "dep:quick-xml", "html"]
+# xlsx/pptx：M3 吸收占位（当前空实现，注册块被 cfg 剔除）
+xlsx = []
+pptx = []
+
+[dependencies.zip]
+version = "9"
+features = ["deflate-flate2-zlib-rs"]
+default-features = false
+optional = true
+
+[dependencies.quick-xml]
+version = "0.42"
+features = ["serialize"]
+optional = true
+
+[dependencies.md-5]
+version = "0.10"
+optional = true
+
+[dependencies.log]
+version = "0.4"
+optional = true
 
 [dependencies.serde]
 version = "1"
