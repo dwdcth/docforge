@@ -21,8 +21,6 @@ pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译
 环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
 ghostscript shim；详见 docs/开发记录.md）。
 
-规划：[docparse-plan.md](docparse-plan.md)；各期规格：`docforge-spec-*.md`。
-
 ## 快速上手
 
 按场景三行依赖声明（文本族随 `default` 自带，见节末说明）：
