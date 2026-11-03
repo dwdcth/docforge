@@ -3,8 +3,8 @@
 //! 原实现住在 [`crate::plugins::text`]（格式插件文件），但"字节 → String"
 //! 的解码链语义上是横切能力：TXT/MD/CSV/HTML 共用
 //! [`read_text`](crate::plugins::text::read_text) 一条链；EPUB 条目解码
-//! （[`crate::backends::epub`]）在 XML 声明嗅探未命中时回落到本模块；
-//! 外部消费者（rumi 等）可用 [`detect_and_decode`] 拿"解码结果 + 编码名"。
+//! （crate::backends::epub，epub feature）在 XML 声明嗅探未命中时回落到本模块；
+//! 外部消费者可用 [`detect_and_decode`] 拿"解码结果 + 编码名"。
 //! M2 后抽出为独立模块，[`decode`] 保持原签名与行为（text.rs 以 `pub use`
 //! 转发，旧调用点零改动）。
 //!
