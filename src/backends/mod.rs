@@ -11,5 +11,9 @@ pub mod epub;
 pub mod odf;
 #[cfg(feature = "cbz")]
 pub mod cbz;
+#[cfg(feature = "djvu")]
+pub mod djvu;
+#[cfg(feature = "mobi")]
+pub mod mobi;
 #[cfg(feature = "pdf")]
 pub mod pdf;

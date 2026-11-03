@@ -1,0 +1,538 @@
+//! MOBI 后端（Kindle 电子书 / Mobipocket，feature = "mobi"，docparse-plan §7 M5）。
+//!
+//! 支持面（mobi crate 0.8.0 依源码核实，registry 缓存
+//! `~/.cargo/registry/src/mirrors.ustc.edu.cn-38d0e5eb5da2abae/mobi-0.8.0/`）：
+//! * **支持 MOBI7（含 kindlegen 混合件的 MOBI7 部分）**。API 形态：
+//!   `Mobi::from_path`（src/lib.rs L94-97）打开 → `title()/author()/language()`
+//!   等元数据访问（L130-177，EXTH 记录 → 缺省回落）→
+//!   `content_as_string_lossy()`（L321-327）按压缩类型（无压缩/PalmDoc/HUFF，
+//!   palmdoch.rs L20-28）解压 readable 记录区间（L216-219，
+//!   `first_content_record..first_non_book_index`）拼出**整篇 HTML**。
+//! * **不支持 azw3/KF8，`formats` 不含 "azw3"**（保守裁定）：
+//!   ① `MobiType` 枚举无 KF8 变体、`format_version`（KF8=8）不公开
+//!   （mobih.rs L22-63 / L153）；② PalmDOC 解压不做逐记录 trailing-entry
+//!   剥离——`extra_record_data_flags`（mobih.rs L317 解析后从未消费），
+//!   记录切分只按 PDB 头 gap 字段统一截断（record.rs L143-167，真实文件
+//!   该字段=0），KF8 记录的尾部标记字节会以垃圾字符混进正文；
+//!   ③ 混合件（MOBI7+KF8 同包）不受影响：readable 区间止于 MOBI7 的
+//!   `first_non_book_index`，KF8 段不参与——翻译场景按 MOBI7 正文降级正确。
+//!   后续若接 KF8，需换带 per-record trailing 剥离的读取器再开 "azw3"。
+//!
+//! 数据流（epub.rs 同款"原文整体交插件"模式）：
+//! `MobiRawBackend`（ParseCapability）→ 元数据进 `RawDoc.meta`
+//! （`mobi.title` / `mobi.authors` / `mobi.language`）+ 整篇 HTML 进
+//! `items[0]` → `MobiPlugin`（FormatPlugin）`assemble` 用
+//! `plugins::html::parse_blocks` 块化为单页结构化文档。
+//!
+//! 吸收来源：document-parser 0.1.0-alpha.18 的 mobi loader
+//! （vendor/document-parser-0.1.0-alpha.18/src/formats/mobi/loader.rs）仅作
+//! 模式参考——语言规范化口径（枚举 Debug 小写，其 loader.rs L164-174）与
+//! "整篇 HTML 交上层"；其块化用 scraper（html5ever 全家桶，docparse-plan
+//! §2.4 明确不引入），本模块改喂自有 HTML 扫描器。mobi crate（MIT，
+//! crates.io 存档）为直接依赖，feature `time`（chrono）不开。
+//!
+//! DRM：encrypted 是终止码不回退（docparse-plan §6）——PalmDoc 头
+//! encryption 字段或 MOBI 头 drm_offset 任一命中即拒绝，不做解密。
+//!
+//! 测试件：mobi-0.8.0 存档无 tests/ 目录与 .mobi/.azw3 样例（核实于
+//! registry 缓存），故构造最小 MOBI7 二进制金测（手工编字节，构造法与
+//! mobi-rs 自带 src/book.rs 同源），另留 #[ignore] 真件集成测试位。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use mobi::headers::{Encryption, ExthRecord};
+use mobi::Mobi;
+
+use crate::error::{DocError, Result};
+use crate::model::{Document, Page};
+use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawPage, RawTextItem};
+use crate::plugins::html::parse_blocks;
+use crate::registry::Registry;
+
+// ── 元数据归一 ──────────────────────────────────────────────────────
+
+/// 书名归一：EXTH 503 有值即用；PalmDB 名回落带零填充尾（Palm 约定 32B 补零），
+/// 去尾零与首尾空白。
+fn normalize_title(title: String) -> String {
+    title.trim_end_matches('\0').trim().to_string()
+}
+
+/// 取 EXTH 某记录类型的**全部**取值（可重复记录），各自 lossy 解码去空，`; ` 连接。
+/// mobi crate 的 `author()` 只取第一条（get_record_string_lossy → first），
+/// 多作者书会丢后续——这里走底层 `exth_record` 拿全量（口径对齐 epub.authors）。
+fn all_exth_strings(book: &Mobi, record: ExthRecord) -> String {
+    book.metadata
+        .exth_record(record)
+        .map(|records| {
+            records
+                .iter()
+                .map(|d| String::from_utf8_lossy(d).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default()
+}
+
+/// 语言规范化：EXTH 524（字符串形态，如 `zh-cn`）优先——比 MOBI 头 locale
+/// 字节精确；缺省回落 locale 字节枚举的 Debug 小写（document-parser 同款
+/// 口径，vendor/.../formats/mobi/loader.rs L164-174）。Neutral/Unknown 记空串
+/// （调用方不落 meta 键，与 epub.rs"取不到不插键"一致）。
+fn language_of(book: &Mobi) -> String {
+    if let Some(records) = book.metadata.exth_record_at(524) {
+        if let Some(v) = records.first() {
+            let s = String::from_utf8_lossy(v).trim().to_ascii_lowercase();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    match format!("{:?}", book.language()).to_ascii_lowercase().as_str() {
+        "unknown" | "neutral" | "" => String::new(),
+        s => s.to_string(),
+    }
+}
+
+// ── 能力 / 插件 ─────────────────────────────────────────────────────
+
+/// 原始读取：整篇正文 HTML 进 `RawPage.items[0]`，书籍元数据进 `RawDoc.meta`。
+#[derive(Default)]
+pub struct MobiRawBackend;
+
+impl ParseCapability for MobiRawBackend {
+    fn id(&self) -> &str {
+        "mobi.read"
+    }
+    fn formats(&self) -> &[&str] {
+        // azw3 不在支持面（见模块头裁定）；prc 是 MOBI/PalmDoc 的同构扩展名
+        &["mobi", "prc"]
+    }
+    fn parse(&self, path: &str) -> Result<RawDoc> {
+        let book = Mobi::from_path(path)
+            .map_err(|e| DocError::corrupt(format!("MOBI 打开失败: {e}")))?;
+
+        // 加密件是终止码不回退（docparse-plan §6）：PalmDoc 头 encryption 字段
+        // （0=无/1=旧 Mobipocket/2=Mobipocket）+ MOBI 头 drm_offset 指到 DRM
+        // 记录（has_drm，mobih.rs L390-392）任一命中即拒绝
+        if book.encryption() != Encryption::No || book.metadata.mobi.has_drm() {
+            return Err(DocError::encrypted("MOBI 带 DRM 加密，不支持解密"));
+        }
+
+        // 正文：readable 记录区间解压出的整篇 HTML。用 lossy 版本——单字节
+        // 编码瑕疵不致命整个文件（翻译场景宁要占位符不要失败）
+        let html = book.content_as_string_lossy();
+        if html.trim().is_empty() {
+            // Huff 解压失败时 mobi-rs 静默返回空串（lib.rs L325
+            // unwrap_or_default）：把"静默空"升格为 corrupt 交给上层回退链
+            return Err(DocError::corrupt(
+                "MOBI 正文为空（不支持的压缩/内容形态，或纯图像书）",
+            ));
+        }
+
+        let mut meta = HashMap::new();
+        let title = normalize_title(book.title());
+        if !title.is_empty() {
+            meta.insert("mobi.title".to_string(), title);
+        }
+        let authors = all_exth_strings(&book, ExthRecord::Author);
+        if !authors.is_empty() {
+            meta.insert("mobi.authors".to_string(), authors);
+        }
+        let language = language_of(&book);
+        if !language.is_empty() {
+            meta.insert("mobi.language".to_string(), language);
+        }
+
+        Ok(RawDoc {
+            pages: vec![RawPage {
+                items: vec![RawTextItem {
+                    text: html,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            meta,
+            needs_ocr: false,
+        })
+    }
+}
+
+/// MOBI 插件：整篇 HTML → 结构化块（单页文档）。
+///
+/// 取舍（相对 epub.rs 的按文档内标题切节）：**不切节**。MOBI7 无 spine/NCX
+/// 等章界结构，章界靠 `<mbp:pagebreak>` 与标题的松散约定（parse_blocks 不
+/// 产出 pagebreak 位置信息），且真实语料里标题层级混乱（自 Word/网页迁移的
+/// 书常全文 h1）；翻译场景需要的是稳定段落边界而不是猜测的章界——整篇块化
+/// （plugins::html 的 HtmlPlugin 同款口径）+ 元数据透传 `meta.extra`。
+pub struct MobiPlugin;
+
+impl FormatPlugin for MobiPlugin {
+    fn id(&self) -> &str {
+        "mobi"
+    }
+    fn formats(&self) -> &[&str] {
+        &["mobi", "prc"]
+    }
+    fn default_parse_chain(&self) -> Vec<&'static str> {
+        vec!["mobi.read"]
+    }
+    fn default_process_chain(&self) -> Vec<&'static str> {
+        // opt-in 链：能力未注册时 resolve 静默跳过（registry filter_map 语义）
+        #[allow(unused_mut)]
+        let mut chain: Vec<&'static str> = vec!["ocr-images"];
+        #[cfg(feature = "lang-detect")]
+        chain.push("lang-detect");
+        chain
+    }
+    fn assemble(&self, raw: &RawDoc) -> Document {
+        let html = raw
+            .pages
+            .first()
+            .and_then(|p| p.items.first())
+            .map(|i| i.text.as_str())
+            .unwrap_or_default();
+        let blocks = parse_blocks(html);
+        // 页文本 = 非空 content 以空行连接（Image 块 content 为空不进文本，
+        // 与 HtmlPlugin 同口径）
+        let text = blocks
+            .iter()
+            .filter(|b| !b.content.is_empty())
+            .map(|b| b.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut doc = Document {
+            pages: vec![Page {
+                blocks,
+                text,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for key in ["mobi.title", "mobi.authors", "mobi.language"] {
+            if let Some(v) = raw.meta.get(key) {
+                doc.meta.extra.insert(key.to_string(), v.clone());
+            }
+        }
+        doc
+    }
+}
+
+/// 注册 MOBI 后端（解析能力 + 插件）。
+pub fn register_defaults(reg: &mut Registry) {
+    let _ = reg.register_parse(Arc::new(MobiRawBackend), None);
+    reg.register_plugin(Arc::new(MobiPlugin));
+}
+
+// ── 测试：构造最小 MOBI7 金测（mobi crate 只读、无语料 → 手工编字节） ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::BlockKind;
+    use std::path::PathBuf;
+
+    /// 测试件参数（构造最小 MOBI7）。
+    struct Fixture {
+        /// PalmDoc 头 encryption 字段：0=无 / 2=Mobipocket 加密
+        encryption: u16,
+        /// MOBI 头 drm_offset：false=0xFFFFFFFF（无 DRM）/ true=100（指到 DRM 记录）
+        drm: bool,
+        /// 是否挂 EXTH 头（书名/作者/语言字符串记录）
+        exth: bool,
+        /// PalmDB 名（title() 的 EXTH 缺省回落源）
+        name: &'static str,
+        /// 正文 HTML（单条无压缩 UTF-8 记录）
+        content: &'static str,
+    }
+
+    fn be16(v: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    fn be32(v: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// 手工编最小 MOBI7：PDB 头(78B) + 记录表(2×8B + 2B gap) + 记录 0
+    /// （PalmDoc 头 16B + MOBI 头 232B + EXTH? + 全名）+ 记录 1（正文）。
+    /// 字节布局严格对齐 mobi-rs 解析路径
+    /// （headers/{header,palmdoch,mobih,exth}.rs 与 record.rs）。
+    fn build_mobi(dir_name: &str, f: &Fixture) -> PathBuf {
+        let text = f.content.as_bytes().to_vec();
+
+        // ── 记录 0 ──
+        let mut rec0 = Vec::new();
+        // PalmDoc 头（palmdoch.rs L100-110 读取序，16B）
+        be16(1, &mut rec0); // compression = 无压缩
+        be16(0, &mut rec0); // unused
+        be32(text.len() as u32, &mut rec0); // text_length
+        be16(1, &mut rec0); // record_count = 1（正文一条记录）
+        be16(4096, &mut rec0); // record_size
+        be16(f.encryption, &mut rec0); // encryption
+        be16(0, &mut rec0); // unused
+
+        // MOBI 头字段体（mobih.rs L242-327 读取序；identifier 之后 216B，
+        // header_length 记 232 带 8B 尾垫 = 真实 kindlegen 口径）
+        let mut body = Vec::new();
+        be32(2, &mut body); // mobi_type = MobiPocketBook
+        be32(65001, &mut body); // text_encoding = UTF-8
+        be32(0, &mut body); // id
+        be32(6, &mut body); // gen_version
+        be32(!0, &mut body); // ortho_index
+        be32(!0, &mut body); // inflect_index
+        for _ in 0..6 {
+            be32(!0, &mut body); // extra_indices ×6
+        }
+        be32(2, &mut body); // first_non_book_index（正文止于记录 1 之后）
+        let name_off_at = body.len(); // name_offset 占位（记录 0 定长后回填）
+        be32(0, &mut body);
+        be32(f.name.len() as u32, &mut body); // name_length
+        be16(0, &mut body); // unused
+        body.push(9); // locale = 0x09（英文）
+        body.push(9); // language_code = 9 → Language::English
+        be32(0, &mut body); // input_language
+        be32(0, &mut body); // output_language
+        be32(6, &mut body); // format_version（MOBI7 = 6）
+        be32(!0, &mut body); // first_image_index
+        be32(0, &mut body); // first_huff_record
+        be32(0, &mut body); // huff_record_count
+        be32(0, &mut body); // huff_table_offset
+        be32(0, &mut body); // huff_table_length
+        be32(if f.exth { 0x40 } else { 0 }, &mut body); // exth_flags：0x40 = 有 EXTH
+        body.extend_from_slice(&[0; 32]); // unused_0
+        be32(!0, &mut body); // unused_1
+        // drm_offset：非 0xFFFFFFFF 即视为有 DRM（has_drm）
+        be32(if f.drm { 100 } else { !0 }, &mut body);
+        be32(0, &mut body); // drm_count
+        be32(0, &mut body); // drm_size
+        be32(0, &mut body); // drm_flags
+        body.extend_from_slice(&[0; 8]); // unused_2
+        be16(1, &mut body); // first_content_record
+        be16(1, &mut body); // last_content_record
+        be32(0, &mut body); // unused_3
+        be32(!0, &mut body); // fcis_record
+        be32(!0, &mut body); // unused_4
+        be32(!0, &mut body); // flis_record
+        be32(!0, &mut body); // unused_5
+        be32(0, &mut body); // unused_6（u64 低半）
+        be32(0, &mut body); // unused_6（u64 高半）
+        be32(!0, &mut body); // unused_7
+        be32(0, &mut body); // first_compilation_data_section_count
+        be32(!0, &mut body); // data_section_count
+        be32(!0, &mut body); // unused_8
+        be32(0, &mut body); // extra_record_data_flags
+        be32(!0, &mut body); // first_index_record
+        assert_eq!(body.len(), 216, "MOBI 头字段体应为 216B");
+
+        rec0.extend_from_slice(b"MOBI");
+        be32(232, &mut rec0); // header_length（8 + 216 + 8 尾垫）
+        rec0.extend_from_slice(&body);
+        rec0.extend_from_slice(&[0; 8]); // header_length 尾垫（mobi-rs 读进 unused_9）
+
+        // EXTH（exth.rs L217-259）：12B 头 + N×(type u32 + len u32 + data)
+        if f.exth {
+            let mut exth = Vec::new();
+            let mut count = 0u32;
+            let mut put = |ty: u32, data: &[u8]| {
+                be32(ty, &mut exth);
+                be32(8 + data.len() as u32, &mut exth);
+                exth.extend_from_slice(data);
+                count += 1;
+            };
+            put(100, "作者甲; 作者乙".as_bytes()); // Author（可重复记录）
+            put(503, "测试书".as_bytes()); // Title（title() 优先源）
+            put(524, b"zh-cn"); // Language（字符串形态）
+            let mut hdr = Vec::new();
+            hdr.extend_from_slice(b"EXTH");
+            be32(12 + exth.len() as u32, &mut hdr);
+            be32(count, &mut hdr);
+            rec0.extend_from_slice(&hdr);
+            rec0.extend_from_slice(&exth);
+        }
+
+        // 4 字节对齐后挂 PalmDB 全名（name_offset 相对记录 0 起点，
+        // headers/mod.rs L87-99 用 records[0].offset + name_offset 定位）
+        while rec0.len() % 4 != 0 {
+            rec0.push(0);
+        }
+        let name_offset = rec0.len() as u32;
+        rec0.extend_from_slice(f.name.as_bytes());
+        let name_off_pos = 16 + 8 + name_off_at; // PalmDoc 头 + "MOBI" + header_length 之后
+        rec0[name_off_pos..name_off_pos + 4].copy_from_slice(&name_offset.to_be_bytes());
+
+        // ── PDB 头 + 记录表（header.rs L44-81；gap 字段 = PdbRecords.extra_bytes，恒 0）──
+        let mut out = Vec::new();
+        let mut pdb_name = f.name.as_bytes().to_vec();
+        pdb_name.resize(32, 0);
+        out.extend_from_slice(&pdb_name); // 32B 名
+        be16(0, &mut out); // attributes
+        be16(0, &mut out); // version
+        be32(0, &mut out); // created
+        be32(0, &mut out); // modified
+        be32(0, &mut out); // backup
+        be32(0, &mut out); // modnum
+        be32(0, &mut out); // app_info_id
+        be32(0, &mut out); // sort_info_id
+        out.extend_from_slice(b"BOOK"); // type
+        out.extend_from_slice(b"MOBI"); // creator
+        be32(2, &mut out); // unique_id_seed
+        be32(0, &mut out); // next_record_list_id
+        be16(2, &mut out); // num_records = 2
+        let rec0_off = out.len() as u32 + 2 * 8 + 2; // 78 + 16 + 2 = 96
+        be32(rec0_off, &mut out);
+        be32(0, &mut out); // (offset, id) ×2
+        be32(rec0_off + rec0.len() as u32, &mut out);
+        be32(1, &mut out);
+        be16(0, &mut out); // gap（extra_bytes = 0）
+        debug_assert_eq!(out.len() as u32, rec0_off);
+        out.extend_from_slice(&rec0);
+        out.extend_from_slice(&text);
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mobi-{dir_name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.mobi");
+        std::fs::write(&path, &out).unwrap();
+        path
+    }
+
+    fn full_fixture() -> Fixture {
+        Fixture {
+            encryption: 0,
+            drm: false,
+            exth: true,
+            name: "testbook",
+            content: "<html><head><title>内页标题</title></head><body>\
+                      <h1>第一章 标题</h1><p>正文一段。</p><p>正文二段。</p>\
+                      <mbp:pagebreak/></body></html>",
+        }
+    }
+
+    /// 金测（构造真件走真读取路径）：EXTH 书名/作者/语言 + 整篇 HTML 进 items[0]。
+    #[test]
+    fn reads_metadata_and_content_from_constructed_mobi7() {
+        let p = build_mobi("full", &full_fixture());
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+
+        assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("测试书"));
+        assert_eq!(
+            raw.meta.get("mobi.authors").map(String::as_str),
+            Some("作者甲; 作者乙")
+        );
+        assert_eq!(raw.meta.get("mobi.language").map(String::as_str), Some("zh-cn"));
+        assert_eq!(raw.pages.len(), 1);
+        assert!(raw.pages[0].items[0].text.contains("正文一段。"));
+        assert!(raw.pages[0].items[0].text.contains("<mbp:pagebreak/>"));
+        assert!(!raw.needs_ocr);
+    }
+
+    /// HTML 块化路径：head/title 跳过，正文 = 标题 + 两段；元数据透传 meta.extra。
+    #[test]
+    fn assembles_html_into_structured_blocks() {
+        let p = build_mobi("asm", &full_fixture());
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let doc = MobiPlugin.assemble(&raw);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+
+        assert_eq!(doc.pages.len(), 1);
+        let kinds: Vec<BlockKind> = doc.pages[0].blocks.iter().map(|b| b.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![BlockKind::Heading, BlockKind::Paragraph, BlockKind::Paragraph]
+        );
+        assert_eq!(doc.pages[0].blocks[0].content, "第一章 标题");
+        assert_eq!(doc.pages[0].text, "第一章 标题\n\n正文一段。\n\n正文二段。");
+        assert_eq!(doc.meta.extra.get("mobi.title").map(String::as_str), Some("测试书"));
+        assert_eq!(doc.meta.extra.get("mobi.language").map(String::as_str), Some("zh-cn"));
+    }
+
+    /// EXTH 缺省回落：书名取 PalmDB 名（去零填充尾），语言取 MOBI 头 locale
+    /// 字节枚举的 Debug 小写；无作者记录则不落键。
+    #[test]
+    fn falls_back_to_palm_name_and_locale_language_without_exth() {
+        let p = build_mobi(
+            "minimal",
+            &Fixture {
+                exth: false,
+                name: "testbook",
+                ..full_fixture()
+            },
+        );
+        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+
+        assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("testbook"));
+        assert_eq!(raw.meta.get("mobi.language").map(String::as_str), Some("english"));
+        assert!(!raw.meta.contains_key("mobi.authors"));
+    }
+
+    /// 加密件是终止码（encrypted），不进回退链：encryption 字段与 drm_offset
+    /// 两条判定路径分别验证。
+    #[test]
+    fn encrypted_or_drm_mobi_is_encrypted_error() {
+        let p = build_mobi("enc", &Fixture { encryption: 2, ..full_fixture() });
+        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert_eq!(err.code.as_str(), "encrypted");
+
+        let p = build_mobi("drm", &Fixture { drm: true, ..full_fixture() });
+        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        assert_eq!(err.code.as_str(), "encrypted");
+    }
+
+    #[test]
+    fn garbage_is_corrupt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("mobi-garbage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.mobi");
+        std::fs::write(
+            &path,
+            b"this file is definitely not a mobi document, not even close......",
+        )
+        .unwrap();
+        let err = MobiRawBackend.parse(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err.code.as_str(), "corrupt");
+    }
+
+    /// 真实语料金测位：mobi-0.8.0 存档无自带样例（无 tests/ 目录，核实于
+    /// registry 缓存）。人工放入 tests/fixtures/mobi/（.mobi/.prc，注明来源
+    /// 与许可）后运行 `cargo test --features mobi -- --ignored`。逐件断言：
+    /// 打开成功 + 书名非空 + 正文有非空块。
+    #[test]
+    #[ignore = "缺 .mobi/.prc 真实语料测试件（放入 tests/fixtures/mobi/ 后运行 --ignored）"]
+    fn real_corpus_golden() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mobi");
+        let entries = std::fs::read_dir(&dir).expect("tests/fixtures/mobi/ 目录应存在");
+        let mut checked = 0;
+        for e in entries.flatten() {
+            let path = e.path();
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if !matches!(ext.to_ascii_lowercase().as_str(), "mobi" | "prc") {
+                continue;
+            }
+            let raw = MobiRawBackend
+                .parse(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{} 打开失败: {e}", path.display()));
+            assert!(
+                raw.meta.contains_key("mobi.title"),
+                "{} 应解析出书名",
+                path.display()
+            );
+            let doc = MobiPlugin.assemble(&raw);
+            assert!(
+                !doc.pages.is_empty()
+                    && doc.pages[0].blocks.iter().any(|b| !b.content.is_empty()),
+                "{} 正文应有非空块",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "tests/fixtures/mobi/ 内没有 .mobi/.prc 样例");
+    }
+}

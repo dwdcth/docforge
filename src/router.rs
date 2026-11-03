@@ -7,6 +7,8 @@ use crate::error::{DocError, Result};
 const OLE_MAGIC: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 const PDF_MAGIC: &[u8] = b"%PDF";
+/// DjVu：IFF 容器，`AT&TFORM` + 4 字节文档类型（DJVM/DJVU），前 8 字节即够判
+const DJVU_MAGIC: &[u8] = b"AT&TFORM";
 
 const OOXML: &[&str] = &["docx", "xlsx", "pptx"];
 const ODF: &[&str] = &["odt", "ods", "odp"];
@@ -46,10 +48,17 @@ pub fn sniff(path: &str) -> Result<&'static str> {
             "OLE 容器但扩展名不支持: {ext}"
         )));
     }
+    if h.starts_with(DJVU_MAGIC) {
+        return Ok("djvu");
+    }
     if h.starts_with(ZIP_MAGIC) {
         // EPUB 也是 ZIP 容器：结构（container.xml/opf/spine）由 epub 后端进一步校验
         if ext == "epub" {
             return Ok("epub");
+        }
+        // CBZ：ZIP + 图片条目（扩展名分流，条目白名单由后端校验）
+        if ext == "cbz" {
+            return Ok("cbz");
         }
         // ODF（ODT/ODS/ODP）同样是 ZIP 容器（内层 content.xml），按扩展名分流；
         // 真实类型由 docparser-odf 后端读 mimetype/content.xml 进一步校验

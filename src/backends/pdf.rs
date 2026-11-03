@@ -15,8 +15,14 @@
 //   原坐标系（Rect 的 y0 = PDF 空间较小值 = 行的下缘）；
 // - OCR 页 `Some(CoordUnits::Px { dpi })`：渲染图像坐标（左上原点），
 //   dpi 即渲染分辨率，可换算回 PDF 点（pt = px / dpi * 72）。
+// - 混合页（页内分治，M4 实验特性 `intra_page`）统一 `Some(CoordUnits::Pt)`：
+//   文字层坐标零损耗；OCR 行 bbox 由整页渲染像素按 dpi 精确缩放 + y 翻转
+//   回 PDF 点（pt = px * 72 / dpi），含 ±1px 取整误差。
 // 同一文档两坐标系并存，消费者按 `Page.coord_units` 区分（归一化坐标列为
 // 远期重构项，docparse-plan §14 Q1）。
+//
+// 已知限制：`/Rotate ≠ 0` 页的混合分治本轮不判旋转（文字行 rotation 本轮
+// 不读），此类页 OCR 块坐标可能失真，后续版本补。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -56,11 +62,15 @@ pub struct PdfOptions {
     pub dpi: u32,
     /// OCR 引擎（`Auto`/`On` 且存在扫描页时必需；`Off` 不用）。
     pub engine: Option<Arc<dyn OcrEngine>>,
+    /// M4 页内混合路由（实验特性）：文字层页内未被文字覆盖的大图区做
+    /// 整页渲染 + 分区域 OCR。仅 `OcrMode::Auto` 且存在引擎时生效；
+    /// 默认 false，行为与现状（纯页级路由）完全等价。
+    pub intra_page: bool,
 }
 
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { mode: OcrMode::Auto, dpi: DEFAULT_DPI, engine: None }
+        Self { mode: OcrMode::Auto, dpi: DEFAULT_DPI, engine: None, intra_page: false }
     }
 }
 
@@ -416,6 +426,7 @@ impl FormatPlugin for PdfPlugin {
                 let text = blocks_to_text(&blocks, "\n");
                 Page {
                     name: rp.name.clone(),
+                    blocks,
                     text,
                     coord_units: rp.coord_units,
                     ..Default::default()
@@ -639,6 +650,33 @@ mod tests {
             .join(format!("pdf-m1-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 回归：assemble 曾漏赋 Page.blocks（M4 DjVu 工人发现），Document 层
+    /// 必须携带块（emit/翻译单元/RAG 全都消费 blocks）。
+    #[test]
+    fn assembled_document_has_blocks() {
+        let raw = crate::plugin::RawDoc {
+            pages: vec![crate::plugin::RawPage {
+                name: Some("1".into()),
+                items: vec![
+                    crate::plugin::RawTextItem {
+                        text: "第一行".into(),
+                        bbox: Some(crate::model::Rect { x0: 1.0, y0: 1.0, x1: 9.0, y1: 5.0 }),
+                        source: crate::model::BlockSource::TextLayer,
+                        ..Default::default()
+                    },
+                ],
+                coord_units: Some(crate::model::CoordUnits::Pt),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let doc = PdfPlugin.assemble(&raw);
+        assert_eq!(doc.pages[0].blocks.len(), 1);
+        assert_eq!(doc.pages[0].blocks[0].content, "第一行");
+        assert_eq!(doc.pages[0].blocks[0].source, crate::model::BlockSource::TextLayer);
+        assert_eq!(doc.pages[0].text, "第一行");
     }
 
     /// 归一化编辑距离相似度。

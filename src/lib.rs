@@ -76,6 +76,18 @@ pub fn parse(path: &str) -> Result<Document> {
     crate::backends::office::register_defaults(&mut registry);
     #[cfg(feature = "epub")]
     crate::backends::epub::register_defaults(&mut registry);
+    #[cfg(feature = "cbz")]
+    crate::backends::cbz::register_defaults(&mut registry);
+    #[cfg(feature = "djvu")]
+    {
+        let opts = crate::backends::djvu::DjVuOptions {
+            #[cfg(feature = "ocr-oar")]
+            engine: Some(crate::ocr::oar::OarOcrEngine::shared()),
+            #[cfg(not(feature = "ocr-oar"))]
+            engine: None,
+        };
+        crate::backends::djvu::register(&mut registry, opts);
+    }
     #[cfg(feature = "pdf")]
     {
         let opts = crate::backends::pdf::PdfOptions {

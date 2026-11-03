@@ -33,8 +33,12 @@ epub = ["dep:zip", "dep:quick-xml", "html"]
 # XLSX/PPTX（docparser-office 吸收；xlsx 含 chrono 日期单元格）
 xlsx = ["dep:chrono", "dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
 pptx = ["dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
+# DjVu（djvu-rs 0.44：文字层直提 + 无字页渲染接 OCR；否决 djvu 0.1.0——GPL）
+djvu = ["dep:djvu-rs", "ocr"]
 # CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
 cbz = ["dep:zip", "dep:image"]
+# MOBI（Kindle 电子书：mobi-rs 读 MOBI7 正文 HTML，azw3/KF8 不支持；M5）
+mobi = ["dep:mobi", "html"]
 # ODF 家族（docparser-odf 吸收）
 odt = ["dep:quick-xml", "dep:zip"]
 ods = ["dep:quick-xml", "dep:zip"]
@@ -58,6 +62,12 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.djvu-rs]
+version = "0.44"
+default-features = false
+features = ["std"]
 optional = true
 
 [dependencies.chrono]
@@ -89,6 +99,10 @@ optional = true
 
 [dependencies.image]
 version = "0.25"
+optional = true
+
+[dependencies.mobi]
+version = "0.8"
 optional = true
 
 # oar-ocr 必须 git 版：crates.io 0.1.1 是旧版，没有 auto-download（rumi 实测同款结论）

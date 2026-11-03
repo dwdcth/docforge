@@ -67,6 +67,18 @@ fn main() {
     docforge::backends::office::register_defaults(&mut registry);
     #[cfg(feature = "epub")]
     docforge::backends::epub::register_defaults(&mut registry);
+    #[cfg(feature = "cbz")]
+    docforge::backends::cbz::register_defaults(&mut registry);
+    #[cfg(feature = "djvu")]
+    docforge::backends::djvu::register(
+        &mut registry,
+        docforge::backends::djvu::DjVuOptions {
+            #[cfg(feature = "ocr-oar")]
+            engine: Some(docforge::ocr::oar::OarOcrEngine::shared()),
+            #[cfg(not(feature = "ocr-oar"))]
+            engine: None,
+        },
+    );
     #[cfg(feature = "pdf")]
     {
         use docforge::backends::pdf::{OcrMode, PdfOptions};
