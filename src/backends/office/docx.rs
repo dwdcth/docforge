@@ -8,6 +8,7 @@
 //!   列表（`w:numPr` + `word/numbering.xml` 的 `numFmt`），缩进/编号文本等更深结构不还原。
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawDoc, RawPage, RawRegion};
@@ -61,9 +62,9 @@ impl ParseCapability for DocxRawBackend {
     fn formats(&self) -> &[&str] {
         &["docx"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let file = std::fs::File::open(path)
-            .map_err(|e| DocError::corrupt(format!("cannot open {path}: {e}")))?;
+            .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
         let mut zip = zip::ZipArchive::new(file)
             .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
 
@@ -1297,13 +1298,13 @@ mod tests {
         }
 
         let raw = DocxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         // 该文件没有任何结构信号 → 默认 `auto` 会走 raw 快路径；本用例
         // 要验的是事件解析，所以另用显式 `semantic` 对照产项
         let sem = DocxRawBackend::default()
             .with_structure_mode(StructureMode::Semantic)
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         std::fs::remove_file(&path).ok();
 
@@ -1347,7 +1348,7 @@ mod tests {
 
         // 七信号全无 → 默认 auto 走快路径（flat_text 有值、items 不产结构判定）
         let raw = DocxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         std::fs::remove_file(&path).ok();
         assert!(
@@ -1429,7 +1430,7 @@ mod tests {
             zw.finish().unwrap();
         }
 
-        let p = path.to_str().unwrap();
+        let p = &path;
         // 该 fixture 正文无结构信号 → 默认 auto 走 raw（不产项），但区域照旧解析：
         // 正好覆盖「raw + include_regions」这个 Python 也会走到的组合
         let with_regions = DocxRawBackend::new(true).parse(p).unwrap();
@@ -1515,7 +1516,7 @@ mod tests {
             zw.finish().unwrap();
         }
 
-        let p = path.to_str().unwrap();
+        let p = &path;
         let with_regions = DocxRawBackend::new(true).parse(p).unwrap();
         let without = DocxRawBackend::default()
             .with_structure_mode(StructureMode::Semantic)
@@ -1567,7 +1568,7 @@ mod tests {
             zw.write_all(DOCUMENT_XML.as_bytes()).unwrap();
             zw.finish().unwrap();
         }
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
 
         let raw = DocxRawBackend::default()
             .with_structure_mode(StructureMode::Raw)
@@ -1686,7 +1687,7 @@ mod tests {
             zw.write_all(&png_bytes(64, 64)).unwrap();
             zw.finish().unwrap();
         }
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
 
         let on = DocxRawBackend::default()
             .with_ocr_images(true)

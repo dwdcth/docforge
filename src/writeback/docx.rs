@@ -57,20 +57,19 @@ use super::{escape_xml_text, open_zip, rewrite_zip, translation_map};
 /// [`crate::emit::to_translation_units`] 同口径（块 `p{页}-b{块序}`、表格格
 /// `p{页}-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
 pub fn writeback_docx(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("docx 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // 第一遍：docforge 解析（与提取侧 register_defaults 完全相同的默认装配：
     // structure_mode=auto / include_regions=false / ocr_images=false）拿块序与 id。
     // 单元流取全量：段落单元 + 表格格单元按文档序交错（格单元由 XML 扫描的
     // w:tbl 格位配对，见模块头对齐口径）。
-    let raw = DocxRawBackend::default().parse(path_str)?;
+    let raw = DocxRawBackend::default().parse(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
     let map = translation_map(translated);
@@ -826,7 +825,7 @@ mod tests {
     /// 与 writeback 同一套装配（= 提取侧 register_defaults 的行为）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = DocxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         OfficePlugin::default().assemble(&raw)
     }

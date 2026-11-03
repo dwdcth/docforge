@@ -3,6 +3,7 @@
 //! 路由：按 magic + 扩展名判定格式（与 Python `engine.Router` 语义对齐）。
 
 use crate::error::{DocError, Result};
+use std::path::Path;
 
 const OLE_MAGIC: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
@@ -23,22 +24,33 @@ const RTF_EXT: &[&str] = &["rtf"];
 /// 格式名 = 扩展名本身（jpg/jpeg、tif/tiff 各自成键，格式保真）
 const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
 
-fn head_of(path: &str, n: usize) -> Result<Vec<u8>> {
+fn head_of(path: &Path, n: usize) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map(|v| v[..v.len().min(n)].to_vec())
-        .map_err(|e| DocError::corrupt(format!("cannot read {path}: {e}")))
+        .map_err(|e| DocError::corrupt(format!("cannot read {}: {e}", path.display())))
+}
+
+/// 扩展名（小写）：取文件名末段 `.` 之后。无点时退化为整名（与原 `&str`
+/// `rsplit('.')` 口径一致——整名不匹配任何已知扩展，路由结果不变）。
+fn ext_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// 语义（继承 KB 现网经验）：
 ///   * OOXML 若文件头是 OLE 容器 → 加密件，归 encrypted；
 ///   * legacy（doc/ppt/xls）期望 OLE，不是 OLE → unsupported（伪装）；
 ///   * 其余按头/magic 兜底。
-pub fn sniff(path: &str) -> Result<&'static str> {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+///
+/// `path` 吃任何 `AsRef<Path>`（&str / PathBuf 均可）。
+pub fn sniff(path: impl AsRef<Path>) -> Result<&'static str> {
+    let path = path.as_ref();
+    let ext = ext_of(path);
     let h = head_of(path, 8)?;
 
     if h.starts_with(OLE_MAGIC) {
@@ -96,7 +108,7 @@ pub fn sniff(path: &str) -> Result<&'static str> {
             return Ok("cbz");
         }
         // fb2.zip：ZIP 容器内层单 .fb2（后端解包；内层校验由后端判）
-        if ext == "zip" && path.to_ascii_lowercase().ends_with(".fb2.zip") {
+        if ext == "zip" && path.to_string_lossy().to_ascii_lowercase().ends_with(".fb2.zip") {
             return Ok("fb2");
         }
         // 通用压缩包（.zip 扩展名）：内层文本多页合并；.fb2.zip/.cbz 已在
@@ -177,7 +189,7 @@ mod tests {
         let mut f = std::fs::File::create(&pdf).unwrap();
         f.write_all(b"%PDF-1.7\n%%EOF").unwrap();
         drop(f);
-        assert_eq!(sniff(pdf.to_str().unwrap()).unwrap(), "pdf");
+        assert_eq!(sniff(&pdf).unwrap(), "pdf");
         std::fs::remove_file(&pdf).ok();
 
         // magic 优先：.doc 但头是 %PDF → 按 pdf 路由（与 Python Router 一致）
@@ -185,7 +197,7 @@ mod tests {
         let mut f = std::fs::File::create(&renamed).unwrap();
         f.write_all(b"%PDF-1.7\n%%EOF").unwrap();
         drop(f);
-        assert_eq!(sniff(renamed.to_str().unwrap()).unwrap(), "pdf");
+        assert_eq!(sniff(&renamed).unwrap(), "pdf");
         std::fs::remove_file(&renamed).ok();
 
         // 伪装 doc：非 OLE / ZIP / PDF 头 → unsupported
@@ -193,7 +205,7 @@ mod tests {
         let mut f = std::fs::File::create(&fake).unwrap();
         f.write_all(b"NOTANOFFICEFILE").unwrap();
         drop(f);
-        let err = sniff(fake.to_str().unwrap()).unwrap_err();
+        let err = sniff(&fake).unwrap_err();
         assert_eq!(err.code.as_str(), "unsupported");
         std::fs::remove_file(&fake).ok();
     }
@@ -205,7 +217,7 @@ mod tests {
         let mut f = std::fs::File::create(&fx).unwrap();
         f.write_all(OLE_MAGIC).unwrap();
         drop(f);
-        let err = sniff(fx.to_str().unwrap()).unwrap_err();
+        let err = sniff(&fx).unwrap_err();
         assert_eq!(err.code.as_str(), "encrypted");
         std::fs::remove_file(&fx).ok();
     }
@@ -225,7 +237,7 @@ mod tests {
             f.write_all(b"1\n00:00:01,000 --> 00:00:02,000\nhi\n")
                 .unwrap();
             drop(f);
-            assert_eq!(sniff(p.to_str().unwrap()).unwrap(), want, "{name}");
+            assert_eq!(sniff(&p).unwrap(), want, "{name}");
             std::fs::remove_file(&p).ok();
         }
     }
@@ -236,7 +248,7 @@ mod tests {
         let d = std::env::temp_dir();
         let p = d.join("docparser_router_r.rtf");
         std::fs::write(&p, br"{\rtf1\ansi hi\par}").unwrap();
-        assert_eq!(sniff(p.to_str().unwrap()).unwrap(), "rtf");
+        assert_eq!(sniff(&p).unwrap(), "rtf");
         std::fs::remove_file(&p).ok();
     }
 
@@ -254,7 +266,7 @@ mod tests {
             let mut f = std::fs::File::create(&p).unwrap();
             f.write_all(ZIP_MAGIC).unwrap();
             drop(f);
-            assert_eq!(sniff(p.to_str().unwrap()).unwrap(), want, "{name}");
+            assert_eq!(sniff(&p).unwrap(), want, "{name}");
             std::fs::remove_file(&p).ok();
         }
     }

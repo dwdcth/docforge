@@ -5,6 +5,8 @@
 //! raw 模式口径对齐 `docparser-office` 的 docx：段落逐条（`text:h` 带 `text:outline-level`
 //! 还原为标题），表格额外产出结构化 `TableData`；列表按 raw 处理（只留文本，不还原层级）。
 
+use std::path::Path;
+
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawDoc, RawPage, RawTextItem};
 use quick_xml::events::Event;
@@ -20,7 +22,7 @@ impl ParseCapability for OdtRawBackend {
     fn formats(&self) -> &[&str] {
         &["odt"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let xml = super::read_content_xml(path)?;
         Ok(RawDoc {
             pages: vec![odt_raw_page(&xml)?],

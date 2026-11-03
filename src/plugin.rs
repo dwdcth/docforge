@@ -7,6 +7,7 @@
 //! 解析能力（格式绑定）→ RawDoc；处理能力（全局共享，就地增强）。
 
 use std::fmt;
+use std::path::Path;
 
 use std::collections::BTreeMap;
 
@@ -160,7 +161,7 @@ pub trait ParseCapability: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
-    fn parse(&self, path: &str) -> Result<RawDoc>;
+    fn parse(&self, path: &Path) -> Result<RawDoc>;
 }
 
 /// 处理能力：全局共享，就地增强 RawDoc（OCR / layout）。

@@ -21,6 +21,7 @@
 //! * [`super::csv`] —— RFC4180 解析为 `TableData`；
 //! * [`super::html`] —— 标准库级标签扫描（标题/段落/列表/代码/表格，跳过 script/style）。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{DocError, Result};
@@ -37,10 +38,11 @@ use super::markdown;
 
 /// 编码健壮读取：UTF-8（含 BOM）→ UTF-16（BOM）→ UTF-8 strict →
 /// （feature `encoding`）chardetng 概率探测（置信闸门）→ GB18030 → Big5 → lossy。
-/// 解码链实现见 [`crate::encoding`]。
-pub fn read_text(path: &str) -> Result<String> {
-    let raw =
-        std::fs::read(path).map_err(|e| DocError::corrupt(format!("cannot read {path}: {e}")))?;
+/// 解码链实现见 [`crate::encoding`]。`path` 吃任何 `AsRef<Path>`。
+pub fn read_text(path: impl AsRef<Path>) -> Result<String> {
+    let path = path.as_ref();
+    let raw = std::fs::read(path)
+        .map_err(|e| DocError::corrupt(format!("cannot read {}: {e}", path.display())))?;
     Ok(crate::encoding::decode(raw))
 }
 
@@ -117,7 +119,7 @@ impl ParseCapability for TextParseCapability {
     fn formats(&self) -> &[&str] {
         std::slice::from_ref(&self.fmt)
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let content = read_text(path)?;
         let mut items: Vec<RawTextItem> = Vec::new();
         for section in super::chapter::split_chapters_with(&content, &self.rules) {
@@ -237,7 +239,7 @@ impl ParseCapability for WholeTextParseCapability {
     fn formats(&self) -> &[&str] {
         std::slice::from_ref(&self.fmt)
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let content = read_text(path)?;
         Ok(RawDoc {
             pages: vec![RawPage {
@@ -264,7 +266,7 @@ impl ParseCapability for CsvParseCapability {
     fn formats(&self) -> &[&str] {
         &["csv"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let content = read_text(path)?;
         let rows = csv::parse_rows(&content);
         Ok(RawDoc {
@@ -392,11 +394,11 @@ mod m2_tests {
         std::fs::write(&p, &bytes).unwrap();
 
         let raw = WholeTextParseCapability { id: "text.read.md", fmt: "md" }
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         assert_eq!(raw.pages[0].items[0].text, md);
         // read_text 直连同链：BOM 无、UTF-16 无、UTF-8 strict 失败 → 编码回退
-        assert_eq!(read_text(p.to_str().unwrap()).unwrap(), md);
+        assert_eq!(read_text(&p).unwrap(), md);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -414,7 +416,7 @@ mod m2_tests {
         .unwrap();
 
         let raw = TextParseCapability { id: "text.read.txt", fmt: "txt", ..Default::default() }
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         let doc = TextPlugin.assemble(&raw);
         let blocks = &doc.pages[0].blocks;
@@ -442,7 +444,7 @@ mod m2_tests {
         .unwrap();
 
         let raw = TextParseCapability { id: "text.read.txt", fmt: "txt", ..Default::default() }
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         let doc = TextPlugin.assemble(&raw);
         let blocks = &doc.pages[0].blocks;
@@ -495,7 +497,7 @@ mod m2_tests {
                 replace_builtin: false,
             },
         }
-        .parse(p.to_str().unwrap())
+        .parse(&p)
         .unwrap();
         let doc = TextPlugin.assemble(&raw);
         let blocks = &doc.pages[0].blocks;

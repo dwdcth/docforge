@@ -53,14 +53,13 @@ const MAX_FLOW_DEPTH: u8 = 8;
 /// [`crate::emit::to_translation_units`] 同口径；未匹配 / 空白译文条目忽略；
 /// 失败返回 `corrupt`。
 pub fn writeback_fb2(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("fb2 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // 0. 容器/编码门禁（单 XML + UTF-8 才可安全字节改写）
     let bytes = std::fs::read(in_path)
@@ -77,7 +76,7 @@ pub fn writeback_fb2(
     }
 
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
-    let raw = Fb2RawBackend::default().parse(path_str)?;
+    let raw = Fb2RawBackend::default().parse(in_path)?;
     let doc = Fb2Plugin.assemble(&raw);
     let units: Vec<_> = crate::emit::to_translation_units(&doc)
         .into_iter()
@@ -880,7 +879,7 @@ mod tests {
     /// 提取侧同管线（Fb2RawBackend + Fb2Plugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = Fb2RawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         Fb2Plugin.assemble(&raw)
     }

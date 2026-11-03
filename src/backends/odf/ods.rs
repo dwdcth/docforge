@@ -7,6 +7,8 @@
 //! `table:number-columns-repeated` / `number-rows-repeated` 按次数展开（上限见
 //! `MAX_REPEAT` = 1024），这样空列/空行的压缩表示不会吃掉内存。
 
+use std::path::Path;
+
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawDoc, RawPage};
 use quick_xml::events::{BytesStart, Event};
@@ -25,7 +27,7 @@ impl ParseCapability for OdsRawBackend {
     fn formats(&self) -> &[&str] {
         &["ods"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let xml = super::read_content_xml(path)?;
         Ok(RawDoc {
             pages: ods_pages(&xml)?,

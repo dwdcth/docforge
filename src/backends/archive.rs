@@ -264,7 +264,7 @@ fn map_rar_err(e: rars::Error) -> DocError {
 /// 成员名按字节取 lossy UTF-8（RAR 4.x 非 Unicode 名是 OEM 编码，lossy 只
 /// 影响页名展示，不影响内容）；目录 / 重定向（symlink）跳过。
 fn collect_rar(
-    path: &str,
+    path: &Path,
     flat: &mut Vec<ArchiveEntry>,
     warns: &mut Vec<String>,
     stats: &mut ScanStats,
@@ -507,25 +507,27 @@ impl ParseCapability for ArchiveRawBackend {
     fn formats(&self) -> &[&str] {
         &["zip", "rar", "7z"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
-        let head = std::fs::read(path)
-            .map_err(|e| DocError::corrupt(format!("文件不存在或不可读 {path}: {e}")))?;
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
+        let head = std::fs::read(path).map_err(|e| {
+            DocError::corrupt(format!("文件不存在或不可读 {}: {e}", path.display()))
+        })?;
         let head = &head[..head.len().min(8)];
-        let ext = ext_of(path).unwrap_or_default();
+        // 扩展名匹配只在 ASCII 集合上发生，lossy 转换不影响判定（非 UTF-8
+        // 字节名里的 ASCII 扩展名原样保留）
+        let ext = ext_of(&path.to_string_lossy()).unwrap_or_default();
         let kind = detect_kind(head, &ext);
         let mut flat = Vec::new();
         let mut warns = Vec::new();
         let mut stats = ScanStats::default();
         match kind {
             ContainerKind::Zip => {
-                let bytes = std::fs::read(path)
-                    .map_err(|e| DocError::corrupt(format!("文件不存在或不可读 {path}: {e}")))?;
+                let bytes = std::fs::read(path).map_err(|e| {
+                    DocError::corrupt(format!("文件不存在或不可读 {}: {e}", path.display()))
+                })?;
                 collect_zip(&bytes, 1, "", &mut flat, &mut warns, &mut stats)?;
             }
             ContainerKind::Rar => collect_rar(path, &mut flat, &mut warns, &mut stats)?,
-            ContainerKind::SevenZ => {
-                collect_sevenz(Path::new(path), &mut flat, &mut warns, &mut stats)?
-            }
+            ContainerKind::SevenZ => collect_sevenz(path, &mut flat, &mut warns, &mut stats)?,
         }
         build_raw(flat, stats, warns)
     }
@@ -719,7 +721,7 @@ mod tests {
                 ("第2章.txt", "少年推门而出。".as_bytes().to_vec()),
             ],
         );
-        let raw = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = ArchiveRawBackend.parse(&p).unwrap();
         assert_eq!(page_names(&raw), vec!["第1章.txt", "第2章.txt", "第10章.txt"]);
 
         // 第 1 页：空行切两段
@@ -770,7 +772,7 @@ mod tests {
             &[("mid.zip", mid_bytes), ("outer.txt", b"outer".to_vec())],
         );
 
-        let raw = ArchiveRawBackend.parse(outer.to_str().unwrap()).unwrap();
+        let raw = ArchiveRawBackend.parse(&outer).unwrap();
         // 外层文本 + 内层 zip（第 2 层）文本；第 3 层 deep.zip 不展开
         assert_eq!(page_names(&raw), vec!["mid.zip/mid.txt", "outer.txt"]);
         assert!(!page_names(&raw).iter().any(|n| n.contains("deep.txt")));
@@ -793,7 +795,7 @@ mod tests {
                 ("cover.jpg", vec![0xFF, 0xD8, 0xFF, 0xE0]),
             ],
         );
-        let raw = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = ArchiveRawBackend.parse(&p).unwrap();
         assert_eq!(page_names(&raw), vec!["a.txt"]);
         let w = raw.meta.get("warnings").expect("应有二进制格式告警");
         assert!(w.contains("pdf"), "{w}");
@@ -810,7 +812,7 @@ mod tests {
         let dir = tmpdir("rar");
         let p = dir.join("book.rar");
         std::fs::write(&p, hex_decode(RAR_FIXTURE_HEX)).unwrap();
-        let raw = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = ArchiveRawBackend.parse(&p).unwrap();
         assert_eq!(page_names(&raw), vec!["第一章.txt", "第二章.txt"]);
         let p0 = &raw.pages[0];
         assert_eq!(p0.items.len(), 2);
@@ -827,7 +829,7 @@ mod tests {
         let dir = tmpdir("sevenz");
         let p = dir.join("book.7z");
         std::fs::write(&p, hex_decode(SEVENZ_FIXTURE_HEX)).unwrap();
-        let raw = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = ArchiveRawBackend.parse(&p).unwrap();
         assert_eq!(page_names(&raw), vec!["第一章.txt", "第二章.txt"]);
         assert_eq!(raw.pages[0].items[0].text, "风起于青萍之末。");
         // 临时目录已清理
@@ -851,7 +853,7 @@ mod tests {
     fn empty_archive_is_corrupt() {
         let dir = tmpdir("empty");
         let p = build_zip(&dir, "empty.zip", &[]);
-        let err = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = ArchiveRawBackend.parse(&p).unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -865,7 +867,7 @@ mod tests {
             "pics.zip",
             &[("p1.jpg", vec![0xFF, 0xD8]), ("p2.png", vec![0x89, b'P'])],
         );
-        let err = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = ArchiveRawBackend.parse(&p).unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("CBZ"), "{}", err.message);
         let _ = std::fs::remove_dir_all(&dir);
@@ -880,7 +882,7 @@ mod tests {
             "docs.zip",
             &[("a.pdf", b"%PDF-1.4".to_vec()), ("b.epub", b"PKxxxx".to_vec())],
         );
-        let err = ArchiveRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = ArchiveRawBackend.parse(&p).unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("pdf"), "{}", err.message);
         let _ = std::fs::remove_dir_all(&dir);

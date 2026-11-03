@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -771,7 +772,7 @@ fn ext_of_content_type(ct: &str) -> String {
 }
 
 /// 读文件：`.fb2.zip` 打包件（ZIP magic 判定）解包取内层首个 `.fb2` 条目（B 语义）。
-fn read_fb2_bytes(path: &str) -> Result<Vec<u8>> {
+fn read_fb2_bytes(path: &Path) -> Result<Vec<u8>> {
     let bytes =
         std::fs::read(path).map_err(|e| DocError::corrupt(format!("FB2 打不开: {e}")))?;
     if bytes.starts_with(b"PK\x03\x04") {
@@ -984,7 +985,7 @@ impl ParseCapability for Fb2RawBackend {
     fn formats(&self) -> &[&str] {
         &["fb2"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let bytes = read_fb2_bytes(path)?;
         let xml = decode_fb2(&bytes);
         parse_fb2(&xml, self.ocr_images)
@@ -1180,7 +1181,7 @@ mod tests {
     fn parse_str(dir_name: &str, ocr_images: bool) -> RawDoc {
         let path = write_file(dir_name, "book.fb2", book_xml().as_bytes());
         let raw = Fb2RawBackend { ocr_images }
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         raw
@@ -1311,7 +1312,7 @@ mod tests {
         bytes.extend_from_slice(br#"</p></title><p>body</p></section></body></FictionBook>"#);
         let path = write_file("gbk", "gbk.fb2", &bytes);
         let raw = Fb2RawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
 
@@ -1341,7 +1342,7 @@ mod tests {
         zw.finish().unwrap();
 
         let raw = Fb2RawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -1356,7 +1357,7 @@ mod tests {
         // 纯文本（无根元素）
         let p1 = write_file("plain", "plain.fb2", b"just some text");
         let err = Fb2RawBackend::default()
-            .parse(p1.to_str().unwrap())
+            .parse(&p1)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         let _ = std::fs::remove_dir_all(p1.parent().unwrap());
@@ -1364,7 +1365,7 @@ mod tests {
         // XML 但根元素不是 FictionBook
         let p2 = write_file("wrongroot", "wrong.fb2", b"<html><body>x</body></html>");
         let err = Fb2RawBackend::default()
-            .parse(p2.to_str().unwrap())
+            .parse(&p2)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("FictionBook"));
@@ -1377,7 +1378,7 @@ mod tests {
             b"<FictionBook><body></body></FictionBook>",
         );
         let err = Fb2RawBackend::default()
-            .parse(p3.to_str().unwrap())
+            .parse(&p3)
             .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("body"));

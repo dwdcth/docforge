@@ -65,17 +65,16 @@ pub(crate) const TR_CLASS: &str = "docforge-tr";
 /// [`crate::emit::to_translation_units`] 同口径（`p0-b{块序}`）；
 /// 未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
 pub fn writeback_html(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("html 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
-    let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }.parse(path_str)?;
+    let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }.parse(in_path)?;
     let doc = HtmlPlugin.assemble(&raw);
     // 单元流全量（含表格格单元 kind = Table）：块级候选按块序消费、表格格
     // 在表格位逐格消费（见主循环的 Table 分支），两段消费拼满同一单元流。
@@ -605,7 +604,7 @@ mod tests {
 
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         HtmlPlugin.assemble(&raw)
     }

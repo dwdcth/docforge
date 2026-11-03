@@ -10,6 +10,7 @@
 //!
 //! 测试件策略：内存 zip 构造（命名 page1/page2/page10 验证自然序）。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{DocError, Result};
@@ -96,9 +97,10 @@ impl ParseCapability for CbzRawBackend {
     fn formats(&self) -> &[&str] {
         &["cbz"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| DocError::corrupt(format!("文件不存在或不可读 {path}: {e}")))?;
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
+        let file = std::fs::File::open(path).map_err(|e| {
+            DocError::corrupt(format!("文件不存在或不可读 {}: {e}", path.display()))
+        })?;
         let mut zip = zip::ZipArchive::new(file)
             .map_err(|e| DocError::corrupt(format!("CBZ 打开失败（非 ZIP）: {e}")))?;
         // 收集图片条目（目录跳过；扩展名白名单）。file_names 的条目是
@@ -241,7 +243,7 @@ mod tests {
     fn natural_order_pages() {
         let p = build_cbz("order", &["page10.png", "page2.png", "page1.png", "cover.jpg"]);
         let raw = CbzRawBackend
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         let names: Vec<&str> = raw.pages.iter().map(|p| p.name.as_deref().unwrap()).collect();
         // 自然序：cover（字母段在前无数字）→ page1 → page2 → page10
@@ -252,7 +254,7 @@ mod tests {
     #[test]
     fn assemble_one_image_block_per_page() {
         let p = build_cbz("asm", &["a.png", "b.png"]);
-        let raw = CbzRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = CbzRawBackend.parse(&p).unwrap();
         let doc = CbzPlugin.assemble(&raw);
         assert_eq!(doc.pages.len(), 2);
         for page in &doc.pages {
@@ -273,7 +275,7 @@ mod tests {
         let path = dir.join("empty.cbz");
         let f = std::fs::File::create(&path).unwrap();
         zip::ZipWriter::new(f).finish().unwrap();
-        let err = CbzRawBackend.parse(path.to_str().unwrap()).unwrap_err();
+        let err = CbzRawBackend.parse(&path).unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("无图片"));
         let _ = std::fs::remove_dir_all(&dir);

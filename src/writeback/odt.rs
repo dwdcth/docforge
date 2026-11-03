@@ -58,18 +58,17 @@ use super::{apply_edits, Edit, escape_xml_text, open_zip, rewrite_zip, translati
 /// [`crate::emit::to_translation_units`] 同口径（段落类 `p0-b{块序}`、格单元
 /// `p0-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
 pub fn writeback_odt(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("odt 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // A. 权威解析（提取侧同管线）拿 id / 文本（全量单元流：段落类单元随
     // 段落块就地配对，格单元随表格块就地配对）
-    let raw = OdtRawBackend.parse(path_str)?;
+    let raw = OdtRawBackend.parse(in_path)?;
     let doc = OdfPlugin.assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
     let map = translation_map(translated);
@@ -626,7 +625,7 @@ mod tests {
 
     /// 提取侧同管线（OdtRawBackend + OdfPlugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
-        let raw = OdtRawBackend.parse(path.to_str().unwrap()).unwrap();
+        let raw = OdtRawBackend.parse(&path).unwrap();
         OdfPlugin.assemble(&raw)
     }
 

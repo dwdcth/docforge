@@ -5,6 +5,8 @@
 //! 形状（`draw:frame` / `draw:text-box`）内的 `text:p` 递归收集；页内表格结构化输出。
 //! 页名取 `draw:name`，缺省用 `Slide N`（与 pptx 后端的命名口径一致）。
 
+use std::path::Path;
+
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawDoc, RawPage, RawTextItem};
 use quick_xml::events::Event;
@@ -20,7 +22,7 @@ impl ParseCapability for OdpRawBackend {
     fn formats(&self) -> &[&str] {
         &["odp"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let xml = super::read_content_xml(path)?;
         Ok(RawDoc {
             pages: odp_pages(&xml)?,

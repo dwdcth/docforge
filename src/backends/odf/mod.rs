@@ -15,6 +15,7 @@
 //!
 //! 按文件类型裁剪：`odt` / `ods` / `odp` 三个 feature，默认全开。
 
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(any(feature = "odt", feature = "ods", feature = "odp"))]
@@ -214,9 +215,9 @@ pub(crate) fn zip_read_str(
 
 /// 打开 ODF 文件并读出 `content.xml`（缺该条目即判定损坏）。
 #[cfg(any(feature = "odt", feature = "ods", feature = "odp"))]
-pub(crate) fn read_content_xml(path: &str) -> Result<String> {
+pub(crate) fn read_content_xml(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)
-        .map_err(|e| DocError::corrupt(format!("cannot open {path}: {e}")))?;
+        .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
     zip_read_str(&mut zip, "content.xml")?
@@ -439,7 +440,7 @@ mod tests {
         }
 
         let raw = crate::backends::odf::odt::OdtRawBackend
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         std::fs::remove_file(&path).ok();
 

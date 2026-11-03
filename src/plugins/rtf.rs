@@ -24,6 +24,7 @@
 //! 已知不做：样式/字体/颜色、页眉页脚内容、图片、表格结构（摊平成制表符+行）、
 //! 多节（`\sect` 只断段不换页）、`\uc` 的组作用域（按全局处理）。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{DocError, Result};
@@ -459,7 +460,7 @@ impl ParseCapability for RtfParseCapability {
     fn formats(&self) -> &[&str] {
         &["rtf"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let raw = std::fs::read(path)
             .map_err(|e| DocError::corrupt(format!("无法读取 RTF 文件: {e}")))?;
         let items = extract_paragraphs(&raw)?
@@ -621,7 +622,7 @@ first paragraph\par
         let mut reg = Registry::new();
         crate::plugins::register_defaults(&mut reg);
         let doc = crate::engine::DocumentEngine::new(reg)
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap_or_else(|e| panic!("rtf 解析失败: {e}"));
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].text, "Hello\n\nWorld");

@@ -111,7 +111,8 @@ fn default_registry() -> Registry {
     registry
 }
 
-/// 便捷解析：默认 Registry 装配。
+/// 便捷解析：默认 Registry 装配。`path` 吃任何 `AsRef<Path>`（`&str` /
+/// `&Path` / `PathBuf`——非 UTF-8 文件名原样透传，无 `to_str` 损失）。
 ///
 /// ```no_run
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -119,7 +120,7 @@ fn default_registry() -> Registry {
 /// println!("{} 页", doc.pages.len());
 /// # Ok(()) }
 /// ```
-pub fn parse(path: &str) -> Result<Document> {
+pub fn parse(path: impl AsRef<std::path::Path>) -> Result<Document> {
     DocumentEngine::new(default_registry()).parse(path)
 }
 
@@ -139,7 +140,7 @@ pub fn parse(path: &str) -> Result<Document> {
 /// println!("{} 页", doc.pages.len());
 /// # Ok(()) }
 /// ```
-pub fn parse_with_progress(path: &str, cb: ProgressFn) -> Result<Document> {
+pub fn parse_with_progress(path: impl AsRef<std::path::Path>, cb: ProgressFn) -> Result<Document> {
     DocumentEngine::new(default_registry())
         .with_progress(cb)
         .parse(path)
@@ -163,6 +164,6 @@ pub fn parse_with_progress(path: &str, cb: ProgressFn) -> Result<Document> {
 /// println!("{} 页", meta.page_count);
 /// # Ok(()) }
 /// ```
-pub fn parse_streaming(path: &str, sink: PageSink<'_>) -> Result<DocMeta> {
+pub fn parse_streaming(path: impl AsRef<std::path::Path>, sink: PageSink<'_>) -> Result<DocMeta> {
     DocumentEngine::new(default_registry()).parse_streaming(path, sink)
 }

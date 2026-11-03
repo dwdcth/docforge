@@ -129,8 +129,8 @@ fn usage() -> ! {
 
 /// 批量作业：一个待转换文件 + 其在 `--out-dir` 里的相对落点信息。
 struct Job {
-    /// 输入路径（进度/错误行显示用）
-    input: String,
+    /// 输入路径（解析直传 + 进度/错误行显示用；PathBuf 保非 UTF-8 文件名）
+    input: PathBuf,
     /// 相对 --out-dir 的子目录（目录输入保持相对其根的子路径；单文件为空）
     rel_dir: PathBuf,
     /// 输出名主体 = 输入文件名去扩展
@@ -326,26 +326,26 @@ fn render(format: &str, doc: &docforge::Document) -> Option<String> {
 /// 返回是否成功；失败详情已打 stderr（`{input}: 解析失败：…` / `…：写出失败：…`）。
 fn convert_one(
     engine: &docforge::DocumentEngine,
-    input: &str,
+    input: &Path,
     format: &str,
     out_path: Option<&Path>,
 ) -> bool {
     let doc = match engine.parse(input) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("{input}: 解析失败：{e}");
+            eprintln!("{}: 解析失败：{e}", input.display());
             return false;
         }
     };
     let Some(output) = render(format, &doc) else {
-        eprintln!("{input}: 未知格式：{format}（md|json|text|units|chunks）");
+        eprintln!("{}: 未知格式：{format}（md|json|text|units|chunks）", input.display());
         return false;
     };
     match out_path {
         Some(p) => match std::fs::write(p, &output) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("{input}: 写出失败（{}）：{e}", p.display());
+                eprintln!("{}: 写出失败（{}）：{e}", input.display(), p.display());
                 false
             }
         },
@@ -441,7 +441,7 @@ fn collect_dir(
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
                 jobs.push(Job {
-                    input: path.to_string_lossy().into_owned(),
+                    input: path.clone(),
                     rel_dir,
                     stem,
                     orig_ext,
@@ -460,27 +460,36 @@ fn collect_dir(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut inputs: Vec<String> = Vec::new();
+    // 参数走 OsString（`args()` 遇非 UTF-8 argv 直接 panic；路径位可能非
+    // UTF-8）。旗标与本 CLI 的字面量恒 ASCII，lossy 视图只用于旗标匹配/显示
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut inputs: Vec<PathBuf> = Vec::new();
     let mut format = "md".to_string();
     #[cfg(feature = "pdf")]
     let mut ocr = "auto".to_string();
-    let mut out_path: Option<String> = None;
-    let mut out_dir: Option<String> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
     let mut list_formats = false;
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
+        let view = args[i].to_string_lossy();
+        match view.as_ref() {
             "--format" | "-f" => {
                 i += 1;
-                format = args.get(i).cloned().unwrap_or_else(|| usage());
+                format = args
+                    .get(i)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| usage());
             }
             "--ocr" => {
                 #[cfg(feature = "pdf")]
                 {
                     i += 1;
-                    ocr = args.get(i).cloned().unwrap_or_else(|| usage());
+                    ocr = args
+                        .get(i)
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| usage());
                 }
                 #[cfg(not(feature = "pdf"))]
                 {
@@ -490,15 +499,15 @@ fn main() {
             }
             "--out" | "-o" => {
                 i += 1;
-                out_path = args.get(i).cloned();
+                out_path = args.get(i).map(PathBuf::from);
             }
             "--out-dir" => {
                 i += 1;
-                out_dir = args.get(i).cloned();
+                out_dir = args.get(i).map(PathBuf::from);
             }
             "--list-formats" => list_formats = true,
             s if s.starts_with('-') => usage(),
-            s => inputs.push(s.to_string()),
+            _ => inputs.push(PathBuf::from(&args[i])),
         }
         i += 1;
     }
@@ -523,32 +532,31 @@ fn main() {
     let mut seen: HashSet<String> = HashSet::new();
     let mut any_dir = false;
     for input in &inputs {
-        let p = Path::new(input);
+        let p = input.as_path();
         if p.is_dir() {
             any_dir = true;
             collect_dir(p, p, &mut jobs, &mut pre_failed, &mut seen);
         } else if p.is_file() {
             let key = std::fs::canonicalize(p)
                 .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| input.clone());
+                .unwrap_or_else(|_| input.display().to_string());
             if !seen.insert(key) {
                 continue;
             }
-            let path = Path::new(input);
             jobs.push(Job {
-                input: input.clone(),
+                input: p.to_path_buf(),
                 rel_dir: PathBuf::new(),
-                stem: path
+                stem: p
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| input.clone()),
-                orig_ext: path
+                    .unwrap_or_else(|| input.display().to_string()),
+                orig_ext: p
                     .extension()
                     .map(|e| e.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             });
         } else {
-            pre_failed.push(format!("{input}: 路径不存在"));
+            pre_failed.push(format!("{}: 路径不存在", input.display()));
         }
     }
     jobs.sort_by(|a, b| a.input.cmp(&b.input));
@@ -582,7 +590,7 @@ fn main() {
     let out_ext = format_ext(&format);
 
     if batch {
-        let out_root = PathBuf::from(out_dir.as_deref().unwrap_or("out"));
+        let out_root = out_dir.clone().unwrap_or_else(|| PathBuf::from("out"));
         if let Err(e) = std::fs::create_dir_all(&out_root) {
             eprintln!("创建输出目录失败（{}）：{e}", out_root.display());
             std::process::exit(1);
@@ -590,12 +598,16 @@ fn main() {
         let mut claimed: HashSet<String> = HashSet::new();
         let total = jobs.len();
         for (idx, job) in jobs.iter().enumerate() {
-            eprintln!("[{}/{}] {}", idx + 1, total, job.input);
+            eprintln!("[{}/{}] {}", idx + 1, total, job.input.display());
             let name = unique_target(&mut claimed, &job.rel_dir, &job.stem, &job.orig_ext, out_ext);
             let target = out_root.join(&job.rel_dir).join(name);
             if let Some(parent) = target.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("{}: 创建输出子目录失败（{}）：{e}", job.input, parent.display());
+                    eprintln!(
+                        "{}: 创建输出子目录失败（{}）：{e}",
+                        job.input.display(),
+                        parent.display()
+                    );
                     bad += 1;
                     continue;
                 }
@@ -610,9 +622,8 @@ fn main() {
     } else if let Some(job) = jobs.first() {
         // 单输入：--out 文件 / --out-dir 目录 / stdout（现状保持）。
         // jobs 为空（输入不存在，已在 pre_failed 报告）则跳过，落全败退出。
-        let target: Option<PathBuf> = if let Some(dir) = out_dir.as_deref() {
-            let root = PathBuf::from(dir);
-            if let Err(e) = std::fs::create_dir_all(&root) {
+        let target: Option<PathBuf> = if let Some(root) = out_dir.as_ref() {
+            if let Err(e) = std::fs::create_dir_all(root) {
                 eprintln!("创建输出目录失败（{}）：{e}", root.display());
                 std::process::exit(1);
             }
@@ -620,7 +631,7 @@ fn main() {
             let name = unique_target(&mut claimed, Path::new(""), &job.stem, &job.orig_ext, out_ext);
             Some(root.join(name))
         } else {
-            out_path.map(PathBuf::from)
+            out_path
         };
         if let Some(t) = &target {
             if let Some(parent) = t.parent().filter(|p| !p.as_os_str().is_empty()) {

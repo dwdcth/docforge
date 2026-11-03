@@ -15,6 +15,7 @@
 //! * 清理后为空的条目跳过；一条不剩则 `corrupt`。
 //! * 严格 UTF-8（可带 BOM）：猜编码会把中文念成乱码，宁可报错让调用方先转码。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{DocError, Result};
@@ -338,9 +339,10 @@ pub fn parse_ass(text: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// 严格 UTF-8（可带 BOM）读取并归一换行；非法字节 → `corrupt`。
-pub fn read_subtitle(path: &str) -> Result<String> {
+/// `path` 吃任何 `AsRef<Path>`。
+pub fn read_subtitle(path: impl AsRef<Path>) -> Result<String> {
     let raw =
-        std::fs::read(path).map_err(|e| DocError::corrupt(format!("无法读取字幕文件: {e}")))?;
+        std::fs::read(path.as_ref()).map_err(|e| DocError::corrupt(format!("无法读取字幕文件: {e}")))?;
     let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw);
     let text = std::str::from_utf8(raw)
         .map_err(|_| DocError::corrupt("字幕文件不是合法 UTF-8：请另存为 UTF-8 后重试"))?;
@@ -348,7 +350,8 @@ pub fn read_subtitle(path: &str) -> Result<String> {
 }
 
 /// 解析成 `[(规范化时间轴, 已清理文本)]`，空白条目丢弃；一条不剩 → `corrupt`。
-pub fn parse_cues(path: &str, kind: &str) -> Result<Vec<(String, String)>> {
+/// `path` 吃任何 `AsRef<Path>`。
+pub fn parse_cues(path: impl AsRef<Path>, kind: &str) -> Result<Vec<(String, String)>> {
     let text = read_subtitle(path)?;
     let raw = match kind {
         "vtt" => parse_vtt(&text)?,
@@ -385,7 +388,7 @@ impl ParseCapability for SubtitleParseCapability {
             _ => &["srt"],
         }
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let cues = parse_cues(path, self.kind)?;
         let pages = cues
             .into_iter()
@@ -590,7 +593,7 @@ mod tests {
             let mut reg = Registry::new();
             crate::plugins::register_defaults(&mut reg);
             let doc = crate::engine::DocumentEngine::new(reg)
-                .parse(p.to_str().unwrap())
+                .parse(&p)
                 .unwrap_or_else(|e| panic!("{name} 解析失败: {e}"));
             assert_eq!(doc.pages.len(), 1, "{name}");
             assert_eq!(doc.pages[0].text, want, "{name}");

@@ -150,10 +150,11 @@ pub struct WritebackSession {
 impl WritebackSession {
     /// 建会话：可行性前置检查 + spill 临时文件就绪（建文件失败当场报，
     /// 不留到 finish）。对应 feature 未编译 → [`crate::error::ErrorCode::Unsupported`]。
+    /// `in_path` / `out_path` 吃任何 `AsRef<Path>`（非 UTF-8 文件名原样透传）。
     pub fn new(
         fmt: WritebackFormat,
-        in_path: &str,
-        out_path: &str,
+        in_path: impl AsRef<Path>,
+        out_path: impl AsRef<Path>,
         strategy: BiStrategy,
     ) -> Result<Self> {
         // 前置检查：feature 未编译的格式当场拒绝（枚举变体不受 cfg 裁剪，
@@ -201,8 +202,8 @@ impl WritebackSession {
 
         Ok(Self {
             fmt,
-            in_path: PathBuf::from(in_path),
-            out_path: PathBuf::from(out_path),
+            in_path: in_path.as_ref().to_path_buf(),
+            out_path: out_path.as_ref().to_path_buf(),
             strategy,
             spill_path,
             spill: Some(spill),
@@ -298,11 +299,8 @@ impl WritebackSession {
     /// 纯文本重组 → 写文件。
     #[cfg(feature = "md")]
     fn finish_markdown(&self, pairs: &[(String, String)]) -> Result<()> {
-        let path_str = self
-            .in_path
-            .to_str()
-            .ok_or_else(|| DocError::corrupt("md 路径不是 UTF-8"))?;
-        let raw = WholeTextParseCapability { id: "text.read.md", fmt: "md" }.parse(path_str)?;
+        let raw = WholeTextParseCapability { id: "text.read.md", fmt: "md" }
+            .parse(&self.in_path)?;
         let doc = MarkdownPlugin.assemble(&raw);
         let md = crate::emit::to_bilingual_markdown_with(&doc, pairs, self.strategy);
         std::fs::write(&self.out_path, md)
@@ -436,7 +434,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = crate::parse(in_path.to_str().unwrap()).unwrap();
+        let doc = crate::parse(&in_path).unwrap();
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 4);
 
@@ -444,8 +442,8 @@ mod tests {
         let out_stream = dir.join("out-stream.txt");
         let mut session = WritebackSession::new(
             WritebackFormat::Txt,
-            in_path.to_str().unwrap(),
-            out_stream.to_str().unwrap(),
+            &in_path,
+            &out_stream,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -494,15 +492,15 @@ mod tests {
         )
         .unwrap();
 
-        let doc = crate::parse(in_path.to_str().unwrap()).unwrap();
+        let doc = crate::parse(&in_path).unwrap();
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 4, "标题 / 段落 / 合并列表 / 尾段");
 
         let out_path = dir.join("out.md");
         let mut session = WritebackSession::new(
             WritebackFormat::Markdown,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -560,7 +558,7 @@ mod tests {
         zw.finish().unwrap();
 
         // 提取侧同管线（DocxRawBackend + OfficePlugin）组单元
-        let raw = DocxRawBackend::default().parse(in_path.to_str().unwrap()).unwrap();
+        let raw = DocxRawBackend::default().parse(&in_path).unwrap();
         let doc = OfficePlugin::default().assemble(&raw);
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 3);
@@ -568,8 +566,8 @@ mod tests {
         let out_path = dir.join("out.docx");
         let mut session = WritebackSession::new(
             WritebackFormat::Docx,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -579,7 +577,7 @@ mod tests {
         session.finish().unwrap();
 
         // 重解析输出：原/译交错（标题复制 pStyle 仍是标题）
-        let raw = DocxRawBackend::default().parse(out_path.to_str().unwrap()).unwrap();
+        let raw = DocxRawBackend::default().parse(&out_path).unwrap();
         let got = OfficePlugin::default().assemble(&raw);
         let contents: Vec<&str> = got.pages[0].blocks.iter().map(|b| b.content.as_str()).collect();
         assert_eq!(
@@ -614,7 +612,7 @@ mod tests {
         .unwrap();
 
         let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }
-            .parse(in_path.to_str().unwrap())
+            .parse(&in_path)
             .unwrap();
         let doc = HtmlPlugin.assemble(&raw);
         let units = to_translation_units(&doc);
@@ -623,8 +621,8 @@ mod tests {
         let out_path = dir.join("out.html");
         let mut session = WritebackSession::new(
             WritebackFormat::Html,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -634,7 +632,7 @@ mod tests {
         session.finish().unwrap();
 
         let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }
-            .parse(out_path.to_str().unwrap())
+            .parse(&out_path)
             .unwrap();
         let got = HtmlPlugin.assemble(&raw);
         let contents: Vec<&str> = got.pages[0].blocks.iter().map(|b| b.content.as_str()).collect();
@@ -697,7 +695,7 @@ mod tests {
         );
         zw.finish().unwrap();
 
-        let raw = EpubRawBackend::default().parse(in_path.to_str().unwrap()).unwrap();
+        let raw = EpubRawBackend::default().parse(&in_path).unwrap();
         let doc = EpubPlugin.assemble(&raw);
         let units = to_translation_units(&doc);
         // 坍缩页语义：单 spine 文档坍缩为一页，首个 h1 可能升为页名（不占块位）
@@ -706,8 +704,8 @@ mod tests {
         let out_path = dir.join("out.epub");
         let mut session = WritebackSession::new(
             WritebackFormat::Epub,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -716,7 +714,7 @@ mod tests {
         }
         session.finish().unwrap();
 
-        let raw = EpubRawBackend::default().parse(out_path.to_str().unwrap()).unwrap();
+        let raw = EpubRawBackend::default().parse(&out_path).unwrap();
         let got = EpubPlugin.assemble(&raw);
         let contents: Vec<&str> = got
             .pages
@@ -768,7 +766,7 @@ mod tests {
         zw.write_all(content_xml.as_bytes()).unwrap();
         zw.finish().unwrap();
 
-        let raw = OdtRawBackend.parse(in_path.to_str().unwrap()).unwrap();
+        let raw = OdtRawBackend.parse(&in_path).unwrap();
         let doc = OdfPlugin.assemble(&raw);
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 2);
@@ -776,8 +774,8 @@ mod tests {
         let out_path = dir.join("out.odt");
         let mut session = WritebackSession::new(
             WritebackFormat::Odt,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -786,7 +784,7 @@ mod tests {
         }
         session.finish().unwrap();
 
-        let raw = OdtRawBackend.parse(out_path.to_str().unwrap()).unwrap();
+        let raw = OdtRawBackend.parse(&out_path).unwrap();
         let got = OdfPlugin.assemble(&raw);
         let contents: Vec<&str> = got.pages[0].blocks.iter().map(|b| b.content.as_str()).collect();
         assert!(contents.contains(&"EN: 标题一"), "实际块序：{contents:?}");
@@ -815,7 +813,7 @@ mod tests {
         )
         .unwrap();
 
-        let raw = Fb2RawBackend::default().parse(in_path.to_str().unwrap()).unwrap();
+        let raw = Fb2RawBackend::default().parse(&in_path).unwrap();
         let doc = Fb2Plugin.assemble(&raw);
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 2);
@@ -823,8 +821,8 @@ mod tests {
         let out_path = dir.join("out.fb2");
         let mut session = WritebackSession::new(
             WritebackFormat::Fb2,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -833,7 +831,7 @@ mod tests {
         }
         session.finish().unwrap();
 
-        let raw = Fb2RawBackend::default().parse(out_path.to_str().unwrap()).unwrap();
+        let raw = Fb2RawBackend::default().parse(&out_path).unwrap();
         let got = Fb2Plugin.assemble(&raw);
         let contents: Vec<&str> = got.pages.iter().flat_map(|p| p.blocks.iter().map(|b| b.content.as_str())).collect();
         assert!(contents.contains(&"EN: 第一章"), "实际块序：{contents:?}");
@@ -856,8 +854,8 @@ mod tests {
         let out_path = dir.join("out-drop.txt");
         let mut session = WritebackSession::new(
             WritebackFormat::Txt,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -870,8 +868,8 @@ mod tests {
         let out_path = dir.join("out-finish.txt");
         let mut session = WritebackSession::new(
             WritebackFormat::Txt,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();
@@ -894,8 +892,8 @@ mod tests {
         let out_path = dir.join("out.txt");
         let mut session = WritebackSession::new(
             WritebackFormat::Txt,
-            in_path.to_str().unwrap(),
-            out_path.to_str().unwrap(),
+            &in_path,
+            &out_path,
             BiStrategy::BilingualInline,
         )
         .unwrap();

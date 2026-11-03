@@ -4,6 +4,8 @@
 //!
 //! 架构：`XlsxRawBackend` -> `ParseCapability`，支持共享字符串表、样式格式化、日期格式。
 
+use std::path::Path;
+
 use chrono::NaiveDate;
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawComment, RawDoc, RawImage, RawPage};
@@ -75,7 +77,7 @@ impl ParseCapability for XlsxRawBackend {
     fn formats(&self) -> &[&str] {
         &["xlsx"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let mut zip = super::open_zip(path)?;
 
         // 读取 workbook.xml 获取 sheet 列表
@@ -1284,7 +1286,7 @@ mod tests {
         }
 
         let raw = XlsxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         std::fs::remove_file(&path).ok();
 
@@ -1487,7 +1489,7 @@ mod tests {
             }
             zw.finish().unwrap();
         }
-        let path = path.to_str().unwrap().to_string();
+        let path = path.clone();
 
         let rows_of = |raw: &crate::plugin::RawDoc| -> Vec<Vec<String>> {
             raw.pages[0].items[0]
@@ -1665,7 +1667,7 @@ mod tests {
             zw.finish().unwrap();
         }
 
-        let p = path.to_str().unwrap();
+        let p = &path;
         let on = XlsxRawBackend::new(true).parse(p).unwrap();
         let off = XlsxRawBackend::default().parse(p).unwrap();
         std::fs::remove_file(&path).ok();
@@ -1811,7 +1813,7 @@ mod tests {
     #[test]
     fn parallel_sheets_keep_workbook_order() {
         let path = multi_sheet_workbook("docparser_office_xlsx_parallel_order", "order.xlsx", 5);
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
         let doc = XlsxRawBackend::default().parse(&p).unwrap();
         std::fs::remove_file(&path).ok();
 
@@ -1885,7 +1887,7 @@ mod tests {
     fn zero_sheet_workbook_is_corrupt() {
         let path = minimal_xlsx("docparser_office_xlsx_zero", "zero.xlsx", "<sheets/>", None);
         let err = XlsxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap_err();
         assert_eq!(
             err.code,
@@ -1908,7 +1910,7 @@ mod tests {
             )),
         );
         let doc = XlsxRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         assert_eq!(doc.pages.len(), 1);
         assert_eq!(doc.pages[0].name.as_deref(), Some("空表"));
@@ -1921,7 +1923,7 @@ mod tests {
     #[test]
     fn truncate_drops_rows_and_later_sheets() {
         let path = two_sheet_workbook("docparser_office_xlsx_truncate", "truncate.xlsx");
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
 
         // 每行开销 = 2 字符 + 0 分隔符 + 1 换行 = 3；预算 5 → 只放得下第 1 行
         let on = XlsxRawBackend::default()
@@ -1955,7 +1957,7 @@ mod tests {
     #[test]
     fn max_sheets_drops_extra_sheets_without_flag() {
         let path = two_sheet_workbook("docparser_office_xlsx_max_sheets", "max.xlsx");
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
         let doc = XlsxRawBackend::default()
             .with_max_sheets(1)
             .parse(&p)
@@ -2061,7 +2063,7 @@ mod tests {
             zw.finish().unwrap();
         }
 
-        let p = path.to_str().unwrap();
+        let p = &path;
         let on = XlsxRawBackend::default()
             .with_ocr_images(true)
             .parse(p)

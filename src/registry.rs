@@ -171,7 +171,7 @@ mod tests {
         fn is_available(&self) -> bool {
             self.available
         }
-        fn parse(&self, _path: &str) -> Result<RawDoc> {
+        fn parse(&self, _path: &std::path::Path) -> Result<RawDoc> {
             Ok(RawDoc::default())
         }
     }

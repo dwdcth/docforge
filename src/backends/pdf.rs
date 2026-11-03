@@ -148,8 +148,8 @@ impl ParseCapability for PdfParseCapability {
         &["pdf"]
     }
 
-    fn parse(&self, path: &str) -> Result<RawDoc> {
-        parse_pdf(Path::new(path), &self.opts)
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
+        parse_pdf(path, &self.opts)
     }
 }
 

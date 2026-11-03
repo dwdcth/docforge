@@ -88,8 +88,8 @@ impl ParseCapability for DjvuParseCapability {
         &["djvu"]
     }
 
-    fn parse(&self, path: &str) -> Result<RawDoc> {
-        parse_djvu(Path::new(path), &self.opts)
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
+        parse_djvu(path, &self.opts)
     }
 }
 

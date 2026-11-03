@@ -51,6 +51,7 @@
 //! 另留 `#[ignore]` 真件集成测试位。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use mobi::headers::{Encryption, ExthRecord};
@@ -122,7 +123,7 @@ impl ParseCapability for MobiRawBackend {
         // azw3 走 kf8 自研支路（见模块头）；prc 是 MOBI/PalmDoc 的同构扩展名
         &["mobi", "prc", "azw3"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         // 整件读入一次：KF8 侦测与 mobi crate 通路共用同一份字节
         let bytes =
             std::fs::read(path).map_err(|e| DocError::corrupt(format!("MOBI 读取失败: {e}")))?;
@@ -449,7 +450,7 @@ mod tests {
     #[test]
     fn reads_metadata_and_content_from_constructed_mobi7() {
         let p = build_mobi("full", &full_fixture());
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("测试书"));
@@ -468,7 +469,7 @@ mod tests {
     #[test]
     fn assembles_html_into_structured_blocks() {
         let p = build_mobi("asm", &full_fixture());
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let doc = MobiPlugin.assemble(&raw);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
@@ -496,7 +497,7 @@ mod tests {
                 ..full_fixture()
             },
         );
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("testbook"));
@@ -509,12 +510,12 @@ mod tests {
     #[test]
     fn encrypted_or_drm_mobi_is_encrypted_error() {
         let p = build_mobi("enc", &Fixture { encryption: 2, ..full_fixture() });
-        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&p).unwrap_err();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(err.code.as_str(), "encrypted");
 
         let p = build_mobi("drm", &Fixture { drm: true, ..full_fixture() });
-        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&p).unwrap_err();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(err.code.as_str(), "encrypted");
     }
@@ -531,7 +532,7 @@ mod tests {
             b"this file is definitely not a mobi document, not even close......",
         )
         .unwrap();
-        let err = MobiRawBackend.parse(path.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&path).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code.as_str(), "corrupt");
     }
@@ -880,7 +881,7 @@ mod tests {
     #[test]
     fn reads_azw3_kf8_content_and_metadata() {
         let p = build_azw3("kf8-full", &kf8_fixture());
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         assert_eq!(raw.meta.get("mobi.title").map(String::as_str), Some("KF8测试书"));
@@ -901,7 +902,7 @@ mod tests {
     #[test]
     fn assembles_azw3_into_structured_blocks() {
         let p = build_azw3("kf8-asm", &kf8_fixture());
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let doc = MobiPlugin.assemble(&raw);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(doc.pages.len(), 1);
@@ -921,7 +922,7 @@ mod tests {
     #[test]
     fn hybrid_mobi_prefers_kf8_part() {
         let p = build_hybrid_mobi("kf8-hybrid");
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         let html = &raw.pages[0].items[0].text;
         assert!(html.contains("正文一段。"), "{html}");
@@ -939,7 +940,7 @@ mod tests {
             ..kf8_fixture()
         };
         let p = build_azw3("kf8-palmdoc", &f);
-        let raw = MobiRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = MobiRawBackend.parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         let html = &raw.pages[0].items[0].text;
         assert!(html.contains("<p>Para one.</p>"), "{html}");
@@ -951,12 +952,12 @@ mod tests {
     #[test]
     fn encrypted_kf8_is_encrypted_error() {
         let p = build_azw3("kf8-enc", &Kf8Fixture { encryption: 2, ..kf8_fixture() });
-        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&p).unwrap_err();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(err.code.as_str(), "encrypted");
 
         let p = build_azw3("kf8-drm", &Kf8Fixture { drm: true, ..kf8_fixture() });
-        let err = MobiRawBackend.parse(p.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&p).unwrap_err();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(err.code.as_str(), "encrypted");
     }
@@ -970,7 +971,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.azw3");
         std::fs::write(&path, b"definitely not an azw3 document at all........").unwrap();
-        let err = MobiRawBackend.parse(path.to_str().unwrap()).unwrap_err();
+        let err = MobiRawBackend.parse(&path).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code.as_str(), "corrupt");
     }
@@ -992,7 +993,7 @@ mod tests {
                 continue;
             }
             let raw = MobiRawBackend
-                .parse(path.to_str().unwrap())
+                .parse(&path)
                 .unwrap_or_else(|e| panic!("{} 打开失败: {e}", path.display()));
             assert!(
                 raw.meta.contains_key("mobi.title"),

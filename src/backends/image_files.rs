@@ -15,6 +15,7 @@
 //!
 //! 测试件策略：image crate 内存编码 PNG/JPEG 落 `target/` 后按扩展名命名。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{DocError, ErrorCode, Result};
@@ -38,10 +39,10 @@ impl ParseCapability for ImageFilesRawBackend {
     fn formats(&self) -> &[&str] {
         &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         // 预检走终止码 Unsupported：文件不存在是确定性结论，不能被兜底后端掩盖
         //（对齐 pdf.rs）
-        let p = std::path::Path::new(path);
+        let p = path;
         if !p.is_file() {
             return Err(DocError {
                 code: ErrorCode::Unsupported,
@@ -50,7 +51,7 @@ impl ParseCapability for ImageFilesRawBackend {
             });
         }
         let data = std::fs::read(p)
-            .map_err(|e| DocError::corrupt(format!("图片读取失败 {path}: {e}")))?;
+            .map_err(|e| DocError::corrupt(format!("图片读取失败 {}: {e}", path.display())))?;
         let ext = p
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -58,7 +59,7 @@ impl ParseCapability for ImageFilesRawBackend {
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
         Ok(RawDoc {
             // 单文件 = 单页：字节透传不解码，px 未知（None），OCR 链解码时
             // 自行判断
@@ -184,7 +185,7 @@ mod tests {
     #[test]
     fn single_png_becomes_one_page() {
         let (p, bytes) = make_image_file("png", "scan.png", image::ImageFormat::Png);
-        let raw = ImageFilesRawBackend.parse(p.to_str().unwrap()).unwrap();
+        let raw = ImageFilesRawBackend.parse(&p).unwrap();
         assert_eq!(raw.pages.len(), 1);
         let page = &raw.pages[0];
         assert_eq!(page.name.as_deref(), Some("scan.png"), "页名 = 文件名");
@@ -208,7 +209,7 @@ mod tests {
         for (file, want_ext) in [("photo.jpg", "jpg"), ("photo.jpeg", "jpeg")] {
             let (p, bytes) =
                 make_image_file("jpeg", file, image::ImageFormat::Jpeg);
-            let raw = ImageFilesRawBackend.parse(p.to_str().unwrap()).unwrap();
+            let raw = ImageFilesRawBackend.parse(&p).unwrap();
             assert_eq!(raw.pages.len(), 1);
             assert_eq!(raw.pages[0].name.as_deref(), Some(file));
             assert_eq!(raw.pages[0].images[0].ext, want_ext, "{file}");
@@ -244,7 +245,7 @@ mod tests {
 
         let (p, _bytes) = make_image_file("e2e", "scan.png", image::ImageFormat::Png);
         let doc = crate::DocumentEngine::new(reg)
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         cleanup(&p);
         assert_eq!(doc.meta.file_type, "png");
@@ -266,7 +267,7 @@ mod tests {
             .join(format!("imgfile-missing-{}", std::process::id()));
         let ghost = dir.join("ghost.png");
         let err = ImageFilesRawBackend
-            .parse(ghost.to_str().unwrap())
+            .parse(&ghost)
             .unwrap_err();
         // 文件不存在是确定性结论：终止码 Unsupported（对齐 pdf.rs 文案）
         assert_eq!(err.code, ErrorCode::Unsupported);

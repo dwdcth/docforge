@@ -54,6 +54,7 @@
 //! （tests/fixtures/chm/ 的 SVN Book CHM，来源与许可见 real_corpus_golden）。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use libchm::{ChmFile, EntrySel};
@@ -417,7 +418,7 @@ impl ParseCapability for ChmRawBackend {
     fn formats(&self) -> &[&str] {
         &["chm"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let mut chm = ChmFile::open(path)
             .map_err(|e| DocError::corrupt(format!("CHM 打开失败: {e}")))?;
 
@@ -815,7 +816,7 @@ mod tests {
                 ("/index.htm", INDEX.as_bytes()),
             ],
         );
-        let raw = ChmRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw = ChmRawBackend::default().parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         // 元数据：/#SYSTEM code 3/2/4
@@ -925,7 +926,7 @@ mod tests {
                 ("/idx.hhk", b"<html></html>"),
             ],
         );
-        let raw = ChmRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw = ChmRawBackend::default().parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         let names: Vec<Option<String>> = raw.pages.iter().map(|p| p.name.clone()).collect();
@@ -955,11 +956,11 @@ mod tests {
         ];
         let p = write_chm("imgs", &entries);
 
-        let raw_off = ChmRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw_off = ChmRawBackend::default().parse(&p).unwrap();
         assert!(raw_off.pages[0].images.is_empty());
 
         let raw_on = ChmRawBackend { ocr_images: true }
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         assert_eq!(raw_on.pages[0].images.len(), 1);
         assert_eq!(raw_on.pages[0].images[0].ext, "png");
@@ -981,7 +982,7 @@ mod tests {
                 ("/app.htm", APP.as_bytes()),
             ],
         );
-        let raw = ChmRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw = ChmRawBackend::default().parse(&p).unwrap();
         let doc = ChmPlugin.assemble(&raw);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
@@ -1007,7 +1008,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.chm");
         std::fs::write(&path, b"this is definitely not a compiled html help file......").unwrap();
-        let err = ChmRawBackend::default().parse(path.to_str().unwrap()).unwrap_err();
+        let err = ChmRawBackend::default().parse(&path).unwrap_err();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(err.code.as_str(), "corrupt");
     }
@@ -1016,7 +1017,7 @@ mod tests {
     #[test]
     fn image_only_chm_is_corrupt() {
         let p = write_chm("imgonly", &[("/logo.png", PNG_SIG)]);
-        let err = ChmRawBackend::default().parse(p.to_str().unwrap()).unwrap_err();
+        let err = ChmRawBackend::default().parse(&p).unwrap_err();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("无 HTML"));
@@ -1036,7 +1037,7 @@ mod tests {
         );
         let mut reg = Registry::new();
         register_defaults(&mut reg);
-        let doc = crate::DocumentEngine::new(reg).parse(p.to_str().unwrap()).unwrap();
+        let doc = crate::DocumentEngine::new(reg).parse(&p).unwrap();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
 
         assert_eq!(doc.meta.file_type, "chm");
@@ -1067,7 +1068,7 @@ mod tests {
                 continue;
             }
             let raw = ChmRawBackend::default()
-                .parse(path.to_str().unwrap())
+                .parse(&path)
                 .unwrap_or_else(|e| panic!("{} 打开失败: {e}", path.display()));
             assert!(!raw.pages.is_empty(), "{} 应至少一章", path.display());
             let doc = ChmPlugin.assemble(&raw);

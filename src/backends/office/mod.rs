@@ -12,6 +12,7 @@
 //!   * `OfficePlugin` → `FormatPlugin`（RawDoc → IR Document 组装）
 //!   * `register_defaults()` → 供 `core-python` 和 `cli` 调用
 
+use std::path::Path;
 use std::sync::Arc;
 
 // `DocError`/`Result` 只被 docx/xlsx 共用的 zip 读取辅助用到；只剩 pptx 时会成为未用导入。
@@ -614,7 +615,7 @@ pub(crate) fn part_dir(part: &str) -> &str {
 /// `size` 预算；任一为 `0` 视为关闭。取不到文件大小时按关闭处理（与 Python 抛错后
 /// 走 `0` 的兜底一致，不因为 stat 失败就截断正文）。
 #[cfg(any(feature = "xlsx", feature = "pptx"))]
-pub(crate) fn truncate_budget(path: &str, threshold: u64, size: usize) -> usize {
+pub(crate) fn truncate_budget(path: &Path, threshold: u64, size: usize) -> usize {
     if threshold == 0 || size == 0 {
         return 0;
     }
@@ -687,9 +688,9 @@ pub(crate) fn zip_read_bytes(
 ///
 /// 并行解析时每个工作块要开自己的一份（`ZipArchive` 读条目需要 `&mut`，
 /// 跨线程共享只能加锁 = 假并行）；串行路径上也统一走这里，错误文案只有一份。
-pub(crate) fn open_zip(path: &str) -> Result<zip::ZipArchive<std::fs::File>> {
+pub(crate) fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>> {
     let file = std::fs::File::open(path)
-        .map_err(|e| DocError::corrupt(format!("cannot open {path}: {e}")))?;
+        .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
     zip::ZipArchive::new(file).map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))
 }
 

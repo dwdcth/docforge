@@ -22,6 +22,7 @@ use crate::plugin::{FormatPlugin, RawDoc};
 use crate::policy::BackendPolicy;
 use crate::registry::Registry;
 use crate::router;
+use std::path::Path;
 
 /// 引擎级解析阶段（粗粒度进度通知；页级粒度见各后端 Options 的回调，
 /// 如 `PdfOptions::on_progress`——本枚举只标注"走到哪一步"，不含取消语义）。
@@ -142,8 +143,11 @@ impl DocumentEngine {
         }
     }
 
-    pub fn parse(&self, path: &str) -> Result<Document> {
-        let (fmt, plugin, raw) = self.run_parse_chain(path)?;
+    /// 解析 `path` 指向的文档。`path` 吃任何 `AsRef<Path>`（`&str` /
+    /// `&Path` / `PathBuf` 均可——非 UTF-8 文件名（Windows GBK / Unix 乱码
+    /// 字节名）经 `Path` 原样透传，不再有 `to_str` 损失）。
+    pub fn parse(&self, path: impl AsRef<Path>) -> Result<Document> {
+        let (fmt, plugin, raw) = self.run_parse_chain(path.as_ref())?;
         // mut 随 feature：块级语言检测（仅 lang-detect 有检测函数）需要就地
         // 改块；无该 feature 时 finalize 按值消费，绑定无需 mut（避免
         // unused_mut 告警）
@@ -170,7 +174,7 @@ impl DocumentEngine {
     ///（Sniffed / Parsed / Processed 在此发出，Assembled 留给组装段之后）。
     fn run_parse_chain(
         &self,
-        path: &str,
+        path: &Path,
     ) -> Result<(&'static str, std::sync::Arc<dyn FormatPlugin>, RawDoc)> {
         let fmt = router::sniff(path)?;
         // ⓪ 嗅探完成：通知体为格式名（此时插件可能仍缺失——格式已认定）
@@ -269,8 +273,8 @@ impl DocumentEngine {
     ///   直接用深度流式入口 `crate::backends::pdf::parse_streaming`：绕过
     ///   RawDoc/assemble 全量驻留，页产即吐、峰值 = 单页。本方法对 pdf
     ///   同样正确，只是受插件解析器现实所限省不掉 RawDoc 阶段。
-    pub fn parse_streaming(&self, path: &str, sink: PageSink<'_>) -> Result<DocMeta> {
-        let (fmt, plugin, raw) = self.run_parse_chain(path)?;
+    pub fn parse_streaming(&self, path: impl AsRef<Path>, sink: PageSink<'_>) -> Result<DocMeta> {
+        let (fmt, plugin, raw) = self.run_parse_chain(path.as_ref())?;
         let mut doc = Self::assemble_document(fmt, plugin.as_ref(), &raw);
         drop(raw); // 流式：处理链已结束，RawDoc 先于页投递释放（不再双驻留）
         // ③ 组装完成：通知点与 parse 一致（finalize 统计回填前发出）
@@ -413,10 +417,10 @@ mod tests {
         DocumentEngine::new(reg).with_policy(policy)
     }
 
-    fn write_tmp(name: &str, content: &str) -> String {
+    fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("docforge_engine_{name}"));
         std::fs::write(&p, content).unwrap();
-        p.to_string_lossy().into_owned()
+        p
     }
 
     #[test]
@@ -585,6 +589,32 @@ mod tests {
         assert!(eng.progress.is_none());
         assert!(eng.parse(&p).is_ok());
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 非 UTF-8 路径端到端（Unix 门控）：OsStr 字节名（`\xff\xfe` 非法
+    /// UTF-8）的文件在 `&str` 签名下根本传不进库（`to_str()` 失败或 lossy
+    /// 损坏扩展名之外的字节）——`AsRef<Path>` 后原样透传，解析成功且
+    /// file_type / 正文正确。这是"以前传不进来、现在能解析"的钱测试。
+    #[test]
+    #[cfg(unix)]
+    fn parse_non_utf8_path_end_to_end() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::env::temp_dir()
+            .join(std::ffi::OsStr::from_bytes(b"docforge-\xff\xfe.txt"));
+        std::fs::write(&p, "line1\n\nline2\n").unwrap();
+
+        // 引擎入口
+        let doc = engine().parse(&p).unwrap();
+        assert_eq!(doc.meta.file_type, "txt");
+        assert_eq!(doc.pages[0].text, "line1\n\nline2");
+        assert_eq!(doc.pages[0].blocks.len(), 2);
+
+        // 便捷入口（默认装配）同验
+        let doc = crate::parse(&p).unwrap();
+        assert_eq!(doc.meta.file_type, "txt");
+        assert_eq!(doc.pages[0].blocks[0].content, "line1");
+
         std::fs::remove_file(&p).ok();
     }
 

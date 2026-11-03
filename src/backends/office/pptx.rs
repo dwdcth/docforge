@@ -17,6 +17,7 @@ use quick_xml::Reader;
 use super::parse_rels;
 use super::structure::StructureMode;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// PPTX raw 后端。
 #[derive(Default)]
@@ -71,7 +72,7 @@ impl ParseCapability for PptxRawBackend {
     fn formats(&self) -> &[&str] {
         &["pptx"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let mut zip = super::open_zip(path)?;
 
         // 全量缓存所有 XML 和 rels 文件，避免 per-slide 多次 ZIP 遍历
@@ -1240,7 +1241,7 @@ mod tests {
     #[test]
     fn truncate_keeps_overflow_page_and_drops_later_slides() {
         let path = three_slide_pptx("docparser_office_pptx_truncate", "truncate.pptx");
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
 
         // 预算 = 2 字符：slide1(2) 放得下；slide2(2) 命中截断但仍整页保留；slide3 不再解析
         // （fixture 每页只有 1 个形状 → auto 会走 raw；本用例验的是 semantic 下的预算）
@@ -1268,7 +1269,7 @@ mod tests {
     #[test]
     fn max_slides_drops_extra_slides_and_keeps_notes() {
         let path = three_slide_pptx("docparser_office_pptx_max_slides", "max.pptx");
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
         let doc = PptxRawBackend::default()
             .with_structure_mode(StructureMode::Semantic)
             .with_max_slides(2)
@@ -1298,7 +1299,7 @@ mod tests {
     #[test]
     fn raw_mode_emits_flat_text_and_drops_notes() {
         let path = three_slide_pptx("docparser_office_pptx_raw", "raw.pptx");
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
         // auto：单形状页 → raw
         let auto = PptxRawBackend::default().parse(&p).unwrap();
         // 显式 semantic：同一文件走全结构
@@ -1409,7 +1410,7 @@ mod tests {
             zw.write_all(&png_bytes(20, 20)).unwrap();
             zw.finish().unwrap();
         }
-        let p = path.to_str().unwrap().to_string();
+        let p = path.clone();
 
         let on = PptxRawBackend::default()
             .with_ocr_images(true)

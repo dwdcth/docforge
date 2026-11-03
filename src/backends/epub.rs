@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
 use quick_xml::events::{BytesEnd, BytesStart, Event};
@@ -440,7 +441,7 @@ pub(crate) fn resolve(base: &str, href: &str) -> String {
     parts.join("/")
 }
 
-fn open_zip(path: &str) -> Result<zip::ZipArchive<std::fs::File>> {
+fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>> {
     let f =
         std::fs::File::open(path).map_err(|e| DocError::corrupt(format!("EPUB 打不开: {e}")))?;
     zip::ZipArchive::new(f).map_err(|e| DocError::corrupt(format!("EPUB 打不开: {e}")))
@@ -614,7 +615,7 @@ impl ParseCapability for EpubRawBackend {
     fn formats(&self) -> &[&str] {
         &["epub"]
     }
-    fn parse(&self, path: &str) -> Result<RawDoc> {
+    fn parse(&self, path: &Path) -> Result<RawDoc> {
         let mut zip = open_zip(path)?;
 
         let container = read_entry(&mut zip, "META-INF/container.xml")?
@@ -892,9 +893,9 @@ pub fn register_defaults(reg: &mut Registry) {
 
 // ── 便捷 API ────────────────────────────────────────────────────────
 
-/// 一次读完：元数据 + 分章（含结构化块）。
-pub fn read_epub(path: &str) -> Result<EpubBook> {
-    let raw = EpubRawBackend::default().parse(path)?;
+/// 一次读完：元数据 + 分章（含结构化块）。`path` 吃任何 `AsRef<Path>`。
+pub fn read_epub(path: impl AsRef<Path>) -> Result<EpubBook> {
+    let raw = EpubRawBackend::default().parse(path.as_ref())?;
     // 书 API 保留结构化块（Heading/List），不按 Document 口径坍缩
     let doc = EpubPlugin.assemble_impl(&raw, false);
     let get = |k: &str| raw.meta.get(k).cloned().unwrap_or_default();
@@ -923,8 +924,9 @@ pub fn read_epub(path: &str) -> Result<EpubBook> {
 }
 
 /// 只取封面路径与书名（不解析正文），供书库/缩略图场景使用。
-pub fn epub_cover_href(path: &str) -> (Option<String>, String) {
-    match EpubRawBackend::default().parse(path) {
+/// `path` 吃任何 `AsRef<Path>`。
+pub fn epub_cover_href(path: impl AsRef<Path>) -> (Option<String>, String) {
+    match EpubRawBackend::default().parse(path.as_ref()) {
         Ok(raw) => (
             raw.meta.get("epub.cover_href").cloned(),
             raw.meta.get("epub.title").cloned().unwrap_or_default(),
@@ -1004,7 +1006,7 @@ mod tests {
     #[test]
     fn reads_metadata_and_split_chapters() {
         let p = write_epub("ok", None);
-        let book = read_epub(p.to_str().unwrap()).unwrap();
+        let book = read_epub(&p).unwrap();
         std::fs::remove_file(&p).ok();
 
         assert_eq!(book.meta.title, "测试书");
@@ -1031,7 +1033,7 @@ mod tests {
         crate::plugins::text::register_defaults(&mut reg);
         register_defaults(&mut reg);
         let doc = crate::DocumentEngine::new(reg)
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         std::fs::remove_file(&p).ok();
 
@@ -1050,7 +1052,7 @@ mod tests {
         crate::plugins::text::register_defaults(&mut reg);
         register_defaults(&mut reg);
         let doc = crate::DocumentEngine::new(reg)
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         std::fs::remove_file(&p).ok();
 
@@ -1077,7 +1079,7 @@ mod tests {
         zw.write_all(b"application/epub+zip").unwrap();
         zw.finish().unwrap();
 
-        let err = read_epub(path.to_str().unwrap()).unwrap_err();
+        let err = read_epub(&path).unwrap_err();
         std::fs::remove_file(&path).ok();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("container.xml"));
@@ -1091,7 +1093,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.epub");
         std::fs::write(&path, b"not a zip").unwrap();
-        let err = read_epub(path.to_str().unwrap()).unwrap_err();
+        let err = read_epub(&path).unwrap_err();
         std::fs::remove_file(&path).ok();
         assert_eq!(err.code.as_str(), "corrupt");
     }
@@ -1172,7 +1174,7 @@ mod five_piece_tests {
             r#"<item id="nx" href="nx.xhtml" media-type="application/xhtml+xml"/>"#,
             &[("nx.xhtml", b"<html><body><p>hidden</p></body></html>")],
         );
-        let raw = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw = EpubRawBackend::default().parse(&p).unwrap();
         assert_eq!(raw.pages.len(), 1, "linear=no 不进阅读流");
         assert!(raw.pages[0].items[0].text.contains("chapter one"));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
@@ -1187,7 +1189,7 @@ mod five_piece_tests {
             r#"<item id="cv" href="my-cover-image.png" media-type="image/png"/>"#,
             &[],
         );
-        let (href, _) = epub_cover_href(p.to_str().unwrap());
+        let (href, _) = epub_cover_href(&p);
         assert_eq!(href.as_deref(), Some("my-cover-image.png"));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
@@ -1202,13 +1204,13 @@ mod five_piece_tests {
             &[("pic.png", &png)],
         );
         let raw = EpubRawBackend { ocr_images: true }
-            .parse(p.to_str().unwrap())
+            .parse(&p)
             .unwrap();
         assert_eq!(raw.pages[0].images.len(), 1);
         assert_eq!(raw.pages[0].images[0].ext, "png");
         assert_eq!(&raw.pages[0].images[0].data[..4], &png[..4]);
         // 默认关：不提取
-        let raw_off = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw_off = EpubRawBackend::default().parse(&p).unwrap();
         assert!(raw_off.pages[0].images.is_empty());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
@@ -1226,7 +1228,7 @@ mod five_piece_tests {
             r#"<item id="g" href="gbk.xhtml" media-type="application/xhtml+xml"/>"#,
             &[("gbk.xhtml", &xhtml)],
         );
-        let raw = EpubRawBackend::default().parse(p.to_str().unwrap()).unwrap();
+        let raw = EpubRawBackend::default().parse(&p).unwrap();
         assert_eq!(raw.pages.len(), 2);
         let got = &raw.pages[1].items[0].text;
         #[cfg(feature = "encoding")]

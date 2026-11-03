@@ -52,17 +52,16 @@ use super::{apply_edits, Edit, escape_xml_text, open_zip, rewrite_zip, translati
 /// [`crate::emit::to_translation_units`] 同口径（`p{页}-b{块序}`，页名取
 /// Document 页名）。失败返回 `corrupt`。
 pub fn writeback_epub(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("epub 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
-    let raw = EpubRawBackend::default().parse(path_str)?;
+    let raw = EpubRawBackend::default().parse(in_path)?;
     let doc = EpubPlugin.assemble(&raw);
     // 单元流全量（含表格格单元 kind = Table）：块级候选按块序消费、表格格
     // 在表格位逐格消费（见主循环的 Table 分支），两段消费拼满同一单元流。
@@ -578,7 +577,7 @@ mod tests {
     /// 提取侧同管线（EpubRawBackend + EpubPlugin::assemble）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = EpubRawBackend::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         EpubPlugin.assemble(&raw)
     }
@@ -624,7 +623,7 @@ mod tests {
         );
 
         // 书 API（保留结构化块）：原/译交错
-        let book = read_epub(out_path.to_str().unwrap()).unwrap();
+        let book = read_epub(&out_path).unwrap();
         let titles: Vec<&str> = book.chapters.iter().map(|c| c.title.as_str()).collect();
         assert_eq!(titles, ["第一章", "甲节", "乙节"]);
 
@@ -750,10 +749,10 @@ mod tests {
 
         // 前两个 spine 文档不动
         let raw_in = EpubRawBackend::default()
-            .parse(in_path.to_str().unwrap())
+            .parse(&in_path)
             .unwrap();
         let raw_out = EpubRawBackend::default()
-            .parse(out_path.to_str().unwrap())
+            .parse(&out_path)
             .unwrap();
         assert_eq!(raw_in.pages[0].items[0].text, raw_out.pages[0].items[0].text);
 
@@ -870,7 +869,7 @@ mod tests {
             BiStrategy::BilingualInline,
         );
         let raw_out = EpubRawBackend::default()
-            .parse(out_path.to_str().unwrap())
+            .parse(&out_path)
             .unwrap();
         let ch3 = &raw_out.pages[2].items[0].text;
         assert!(
@@ -878,7 +877,7 @@ mod tests {
             "格内 br 对照插在格内容终点：{ch3}"
         );
         assert!(ch3.contains("<td>伏</td>"), "未命中格原样：{ch3}");
-        let book = read_epub(out_path.to_str().unwrap()).unwrap();
+        let book = read_epub(&out_path).unwrap();
         let tbl = book.chapters[3].blocks[1].table.as_ref().unwrap();
         assert_eq!(
             tbl.rows[1],
@@ -899,12 +898,12 @@ mod tests {
             BiStrategy::OriginalPlusAppendix,
         );
         let raw_out2 = EpubRawBackend::default()
-            .parse(out2.to_str().unwrap())
+            .parse(&out2)
             .unwrap();
         // 附录落在最后 spine 文档（ch3，表格所在部件）；表格原样、格译文
         // 不入正文也不入附录（附录只收段落类）
         let raw_in = EpubRawBackend::default()
-            .parse(in_path.to_str().unwrap())
+            .parse(&in_path)
             .unwrap();
         let ch3_out = &raw_out2.pages[2].items[0].text;
         assert!(ch3_out.contains("<p>See the table.</p>"), "段落译文进附录");

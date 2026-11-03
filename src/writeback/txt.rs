@@ -56,14 +56,13 @@ const APPENDIX_MARK: &str = "【译文】";
 /// [`crate::emit::to_translation_units`] 同口径（`p0-b{块序}`）；未匹配 /
 /// 空白译文条目忽略；失败返回 `corrupt`。
 pub fn writeback_txt(
-    in_path: &Path,
+    in_path: impl AsRef<Path>,
     translated: &[(String, String)],
     strategy: BiStrategy,
-    out: &Path,
+    out: impl AsRef<Path>,
 ) -> Result<()> {
-    let path_str = in_path
-        .to_str()
-        .ok_or_else(|| DocError::corrupt("txt 路径不是 UTF-8"))?;
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
 
     // A. 读字节并解码（UTF-8 快路径逐字节保真；其余走解析侧同链）
     let bytes = std::fs::read(in_path)
@@ -71,7 +70,7 @@ pub fn writeback_txt(
     let (bom, text) = decode_input(&bytes)?;
 
     // B. 权威解析（提取侧同管线、同默认规则）拿 id / 文本
-    let raw = TextParseCapability::default().parse(path_str)?;
+    let raw = TextParseCapability::default().parse(in_path)?;
     let doc = TextPlugin.assemble(&raw);
     let units: Vec<_> = crate::emit::to_translation_units(&doc)
         .into_iter()
@@ -356,7 +355,7 @@ mod tests {
     /// 提取侧同管线（TextParseCapability 默认规则 + TextPlugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = TextParseCapability::default()
-            .parse(path.to_str().unwrap())
+            .parse(&path)
             .unwrap();
         TextPlugin.assemble(&raw)
     }
