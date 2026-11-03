@@ -48,7 +48,7 @@ pub mod policy;
 pub mod registry;
 pub mod router;
 
-pub use engine::{DocumentEngine, ParsePhase, ProgressFn};
+pub use engine::{DocumentEngine, PageSink, ParsePhase, ProgressFn};
 pub use error::{DocError, ErrorCode, Result};
 // 编码探测（横切能力）：decode 对外兼容（原 plugins::text::decode），
 // detect_and_decode 返回"解码结果 + 命中编码名"（rumi 等外部消费者入口）
@@ -64,9 +64,9 @@ pub use registry::{Registry, RegistryError};
 
 /// 默认 Registry 装配（文本族内置 + pdf feature 开启时注册
 /// `PdfOptions::default()`）。发布版不内置 OCR 引擎（git 依赖不上 crates.io），
-/// 引擎一律注入：见 [`ocr::OcrEngine`]。[`parse`] 与 [`parse_with_progress`]
-/// 共用此装配；自定义装配（注入引擎/选项/后端）用 [`Registry`] +
-/// [`DocumentEngine`]。
+/// 引擎一律注入：见 [`ocr::OcrEngine`]。[`parse`] / [`parse_with_progress`] /
+/// [`parse_streaming`] 共用此装配；自定义装配（注入引擎/选项/后端）用
+/// [`Registry`] + [`DocumentEngine`]。
 fn default_registry() -> Registry {
     let mut registry = Registry::new();
     plugins::text::register_defaults(&mut registry);
@@ -142,4 +142,26 @@ pub fn parse_with_progress(path: &str, cb: ProgressFn) -> Result<Document> {
     DocumentEngine::new(default_registry())
         .with_progress(cb)
         .parse(path)
+}
+
+/// 便捷流式解析：默认 Registry 装配（与 [`parse`] / [`parse_with_progress`]
+/// 共用）。assemble 后逐页投递给 sink、按已投递页回填统计，语义详见
+/// [`DocumentEngine::parse_streaming`]。
+///
+/// 消费指引：pdf 千页扫描件（keep_raster_pages 全量驻留爆内存）的最坏场景
+/// 直接用 pdf 后端的深度流式入口 `docforge::backends::pdf::parse_streaming`
+///（页产即吐、峰值 = 单页）；其余格式（及对 pdf 的正确但不省内存路径）用
+/// 本函数。
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let meta = docforge::parse_streaming("note.md", &mut |page| {
+///     println!("{} 字符", page.text.chars().count());
+///     true // false = 中止：余页不产，meta 仍返回
+/// })?;
+/// println!("{} 页", meta.page_count);
+/// # Ok(()) }
+/// ```
+pub fn parse_streaming(path: &str, sink: PageSink<'_>) -> Result<DocMeta> {
+    DocumentEngine::new(default_registry()).parse_streaming(path, sink)
 }

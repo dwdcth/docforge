@@ -3,7 +3,10 @@
 // FormatPlugin::enrich_meta 后置钩子（格式特有元数据 → DocMeta.extra）；
 // ③ 无插件报错附 feature 自查提示（fmt_feature_hint 静态映射 + 对应单测）；
 // ④ engine 级粗粒度进度钩子（ParsePhase / ProgressFn / with_progress，四阶段
-// 边界各通知一次；页级粒度与取消仍在各后端 Options，如 PdfOptions.on_progress）。
+// 边界各通知一次；页级粒度与取消仍在各后端 Options，如 PdfOptions.on_progress）；
+// ⑤ engine 级流式解析（PageSink / parse_streaming：assemble 后逐页投递，统计
+// 按已投递页回填、warnings 记中止；pdf 千页件的最坏场景另有
+// backends::pdf::parse_streaming 深度流式入口，页产即吐、峰值 = 单页）。
 //! 文档引擎：sniff → 解析链（回退保留原始错误码）→ 处理链（失败仅记录）→ assemble。
 //!
 //! 可选引擎级进度钩子（[`ProgressFn`]）在各阶段边界发粗粒度通知，覆盖全部
@@ -12,7 +15,8 @@
 //! 并存、互不替代。未挂钩子时零开销（一次判空，无分配）。
 
 use crate::error::{DocError, ErrorCode, Result};
-use crate::model::Document;
+use crate::model::{DocMeta, Document, Page};
+use crate::plugin::{FormatPlugin, RawDoc};
 use crate::policy::BackendPolicy;
 use crate::registry::Registry;
 use crate::router;
@@ -52,6 +56,11 @@ impl ParsePhase {
 /// `PdfOptions::on_progress` 返回 false 的截停语义）。全同步：实现方
 /// 不得在回调里重入同一 engine。
 pub type ProgressFn = std::sync::Arc<dyn Fn(ParsePhase, &str) + Send + Sync>;
+
+/// 页接收器：流式解析逐页投递（见 [`DocumentEngine::parse_streaming`]）。
+/// 返回 false 中止（余页不产，meta 仍返回，warnings 记中止）。消费即释放
+/// ——调用方不应长期持有 [`Page`]。
+pub type PageSink<'a> = &'a mut dyn FnMut(Page) -> bool;
 
 /// 格式名 → feature 自查提示：`没有可处理该格式的插件` 报错时的指路映射。
 ///
@@ -132,6 +141,22 @@ impl DocumentEngine {
     }
 
     pub fn parse(&self, path: &str) -> Result<Document> {
+        let (fmt, plugin, raw) = self.run_parse_chain(path)?;
+        let doc = Self::assemble_document(fmt, plugin.as_ref(), &raw);
+        // ③ 组装完成：finalize 统计回填前发出（文档结构已就绪，仅差
+        // text_length 等统计字段；无附加标识，通知体空串）
+        self.notify(ParsePhase::Assembled, "");
+        Ok(doc.finalize())
+    }
+
+    /// 共享前段（⓪①②）：sniff → 插件 → 解析链（回退保留原始错误码）→
+    /// 处理链（就地增强，失败仅记录告警并回填 RawDoc.meta）。[`Self::parse`]
+    /// 与 [`Self::parse_streaming`] 共用；进度通知点与旧实现一一对应
+    ///（Sniffed / Parsed / Processed 在此发出，Assembled 留给组装段之后）。
+    fn run_parse_chain(
+        &self,
+        path: &str,
+    ) -> Result<(&'static str, std::sync::Arc<dyn FormatPlugin>, RawDoc)> {
         let fmt = router::sniff(path)?;
         // ⓪ 嗅探完成：通知体为格式名（此时插件可能仍缺失——格式已认定）
         self.notify(ParsePhase::Sniffed, fmt);
@@ -188,11 +213,16 @@ impl DocumentEngine {
         if !warnings.is_empty() {
             raw.meta.insert("warnings".into(), warnings.join("; "));
         }
+        Ok((fmt, plugin, raw))
+    }
 
-        // ③ 组装 IR（后置钩子：插件把 frontmatter / 书籍元数据写入 extra；
-        // 必须在 finalize 统计回填之前完成）
-        let mut doc = plugin.assemble(&raw);
-        plugin.enrich_meta(&raw, &mut doc);
+    /// ③ 组装段（finalize 之前）：assemble + enrich_meta 后置钩子 +
+    /// file_type 回填 + warnings/language 搬运 extra。parse 与
+    /// parse_streaming 共用；返回的 Document 尚未回填统计（finalize 由
+    /// 调用方择机执行）。
+    fn assemble_document(fmt: &str, plugin: &dyn FormatPlugin, raw: &RawDoc) -> Document {
+        let mut doc = plugin.assemble(raw);
+        plugin.enrich_meta(raw, &mut doc);
         doc.meta.file_type = fmt.to_string();
         // 处理链告警此前只留在 RawDoc.meta 里（随 raw 丢弃），落到 doc.meta.extra 才可见
         if let Some(w) = raw.meta.get("warnings") {
@@ -202,10 +232,88 @@ impl DocumentEngine {
         if let Some(lang) = raw.meta.get("language") {
             doc.meta.extra.insert("language".to_string(), lang.clone());
         }
-        // ③ 组装完成：finalize 统计回填前发出（文档结构已就绪，仅差
-        // text_length 等统计字段；无附加标识，通知体空串）
+        doc
+    }
+
+    /// 流式解析：assemble 后逐页喂 sink（不攒 Document），返回 DocMeta
+    ///（统计按已投递页回填）。RawDoc 阶段仍全量（解析器现实），峰值内存 =
+    /// RawDoc + 单页（对比 [`Self::parse`] 的 RawDoc + Document 双驻留减半：
+    /// 处理链结束即释放 RawDoc，组装页投递后即弃）。
+    ///
+    /// # 语义
+    /// - 投递序 = 页序；sink 返回 false 即中止：余页不产不投，DocMeta 仍
+    ///   返回（统计 = 已投递页集合——被拒页已送达 sink，计为已投递），
+    ///   warnings 附"流式消费中止于第 N 页"。进度钩子照常通知（四阶段边界
+    ///   与 [`Self::parse`] 完全一致）。
+    /// - 统计回填复用 [`Document::finalize`]：构造只含已投递页的临时
+    ///   Document 再 finalize。已投递页在引擎侧只留"统计幽灵"（finalize
+    ///   实际读取的 text / images.len / ocr_text），块结构与图像字节随投递
+    ///   释放，不在引擎侧长期驻留。
+    /// - 消费即释放——调用方不应长期持有 Page。
+    /// - pdf 千页扫描件（keep_raster_pages 全量驻留爆内存）的最坏场景请
+    ///   直接用深度流式入口 `crate::backends::pdf::parse_streaming`：绕过
+    ///   RawDoc/assemble 全量驻留，页产即吐、峰值 = 单页。本方法对 pdf
+    ///   同样正确，只是受插件解析器现实所限省不掉 RawDoc 阶段。
+    pub fn parse_streaming(&self, path: &str, sink: PageSink<'_>) -> Result<DocMeta> {
+        let (fmt, plugin, raw) = self.run_parse_chain(path)?;
+        let mut doc = Self::assemble_document(fmt, plugin.as_ref(), &raw);
+        drop(raw); // 流式：处理链已结束，RawDoc 先于页投递释放（不再双驻留）
+        // ③ 组装完成：通知点与 parse 一致（finalize 统计回填前发出）
         self.notify(ParsePhase::Assembled, "");
-        Ok(doc.finalize())
+
+        // ④ 逐页投递：mem::take 消费组装页，sink false 即中止（余页不产）。
+        // 统计幽灵先于投递构建（只克隆 finalize 读取的字段），载荷随 Page
+        // 交给消费方。
+        let pages = std::mem::take(&mut doc.pages);
+        let total = pages.len();
+        let mut ghosts: Vec<Page> = Vec::with_capacity(total);
+        let mut aborted_at: Option<usize> = None;
+        for (i, page) in pages.into_iter().enumerate() {
+            ghosts.push(ghost_page(&page));
+            if !sink(page) {
+                aborted_at = Some(i + 1);
+                break;
+            }
+        }
+
+        // ⑤ meta 统计按已投递页回填：构造只含已投递页的临时 Document 复用
+        // finalize 统计逻辑；中止标记附进 warnings（与处理链告警同 "; " 连接）
+        let mut meta_doc = Document { meta: std::mem::take(&mut doc.meta), pages: ghosts };
+        if let Some(n) = aborted_at {
+            append_warning(&mut meta_doc.meta.extra, format!("流式消费中止于第 {n} 页"));
+        }
+        Ok(meta_doc.finalize().meta)
+    }
+}
+
+/// 统计幽灵页：只保留 [`Document::finalize`] 实际读取的字段（text / images
+/// 的条数与 ocr_text）。块结构与图像字节不驻留——流式投递后载荷随 Page
+/// 交给消费方，引擎侧只留统计骨架。engine 层与 pdf 深度流式共用同一口径。
+pub(crate) fn ghost_page(page: &Page) -> Page {
+    Page {
+        text: page.text.clone(),
+        images: page
+            .images
+            .iter()
+            .map(|im| crate::model::Image {
+                ocr_text: im.ocr_text.clone(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// warnings 追加（与处理链告警的 "; " join 语义一致；无则新建条目）。
+fn append_warning(extra: &mut std::collections::BTreeMap<String, String>, msg: String) {
+    match extra.get_mut("warnings") {
+        Some(w) => {
+            w.push_str("; ");
+            w.push_str(&msg);
+        }
+        None => {
+            extra.insert("warnings".to_string(), msg);
+        }
     }
 }
 
@@ -454,5 +562,99 @@ mod tests {
             ]
         );
         assert_eq!(doc.pages[0].blocks[0].level, Some(2));
+    }
+
+    /// 流式投递：sink 收页序 = 页序、页文本与全量 parse 一致、meta 统计
+    /// 与全量一致。txt / md 件各验一遍（spec 件型）；另以 srt 字幕件
+    ///（每条 cue 一页，始终编译）真验多页投递序。
+    #[test]
+    fn streaming_sink_receives_pages_in_order() {
+        // txt：单页，文本 / 统计与全量 parse 对齐
+        let p = write_tmp("stream_a.txt", "line1\n\nline2\n");
+        let mut got: Vec<Page> = Vec::new();
+        let meta = engine()
+            .parse_streaming(&p, &mut |page: Page| {
+                got.push(page);
+                true
+            })
+            .unwrap();
+        let full = engine().parse(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "line1\n\nline2");
+        assert_eq!(got[0].blocks.len(), 2);
+        assert_eq!(meta.file_type, "txt");
+        assert_eq!(meta.page_count, full.pages.len());
+        assert_eq!(meta.text_length, full.meta.text_length);
+        assert_eq!(meta.image_count, 0);
+
+        // md：块结构照常进 IR（块级语法解析不受流式影响）
+        #[cfg(feature = "md")]
+        {
+            let mp = write_tmp("stream.md", "# 标题\n\n正文一段\n");
+            let mut mpages: Vec<Page> = Vec::new();
+            let mmeta = engine()
+                .parse_streaming(&mp, &mut |page: Page| {
+                    mpages.push(page);
+                    true
+                })
+                .unwrap();
+            std::fs::remove_file(&mp).ok();
+            assert_eq!(mmeta.file_type, "md");
+            assert_eq!(mpages.len(), 1);
+            assert_eq!(mpages[0].blocks[0].kind, crate::model::BlockKind::Heading);
+            assert_eq!(mpages[0].blocks[0].level, Some(1));
+        }
+
+        // srt 多页：投递序 = cue 序（页 name / 文本逐页对齐全量 parse）
+        let sp = write_tmp(
+            "stream.srt",
+            "1\n00:00:01,000 --> 00:00:02,000\n第一句\n\n2\n00:00:03,000 --> 00:00:04,000\n第二句\n",
+        );
+        let mut spages: Vec<Page> = Vec::new();
+        let smeta = engine()
+            .parse_streaming(&sp, &mut |page: Page| {
+                spages.push(page);
+                true
+            })
+            .unwrap();
+        let sfull = engine().parse(&sp).unwrap();
+        std::fs::remove_file(&sp).ok();
+        assert!(
+            spages.len() >= 2,
+            "srt 件应产多页（实际 {} 页），多页投递序才有断言力",
+            spages.len()
+        );
+        let got_names: Vec<_> = spages.iter().map(|pg| pg.name.clone()).collect();
+        let want_names: Vec<_> = sfull.pages.iter().map(|pg| pg.name.clone()).collect();
+        assert_eq!(got_names, want_names, "投递序 = 页序");
+        for (i, (gp, fp)) in spages.iter().zip(sfull.pages.iter()).enumerate() {
+            assert_eq!(gp.text, fp.text, "第 {} 页文本与全量不一致", i + 1);
+        }
+        assert_eq!(smeta.page_count, sfull.pages.len());
+        assert_eq!(smeta.text_length, sfull.meta.text_length);
+        assert_eq!(smeta.image_count, 0);
+        assert_eq!(smeta.file_type, "srt");
+    }
+
+    /// 流式中止：第 1 页 sink false → 恰投递 1 页、meta.page_count == 1
+    ///（被拒页已送达 sink，计为已投递）、warnings 含中止标记、统计按已
+    /// 投递页回填。
+    #[test]
+    fn streaming_cancel_stops_delivery() {
+        let p = write_tmp("stream_cancel.txt", "第一页内容\n");
+        let mut delivered = 0usize;
+        let meta = engine()
+            .parse_streaming(&p, &mut |_page: Page| {
+                delivered += 1;
+                false
+            })
+            .unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(delivered, 1, "sink false 即停，余页不投");
+        assert_eq!(meta.page_count, 1);
+        assert_eq!(meta.text_length, "第一页内容".chars().count());
+        let w = meta.extra.get("warnings").expect("应有中止告警");
+        assert!(w.contains("流式消费中止于第 1 页"), "实际告警：{w}");
     }
 }

@@ -36,6 +36,10 @@
 //  （Ok 语义，不报错）。
 // - `PdfOptions.keep_raster_pages` 扫描页渲染图保留：与 OCR 消费同一渲染
 //   图，PNG 字节进该页 RawPage.images（assemble 透传 Page.images）。
+// - `parse_streaming` pdf 深度流式入口：懒式循环逐页产 Page 直接投递 sink
+//   （RawDoc 不攒，峰值内存 = 单页，含 keep_raster_pages 的页图），统计按
+//   已投递页回填；sink false 与 on_progress false 同一截停语义。批式与
+//   流式共用同一单页生产循环体（PageProducer::produce_page）。
 //
 // # 逐页懒式管线（取消即截停算力）
 //
@@ -54,14 +58,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use pdf_inspector::extractor::{group_into_lines_preserving_all_text, ItemType};
 use pdf_inspector::{DetectionConfig, ScanStrategy};
 
 use crate::error::{DocError, ErrorCode, Result};
-use crate::model::{blocks_to_text, Block, BlockKind, BlockSource, CoordUnits, Document, Page,
-    Rect};
+use crate::model::{blocks_to_text, Block, BlockKind, BlockSource, CoordUnits, DocMeta, Document,
+    Page, Rect};
 use crate::ocr::OcrEngine;
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawImage, RawPage, RawTextItem};
 use crate::registry::Registry;
@@ -151,140 +154,303 @@ impl ParseCapability for PdfParseCapability {
 }
 
 /// 页级路由主流程（逐页懒式管线，见模块头"逐页懒式管线"节）。
+/// 全量批式：逐页生产攒 RawDoc 返回（深度流式变体见 [`parse_streaming`]）。
 fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
-    // 预检走终止码 Unsupported：文件不存在是确定性结论，不能被兜底后端掩盖
-    if !path.is_file() {
-        return Err(DocError {
-            code: ErrorCode::Unsupported,
-            message: format!("文件不存在：{}", path.display()),
-            attempts: vec![],
-        });
+    let mut producer = PageProducer::new(path, opts)?;
+    let mut pages: Vec<RawPage> = Vec::with_capacity(producer.page_count as usize);
+    for p in 1..=producer.page_count {
+        // 占位页（取消后）不回调——回调只发生在真实页产出点（与旧实现一致）
+        let already_canceled = producer.is_canceled();
+        let page = producer.produce_page(p)?;
+        pages.push(page);
+        if !already_canceled {
+            producer.report(p);
+        }
+    }
+    producer.push_abort_warning();
+    let needs_ocr = producer.needs_ocr();
+    let mut meta = std::collections::HashMap::new();
+    if let Some(w) = producer.warnings.pop() {
+        meta.insert("warnings".to_string(), w);
+    }
+    Ok(RawDoc { pages, meta, needs_ocr })
+}
+
+/// pdf 深度流式：懒式管线的逐页循环直接产 Page 投递 sink（RawDoc 不攒），
+/// 峰值内存 = 单页（含 keep_raster_pages 的页图）。与 engine 层通用流式
+/// [`crate::engine::DocumentEngine::parse_streaming`] 的差异：绕过 RawDoc /
+/// assemble 全量驻留，页产即吐——千页扫描件 + keep_raster_pages 全量驻留
+/// 爆内存的最坏场景由本入口根治。rumi 等消费者调用指引：pdf 用本深度版
+///（engine 层通用版对 pdf 同样正确，只是省不掉 RawDoc 阶段），其余格式用
+/// engine 层通用版。
+///
+/// # 语义
+/// - 逐页 produce → sink 投递 → on_progress 回调（页级回调与 sink 投递同
+///   点，页序单调）→ 取消检查。sink 返回 false 与 on_progress 返回 false
+///   同一截停语义：余页不产不投（三层截停点全部生效：懒提取 / 区间渲染 /
+///   逐页 OCR），warnings 记"用户中止于第 N 页"（与批式取消同文案，
+///   Ok 语义不报错）。
+/// - DocMeta 统计按已投递页回填（复用 [`Document::finalize`]；被拒页已送达
+///   sink，计为已投递）。统计幽灵只保留 finalize 读取的字段（text /
+///   images 条数 / ocr_text），PNG 字节随投递释放。
+/// - 预检与批式一致：文件缺失 / 扫描页缺引擎的 Err 先于任何页产出；取消
+///   后余页不出占位（流式无 Document 可对齐，直接停止投递）。
+pub fn parse_streaming(
+    path: &std::path::Path,
+    opts: &PdfOptions,
+    sink: &mut dyn FnMut(Page) -> bool,
+) -> Result<DocMeta> {
+    let mut producer = PageProducer::new(path, opts)?;
+    let mut ghosts: Vec<Page> = Vec::new();
+    for p in 1..=producer.page_count {
+        if producer.is_canceled() {
+            break; // 流式：取消后余页不产不投（占位页无消费方）
+        }
+        let raw_page = producer.produce_page(p)?;
+        // 单页组装（行块透传 / 图片搬运与批式完全一致）→ 统计幽灵 → 投递
+        let page = assemble_single(raw_page);
+        ghosts.push(crate::engine::ghost_page(&page));
+        if !sink(page) {
+            producer.cancel_at(p);
+            break;
+        }
+        // 页级进度回调（与 sink 投递同点）；false 已置取消，循环头停止
+        if !producer.report(p) {
+            break;
+        }
+    }
+    producer.push_abort_warning();
+
+    let mut meta = DocMeta { file_type: "pdf".to_string(), ..Default::default() };
+    if let Some(w) = producer.warnings.pop() {
+        meta.extra.insert("warnings".to_string(), w);
+    }
+    Ok(Document { meta, pages: ghosts }.finalize().meta)
+}
+
+/// 单页组装（PdfPlugin::assemble 的单页切片）：流式逐页 RawPage → Page，
+/// 行块透传 / OCR 语义 / 图片搬运语义与批式完全一致。
+fn assemble_single(rp: RawPage) -> Page {
+    let mut doc = PdfPlugin.assemble(&RawDoc { pages: vec![rp], ..Default::default() });
+    doc.pages.pop().expect("单页组装必出一页")
+}
+
+/// 一次区间渲染的在途产物（`pdftoppm -f F -l L` 一次出全区间，区间内逐页
+/// 消费）。
+struct PendingInterval {
+    /// 下一个待消费的页号（消费点对不上时防御性重渲染新区间；正常流程恒
+    /// 与扫描页号同步推进）。
+    next_page: u32,
+    /// 渲染产物按页序，消费完即弃（流式峰值内存的关键：区间图不跨区间驻留）。
+    images: std::vec::IntoIter<image::RgbaImage>,
+}
+
+/// 逐页生产上下文：懒式管线的可变状态（懒提取缓存 / 区间渲染产物 / 取消
+/// 标志 / 告警）。[`parse_pdf`]（全量批式）与 [`parse_streaming`]（深度
+/// 流式）共用同一循环体——单页生产在 [`PageProducer::produce_page`]，
+/// on_progress 回调点由驱动方决定（批式 = 页产出即回调；流式 = sink 投递
+/// 后回调）。
+struct PageProducer<'a> {
+    path: &'a Path,
+    opts: &'a PdfOptions,
+    page_count: u32,
+    /// 实际走渲染+OCR 的页（Off 模式恒空）。
+    raster_pages: HashSet<u32>,
+    /// 分类器判定"需要 OCR"的页（Off 告警与 needs_ocr 标记用）。
+    scan_detected: Vec<u32>,
+    /// 文字层页集合（懒提取的范围参数）。
+    text_pages: HashSet<u32>,
+    /// 懒提取缓存：首个文字层页到达才一次性全量提取并缓存（取消发生在
+    /// 提取前则整段提取算力不发生）。
+    text_cache: Option<(Vec<Vec<RawTextItem>>, Vec<pdf_inspector::TextItem>)>,
+    /// 区间渲染在途产物（扫描区间首页到达时整段渲染，区间内逐页消费）。
+    pending: Option<PendingInterval>,
+    /// 取消标志：on_progress 返回 false 或流式 sink 返回 false 即置位；
+    /// 各截停点只读。
+    canceled: bool,
+    /// 中止页（最后一条进度回调 / sink 拒绝的页号），warnings 用。
+    cancelled_at: Option<u32>,
+    /// 告警缓冲（Off 模式扫描页 / 页内分治降级 / 中止标记）。
+    warnings: Vec<String>,
+}
+
+impl<'a> PageProducer<'a> {
+    /// 预检 + 分类 + 前置告警：文件存在（Unsupported 终止码，不进解析
+    /// 循环）、页级分类、Off 模式扫描页告警入列、扫描页引擎预检。批式与
+    /// 流式共用——Err 一律先于任何页产出 / 回调（与旧实现一致）。
+    fn new(path: &'a Path, opts: &'a PdfOptions) -> Result<Self> {
+        // 预检走终止码 Unsupported：文件不存在是确定性结论，不能被兜底后端掩盖
+        if !path.is_file() {
+            return Err(DocError {
+                code: ErrorCode::Unsupported,
+                message: format!("文件不存在：{}", path.display()),
+                attempts: vec![],
+            });
+        }
+
+        let Classification { page_count, raster: raster_pages, scan_detected } =
+            classify(path, opts.mode)?;
+        let mut warnings = Vec::new();
+
+        // Off 模式：探测出的扫描页不渲染不报错，记告警（页不出块）。先于生产
+        // 循环入列（meta 只保留末条告警，取消标记最后入列优先，与旧实现一致）。
+        if opts.mode == OcrMode::Off && !scan_detected.is_empty() {
+            warnings.push(format!(
+                "扫描页未 OCR（mode=Off）：第 {} 页",
+                scan_detected
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+        }
+
+        // 扫描页需 OCR 引擎：预检保持 Err 先于任何页产出/回调（与旧实现一致）
+        if !raster_pages.is_empty() {
+            opts.engine.as_ref().ok_or_else(|| DocError {
+                code: ErrorCode::Unsupported,
+                message: format!(
+                    "第 {} 页需 OCR 引擎：开启 ocr-oar feature 或在 PdfOptions.engine 注入 OcrEngine",
+                    raster_pages.iter().min().unwrap()
+                ),
+                attempts: vec![],
+            })?;
+        }
+
+        // 文字层页集合（Off 模式 raster 集为空 → 全部页走文字层）
+        let text_pages: HashSet<u32> =
+            (1..=page_count).filter(|p| !raster_pages.contains(p)).collect();
+        Ok(Self {
+            path,
+            opts,
+            page_count,
+            raster_pages,
+            scan_detected,
+            text_pages,
+            text_cache: None,
+            pending: None,
+            canceled: false,
+            cancelled_at: None,
+            warnings,
+        })
     }
 
-    let Classification { page_count, raster: raster_pages, scan_detected } =
-        classify(path, opts.mode)?;
-    let mut warnings = Vec::new();
-
-    // Off 模式：探测出的扫描页不渲染不报错，记告警（页不出块）。先于生产
-    // 循环入列（meta 只保留末条告警，取消标记最后入列优先，与旧实现一致）。
-    if opts.mode == OcrMode::Off && !scan_detected.is_empty() {
-        warnings.push(format!(
-            "扫描页未 OCR（mode=Off）：第 {} 页",
-            scan_detected
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join("、")
-        ));
+    fn is_canceled(&self) -> bool {
+        self.canceled
     }
 
-    // 扫描页需 OCR 引擎：预检保持 Err 先于任何页产出/回调（与旧实现一致）
-    if !raster_pages.is_empty() {
-        opts.engine.as_ref().ok_or_else(|| DocError {
-            code: ErrorCode::Unsupported,
-            message: format!(
-                "第 {} 页需 OCR 引擎：开启 ocr-oar feature 或在 PdfOptions.engine 注入 OcrEngine",
-                raster_pages.iter().min().unwrap()
-            ),
-            attempts: vec![],
-        })?;
-    }
-
-    // 取消标志：on_progress 返回 false 即置位；生产循环各截停点只读。
-    // report 是全部进度回调的统一包装：页序单调，false 置标志后不再回调，
-    // 触发回调的当前页已产出、保留。
-    let canceled = AtomicBool::new(false);
-    let report = |done: u32, total: u32| -> bool {
-        let Some(cb) = opts.on_progress.as_ref() else { return true };
-        if cb(done, total) {
+    /// 进度回调统一包装：页序单调，false 置取消并记中止页（触发回调的
+    /// 当前页已产出）。
+    fn report(&mut self, done: u32) -> bool {
+        let Some(cb) = self.opts.on_progress.as_ref() else { return true };
+        if cb(done, self.page_count) {
             true
         } else {
-            canceled.store(true, Ordering::SeqCst);
+            self.canceled = true;
+            self.cancelled_at = Some(done);
             false
         }
-    };
+    }
 
-    // 文字层页集合（Off 模式 raster 集为空 → 全部页走文字层）。懒提取：
-    // 首个文字页到达才一次性全量提取并缓存（TextLayer 行按页分箱 + Image
-    // 占位收集）；取消发生在提取前则整段提取算力不发生。
-    let text_pages: HashSet<u32> = (1..=page_count).filter(|p| !raster_pages.contains(p)).collect();
-    let mut text_cache: Option<(Vec<Vec<RawTextItem>>, Vec<pdf_inspector::TextItem>)> = None;
+    /// 流式 sink 拒绝续投：与 on_progress false 同一截停语义（中止页 = 该页）。
+    fn cancel_at(&mut self, done: u32) {
+        self.canceled = true;
+        self.cancelled_at = Some(done);
+    }
 
-    let mut pages: Vec<RawPage> = Vec::with_capacity(page_count as usize);
-    let mut cancelled_at: Option<u32> = None;
-    let mut p = 1u32;
-    while p <= page_count {
+    /// 中止告警（生产循环结束后调用；最后入列，meta 只保留末条告警时优先）。
+    fn push_abort_warning(&mut self) {
+        if let Some(done) = self.cancelled_at {
+            self.warnings
+                .push(format!("用户中止于第 {done} 页（共 {} 页）", self.page_count));
+        }
+    }
+
+    /// 分类结论派生标记：存在"需要 OCR 却未 OCR"的页。
+    fn needs_ocr(&self) -> bool {
+        !self.raster_pages.is_empty()
+            || (self.opts.mode == OcrMode::Off && !self.scan_detected.is_empty())
+    }
+
+    /// 单页生产（原 parse_pdf 循环体单页化）。取消后余页出空占位（页号
+    /// 对齐）；扫描页到达时若无在途区间产物则发起区间渲染（一次 pdftoppm），
+    /// 区间内逐页消费渲染产物进 OCR。不回调 on_progress——回调点由驱动方
+    /// 决定（批式：产出即回调；流式：sink 投递后回调）。
+    fn produce_page(&mut self, p: u32) -> Result<RawPage> {
         // 截停点（页级）：取消后余页全部空占位——不再回调、不再提取、
         // 不再发起区间渲染（占位保持页号对齐）
-        if canceled.load(Ordering::SeqCst) {
-            pages.push(RawPage { name: Some(p.to_string()), ..Default::default() });
-            p += 1;
-            continue;
+        if self.canceled {
+            return Ok(RawPage { name: Some(p.to_string()), ..Default::default() });
         }
+        let path = self.path;
+        let opts: &PdfOptions = self.opts;
 
-        if raster_pages.contains(&p) {
+        if self.raster_pages.contains(&p) {
             // 扫描页：连续区间合并渲染（一次 pdftoppm -f/-l，性能位，无取消
-            // 损耗）。取消只能经由页产出后的回调置位，循环头未取消才进入本
-            // 分支——"区间渲染前查取消"由此覆盖：取消页起的区间整段不发起
-            // 渲染。
+            // 损耗）。取消只能经由驱动方回调 / sink 置位，本函数入口未取消
+            // 才进入本分支——"区间渲染前查取消"由此覆盖：取消页起的区间
+            // 整段不发起渲染。
+            if self.pending.as_ref().map_or(true, |pi| pi.next_page != p) {
+                let mut last = p;
+                while last < self.page_count && self.raster_pages.contains(&(last + 1)) {
+                    last += 1;
+                }
+                let images = render_pages(path, p, last, opts.dpi)?;
+                self.pending = Some(PendingInterval { next_page: p, images: images.into_iter() });
+            }
+            // 截停点（逐页 OCR）：OCR 是算力大头，取消后余页不再进引擎，
+            // keep_raster_pages 的 PNG 编码随之跳过（余页占位由驱动方逐页
+            // 补出——批式；流式直接停止投递）
             let engine = opts.engine.as_ref().expect("扫描页引擎已预检");
-            let mut last = p;
-            while last < page_count && raster_pages.contains(&(last + 1)) {
-                last += 1;
-            }
-            let images = render_pages(path, p, last, opts.dpi)?;
-            for (i, img) in images.into_iter().enumerate() {
-                let page_no = p + i as u32;
-                // 截停点（逐页 OCR）：OCR 是算力大头，取消后余页不再进引擎，
-                // keep_raster_pages 的 PNG 编码随之跳过；余页占位由外层循环
-                // 头逐页补出
-                if canceled.load(Ordering::SeqCst) {
-                    break;
-                }
-                let lines = engine
-                    .recognize(&img)
-                    .map_err(|e| DocError { code: ErrorCode::Unknown, message: e, attempts: vec![] })?;
-                let items = lines.into_iter().map(|l| {
-                    let bbox = l.axis_rect();
-                    RawTextItem {
-                        text: l.text,
-                        bbox: Some(bbox),
-                        quad: Some(l.quad),
-                        source: BlockSource::Ocr,
-                        confidence: Some(l.score),
-                        ..Default::default()
-                    }
-                }).collect();
-                // keep_raster_pages：与 OCR 消费同一渲染图，编码 PNG 挂页
-                let page_image = if opts.keep_raster_pages {
-                    Some(encode_page_png(&img)?)
-                } else {
-                    None
+            let (img, interval_done) = {
+                let pi = self.pending.as_mut().expect("区间渲染产物在途");
+                let Some(img) = pi.images.next() else {
+                    return Err(DocError {
+                        code: ErrorCode::Corrupt,
+                        message: format!("区间渲染产物与页数不齐（第 {p} 页）"),
+                        attempts: vec![],
+                    });
                 };
-                pages.push(RawPage {
-                    name: Some(page_no.to_string()),
-                    items,
-                    images: page_image.into_iter().collect(),
-                    coord_units: Some(CoordUnits::Px { dpi: opts.dpi as f32 }),
+                pi.next_page += 1;
+                (img, pi.images.as_slice().is_empty())
+            };
+            if interval_done {
+                self.pending = None; // 区间产物消费完即弃（不跨区间驻留）
+            }
+            let lines = engine
+                .recognize(&img)
+                .map_err(|e| DocError { code: ErrorCode::Unknown, message: e, attempts: vec![] })?;
+            let items = lines.into_iter().map(|l| {
+                let bbox = l.axis_rect();
+                RawTextItem {
+                    text: l.text,
+                    bbox: Some(bbox),
+                    quad: Some(l.quad),
+                    source: BlockSource::Ocr,
+                    confidence: Some(l.score),
                     ..Default::default()
-                });
-                if !report(page_no, page_count) {
-                    cancelled_at = Some(page_no);
                 }
-            }
-            if canceled.load(Ordering::SeqCst) {
-                p += 1; // 区间余页连同后续所有页交循环头逐页出占位
+            }).collect();
+            // keep_raster_pages：与 OCR 消费同一渲染图，编码 PNG 挂页
+            let page_image = if opts.keep_raster_pages {
+                Some(encode_page_png(&img)?)
             } else {
-                p = last + 1;
-            }
-            continue;
+                None
+            };
+            return Ok(RawPage {
+                name: Some(p.to_string()),
+                items,
+                images: page_image.into_iter().collect(),
+                coord_units: Some(CoordUnits::Px { dpi: opts.dpi as f32 }),
+                ..Default::default()
+            });
         }
 
-        // ---- 文字层页：懒提取 → 页内分治 → 组装 → 回调 ----
-        if text_cache.is_none() {
-            text_cache = Some(extract_text_layer(path, &text_pages, page_count)?);
+        // ---- 文字层页：懒提取 → 页内分治 → 组装 ----
+        if self.text_cache.is_none() {
+            self.text_cache = Some(extract_text_layer(path, &self.text_pages, self.page_count)?);
         }
-        let (lines_by_page, img_items) = text_cache.as_mut().unwrap();
+        let (lines_by_page, img_items) = self.text_cache.as_mut().unwrap();
         let idx = p as usize - 1;
         let mut items = std::mem::take(&mut lines_by_page[idx]);
         let mut dims: Option<(f32, f32)> = None;
@@ -299,7 +465,7 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
                 // 无引擎降级：分治判定为真也不报错（任务书 §6）
                 None => {
                     if needs_intra_page_split(&items, &page_imgs) {
-                        warnings.push(format!("页 {p} 检测到未覆盖大图区，未 OCR（无引擎）"));
+                        self.warnings.push(format!("页 {p} 检测到未覆盖大图区，未 OCR（无引擎）"));
                     }
                 }
                 Some(engine) => {
@@ -320,7 +486,7 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
                                     Rect { x0: t.x, y0: t.y, x1: t.x + t.width, y1: t.y + t.height };
                                 match crop_and_ocr_region(&page_img, rect, opts.dpi, h_pt, engine.as_ref()) {
                                     Ok(mut its) => ocr_items.append(&mut its),
-                                    Err(e) => warnings.push(format!("页 {p} 大图区 OCR 失败：{e}")),
+                                    Err(e) => self.warnings.push(format!("页 {p} 大图区 OCR 失败：{e}")),
                                 }
                             }
                             items = merge_by_reading_order(items, ocr_items);
@@ -330,7 +496,7 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
                 }
             }
         }
-        pages.push(RawPage {
+        Ok(RawPage {
             name: Some(p.to_string()),
             items,
             coord_units: Some(CoordUnits::Pt),
@@ -338,22 +504,8 @@ fn parse_pdf(path: &Path, opts: &PdfOptions) -> Result<RawDoc> {
             width: dims.map(|d| d.0),
             height: dims.map(|d| d.1),
             ..Default::default()
-        });
-        if !report(p, page_count) {
-            cancelled_at = Some(p);
-        }
-        p += 1;
+        })
     }
-    if let Some(done) = cancelled_at {
-        warnings.push(format!("用户中止于第 {done} 页（共 {page_count} 页）"));
-    }
-
-    let needs_ocr = !raster_pages.is_empty() || (opts.mode == OcrMode::Off && !scan_detected.is_empty());
-    let mut meta = std::collections::HashMap::new();
-    if let Some(w) = warnings.pop() {
-        meta.insert("warnings".to_string(), w);
-    }
-    Ok(RawDoc { pages, meta, needs_ocr })
 }
 
 /// 文字层懒提取：一次性提取全部文字页（pdf-inspector 批量 API，一次调用
@@ -1837,6 +1989,180 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
             assert!(it.confidence.unwrap_or(0.0) > 0.0, "OCR 行应带正置信度");
         }
         println!("页 2 OCR 行数：{}", raw.pages[1].items.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 等价性金测（核心）：混合件（页 1 文字层 + 页 2 扫描页，Mock 引擎）
+    /// 分别走批式 parse_pdf→assemble→finalize 与深度流式 parse_streaming
+    ///（收集），断言逐页相等（PartialEq 全字段）与 meta 统计一致——
+    /// produce_page 抽取 + 流式入口是行为等价重构。
+    #[test]
+    fn pdf_streaming_equals_batch() {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let shim = match prepare_renderer() {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("skip：{msg}");
+                return;
+            }
+        };
+        let dir = probe_dir("stream-eq");
+        let pdf = dir.join("mixed.pdf");
+        if sample::generate_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let opts = PdfOptions {
+            engine: Some(std::sync::Arc::new(MockRegionEngine)),
+            ..Default::default()
+        };
+        // shim 目录前插 PATH（PATH_LOCK 保证与 PATH 操纵用例互斥），两轮解析
+        //（批式/流式）跑完统一还原
+        let old = std::env::var_os("PATH");
+        if let Some(d) = &shim {
+            let new = match old.as_ref() {
+                Some(p) => format!("{}:{}", d.display(), p.to_string_lossy()),
+                None => d.display().to_string(),
+            };
+            std::env::set_var("PATH", new);
+        }
+        let batch = parse_pdf(&pdf, &opts);
+        let mut collected: Vec<Page> = Vec::new();
+        let stream = parse_streaming(&pdf, &opts, &mut |page: Page| {
+            collected.push(page);
+            true
+        });
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        // engine 组装段会回填 file_type（流式入口自述 "pdf"，同一语义位），
+        // 批式基线补齐同值再比
+        let mut batch_doc = PdfPlugin.assemble(&batch.expect("批式解析失败")).finalize();
+        batch_doc.meta.file_type = "pdf".to_string();
+        let stream_meta = stream.expect("流式解析失败");
+
+        // 逐页相等（Debug/PartialEq 全字段：blocks/text/images/coord_units/name）
+        assert_eq!(
+            collected.len(),
+            batch_doc.pages.len(),
+            "投递页数 = 批式页数"
+        );
+        for (i, (sp, bp)) in collected.iter().zip(batch_doc.pages.iter()).enumerate() {
+            assert_eq!(sp, bp, "第 {} 页流式与批式不相等", i + 1);
+        }
+        // meta 统计一致（file_type/page_count/text_length/image_count/extra）
+        assert_eq!(stream_meta, batch_doc.meta, "meta 统计一致");
+        // 抽查路由语义（等价性不掩盖页级路由正确性）：页 1 文字层 Pt、
+        // 页 2 扫描页 OCR Px 且有 Mock 识别块
+        assert_eq!(collected[0].coord_units, Some(CoordUnits::Pt));
+        assert_eq!(
+            collected[1].coord_units,
+            Some(CoordUnits::Px { dpi: DEFAULT_DPI as f32 })
+        );
+        assert!(
+            collected[1].blocks.iter().all(|b| b.source == BlockSource::Ocr),
+            "页 2 全部为 OCR 块"
+        );
+        assert!(!collected[1].blocks.is_empty(), "Mock 引擎扫描页应有识别块");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 深度流式的单页内存语义（不真测内存）：keep_raster_pages 流式收页，
+    /// 扫描页 data 完整（PNG 头 + 与批式逐字节一致——同一渲染图编码）且
+    /// meta.image_count 正确（= 已投递页图数）。
+    #[test]
+    fn pdf_streaming_keeps_single_page_memory_semantics() {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let shim = match prepare_renderer() {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("skip：{msg}");
+                return;
+            }
+        };
+        let dir = probe_dir("stream-raster");
+        let pdf = dir.join("mixed.pdf");
+        if sample::generate_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let opts = PdfOptions {
+            engine: Some(std::sync::Arc::new(MockRegionEngine)),
+            keep_raster_pages: true,
+            ..Default::default()
+        };
+        let old = std::env::var_os("PATH");
+        if let Some(d) = &shim {
+            let new = match old.as_ref() {
+                Some(p) => format!("{}:{}", d.display(), p.to_string_lossy()),
+                None => d.display().to_string(),
+            };
+            std::env::set_var("PATH", new);
+        }
+        let batch = parse_pdf(&pdf, &opts);
+        let mut collected: Vec<Page> = Vec::new();
+        let stream = parse_streaming(&pdf, &opts, &mut |page: Page| {
+            collected.push(page);
+            true
+        });
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        // engine 组装段会回填 file_type（流式入口自述 "pdf"），基线补齐同值
+        let mut batch_doc = PdfPlugin.assemble(&batch.expect("批式解析失败")).finalize();
+        batch_doc.meta.file_type = "pdf".to_string();
+        let meta = stream.expect("流式解析失败");
+
+        assert_eq!(collected.len(), 2);
+        assert!(collected[0].images.is_empty(), "文字层页不产渲染页图");
+        assert_eq!(collected[1].images.len(), 1, "扫描页恰一张渲染页图");
+        let data = &collected[1].images[0].data;
+        assert!(!data.is_empty(), "渲染页字节非空");
+        assert!(
+            data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            "应为 PNG 头"
+        );
+        assert_eq!(
+            data,
+            &batch_doc.pages[1].images[0].data,
+            "流式与批式的渲染页字节一致（同一渲染图 PNG 编码，data 完整）"
+        );
+        assert_eq!(meta.image_count, 1, "image_count = 已投递页图数");
+        assert_eq!(meta, batch_doc.meta, "keep_raster 件 meta 仍逐项一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 深度流式 sink 取消：页 1（文字层）投递后 false → Ok 返回（不报错）、
+    /// page_count == 1（被拒页计为已投递）、页 2 扫描页整段不产（Mock 引擎
+    /// recognize == 0——sink 取消同样截停算力：区间渲染与 OCR 不发生）、
+    /// warnings 记"用户中止于第 1 页"。无渲染依赖（页 2 不渲染）。
+    #[test]
+    fn pdf_streaming_sink_cancel_stops_compute() {
+        let dir = probe_dir("stream-cancel");
+        let pdf = dir.join("mixed.pdf");
+        if sample::generate_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let engine = std::sync::Arc::new(CountingEngine::new());
+        let opts = PdfOptions {
+            mode: OcrMode::Auto,
+            engine: Some(engine.clone()),
+            ..Default::default()
+        };
+        let mut delivered = 0usize;
+        let meta = parse_streaming(&pdf, &opts, &mut |_page: Page| {
+            delivered += 1;
+            false
+        })
+        .expect("取消是 Ok 语义，不应报错");
+        assert_eq!(delivered, 1, "sink false 即停，余页不投");
+        assert_eq!(meta.page_count, 1);
+        assert_eq!(engine.count(), 0, "核心断言：sink 取消截停扫描页渲染与 OCR");
+        let w = meta.extra.get("warnings").expect("应有中止告警");
+        assert!(w.contains("用户中止于第 1 页"), "实际告警：{w}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
