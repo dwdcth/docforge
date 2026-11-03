@@ -129,7 +129,7 @@ const DOCX_TAIL: &str = "</w:body></w:document>";
 /// 提供结构信号（与真实文档一致，走 semantic 组装出块）
 #[cfg(feature = "docx")]
 fn docx_unit(i: usize) -> String {
-    if i % 16 == 0 {
+    if i.is_multiple_of(16) {
         format!(
             "<w:p><w:pPr><w:pStyle w:val=\"Heading2\"/></w:pPr>\
              <w:r><w:t>第 {i} 小节标题：合成基准数据</w:t></w:r></w:p>"
@@ -529,7 +529,7 @@ fn fmt_int(n: u64) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, &c) in b.iter().enumerate() {
-        if i > 0 && (b.len() - i) % 3 == 0 {
+        if i > 0 && (b.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c as char);
@@ -545,8 +545,8 @@ fn print_table(rows: &[Row], single_mode: bool, hwm_kb: Option<u64>) {
     );
     println!();
     println!(
-        "{:<12} {:>14} {:>12} {:>12}  {}",
-        "case", "字节", "中位耗时", "吞吐", "VmHWM"
+        "{:<12} {:>14} {:>12} {:>12}  VmHWM",
+        "case", "字节", "中位耗时", "吞吐"
     );
     println!(
         "{} {} {} {}  {}",

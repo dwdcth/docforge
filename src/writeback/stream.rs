@@ -74,7 +74,7 @@
 //!
 //! # 覆盖格式与门控
 //!
-//! [`WritebackFormat`] 七种：Txt 恒开（零依赖）；Docx/Epub/Html/Fb2/Odt
+//! [`WritebackFormat`] 八种：Txt 恒开（零依赖）；Docx/Epub/Html/Fb2/Odt/Xlsx
 //! 各随同名 feature（finish 分发到对应 `writeback_*`，见 writeback 模块
 //! 级文档）；Markdown 恒在但解析侧随 feature `md`（默认开，回写 =
 //! 重解析 + [`crate::emit::to_bilingual_markdown_with`] 纯文本重组写文件）。
@@ -94,6 +94,8 @@ use super::writeback_html;
 #[cfg(feature = "odt")]
 use super::writeback_odt;
 use super::writeback_txt;
+#[cfg(feature = "xlsx")]
+use super::writeback_xlsx;
 #[cfg(feature = "md")]
 use crate::plugin::{FormatPlugin as _, ParseCapability as _};
 #[cfg(feature = "md")]
@@ -124,6 +126,8 @@ pub enum WritebackFormat {
     Fb2,
     /// ODT（feature `odt`）。
     Odt,
+    /// XLSX（feature `xlsx`；格单元回写 + 附录「译文」sheet，见 `writeback::xlsx`）。
+    Xlsx,
     /// TXT（恒开，零依赖）。
     Txt,
     /// Markdown（恒在；重解析随 feature `md`，默认开）。
@@ -180,6 +184,10 @@ impl WritebackSession {
             WritebackFormat::Odt => {}
             #[cfg(not(feature = "odt"))]
             WritebackFormat::Odt => return Err(unsupported("odt")),
+            #[cfg(feature = "xlsx")]
+            WritebackFormat::Xlsx => {}
+            #[cfg(not(feature = "xlsx"))]
+            WritebackFormat::Xlsx => return Err(unsupported("xlsx")),
             WritebackFormat::Txt => {}
             #[cfg(feature = "md")]
             WritebackFormat::Markdown => {}
@@ -291,6 +299,12 @@ impl WritebackSession {
             }
             #[cfg(not(feature = "odt"))]
             WritebackFormat::Odt => Err(unsupported("odt")),
+            #[cfg(feature = "xlsx")]
+            WritebackFormat::Xlsx => {
+                writeback_xlsx(&self.in_path, &pairs, self.strategy, &self.out_path)
+            }
+            #[cfg(not(feature = "xlsx"))]
+            WritebackFormat::Xlsx => Err(unsupported("xlsx")),
         }
     }
 
@@ -838,6 +852,121 @@ mod tests {
         assert!(contents.contains(&"EN: 正文一段。"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// xlsx（cfg xlsx）：push → finish 与直接调 `writeback_xlsx` 等价（同一份
+    /// (id, 译文) 全集 → 重解析输出逐块一致），译文落进格单元。
+    #[test]
+    #[cfg(feature = "xlsx")]
+    fn xlsx_stream_matches_direct_writeback() {
+        use crate::backends::office::xlsx::XlsxRawBackend;
+        use crate::backends::office::OfficePlugin;
+        use crate::plugin::{FormatPlugin as _, ParseCapability as _};
+        use std::io::Write as _;
+
+        let dir = case_dir("xlsx");
+        let in_path = dir.join("in.xlsx");
+        let workbook = concat!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" "#,
+            r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+            r#"<sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        );
+        let rels = concat!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+            r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>"#,
+            r#"</Relationships>"#
+        );
+        let sheet1 = concat!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+            r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>甲</t></is></c>"#,
+            r#"<c r="B1" t="inlineStr"><is><t>乙</t></is></c></row></sheetData></worksheet>"#
+        );
+        let f = std::fs::File::create(&in_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, body) in [
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/worksheets/sheet1.xml", sheet1),
+        ] {
+            zw.start_file(name, opts).unwrap();
+            zw.write_all(body.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+
+        // 提取侧同管线（XlsxRawBackend + OfficePlugin）组单元：格阈值恒 1
+        let raw = XlsxRawBackend::default().parse(&in_path).unwrap();
+        let doc = OfficePlugin::default().assemble(&raw);
+        let units = to_translation_units(&doc);
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            ["pS1-b0-r0c0", "pS1-b0-r0c1"]
+        );
+
+        // 流式路径：全单元逐条 push（含一条未匹配 id 的噪声）→ finish
+        let out_stream = dir.join("out-stream.xlsx");
+        let mut session = WritebackSession::new(
+            WritebackFormat::Xlsx,
+            &in_path,
+            &out_stream,
+            BiStrategy::TranslationOnly,
+        )
+        .unwrap();
+        for u in &units {
+            session.push(&u.id, &format!("[{}]", u.text)).unwrap();
+        }
+        session.push("pX-b99", "bogus").unwrap();
+        session.finish().unwrap();
+
+        // 直接路径：同一份 (id, 译文) 全集 → 两者重解析逐块一致
+        let out_direct = dir.join("out-direct.xlsx");
+        let direct: Vec<(String, String)> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .chain([("pX-b99".to_string(), "bogus".to_string())])
+            .collect();
+        writeback_xlsx(&in_path, &direct, BiStrategy::TranslationOnly, &out_direct).unwrap();
+
+        let stream_doc = {
+            let raw = XlsxRawBackend::default().parse(&out_stream).unwrap();
+            OfficePlugin::default().assemble(&raw)
+        };
+        let direct_doc = {
+            let raw = XlsxRawBackend::default().parse(&out_direct).unwrap();
+            OfficePlugin::default().assemble(&raw)
+        };
+        assert_eq!(
+            stream_doc.pages, direct_doc.pages,
+            "流式分发与全量 API 输出等价"
+        );
+        let rows = stream_doc.pages[0].blocks[0]
+            .table
+            .as_ref()
+            .unwrap()
+            .rows
+            .clone();
+        assert_eq!(
+            rows,
+            vec![vec!["[甲]".to_string(), "[乙]".to_string()]],
+            "译文落进格单元"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// feature 关闭时 `new(Xlsx, …)` 当场报 Unsupported（可行性前置检查）。
+    #[test]
+    #[cfg(not(feature = "xlsx"))]
+    fn unsupported_when_xlsx_feature_off() {
+        let err = WritebackSession::new(
+            WritebackFormat::Xlsx,
+            "in.xlsx",
+            "out.xlsx",
+            BiStrategy::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::error::ErrorCode::Unsupported);
+        assert!(err.message.contains("xlsx"), "报错指路 feature：{}", err.message);
     }
 
     /// spill 清理：构造 + push 几条 + drop（不 finish）→ temp 目录

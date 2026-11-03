@@ -33,6 +33,26 @@
 //!   非 UTF-8 的 spine 条目（罕见，如 GBK 声明件）不做改写（避免改写后
 //!   字节与编码声明失配），其余条目照常透传。
 //! * 未匹配 id / 空白译文一律忽略。
+//!
+//! # 部件级交替（[`writeback_epub_alternating`]，rumi「一页原文一页译文」）
+//!
+//! EPUB 的 spine 部件天然是章/页边界——每个**有命中译文**的 spine 部件后
+//! 插入「该部件的纯译文部件」，阅读器里即 真·逐部件交替（三策略里的
+//! OriginalPlusAppendix 对这个体验只是退化形态）。与 [`writeback_epub`]
+//! 共用同一套解析/重块化/provenance/编辑管线（[`plan_epub_edits`]，策略
+//! 固定 TranslationOnly），差异只在收尾：
+//!
+//! * 译文部件内容 = 该部件全部命中单元的 TranslationOnly 渲染；部件是完整
+//!   合法 XHTML（head/样式/结构块原样），未命中单元原样保留——不是只译文
+//!   的碎片页；
+//! * 命名 `{原部件名去扩展}.tr.xhtml`，与原部件**同目录**——原部件 head
+//!   里 `<link>` 的相对 href 天然不变（无相对路径重算这一坑）；
+//! * OPF：manifest 追加 `<item id="{原id}-tr" …/>`（撞名则 -tr2、-tr3…），
+//!   spine 在原 `<itemref>` 后插 `<itemref idref="{原id}-tr"/>`；原部件
+//!   字节不动（只有 OPF 替换与新增译文部件两处编辑）；
+//! * 无任何命中单元（无实际编辑）的部件不插译文部件——避免逐页「相同页
+//!   翻两遍」；OPF 非 UTF-8 整体拒绝（译文部件的挂载骨架不可缺，宁响勿哑）；
+//! * v1 不动 nav.xhtml / toc.ncx：目录保持原文结构不膨胀，线性翻页为主。
 
 use std::path::Path;
 
@@ -59,7 +79,113 @@ pub fn writeback_epub(
 ) -> Result<()> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
+    let mut plan = plan_epub_edits(in_path, translated, strategy)?;
 
+    // F. 改写并重打包（非 UTF-8 条目不改写，防编码声明失配）
+    let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
+    for (i, part) in plan.parts.iter_mut().enumerate() {
+        if plan.edits[i].is_empty() {
+            continue;
+        }
+        if std::str::from_utf8(&part.bytes).is_err() {
+            continue;
+        }
+        part.xhtml = apply_edits(&part.xhtml, std::mem::take(&mut plan.edits[i]));
+        replaced.push((part.name.clone(), part.xhtml.clone().into_bytes()));
+    }
+    rewrite_zip(in_path, out, &replaced)
+}
+
+/// EPUB 部件级交替：spine 每个有命中译文的部件后插入「该部件的纯译文部件」
+/// ——阅读器里即 真·一页原文一页译文（部件=章/页边界）。`translated` 的
+/// id 与 [`crate::emit::to_translation_units`] 同口径；无任何命中单元（无
+/// 实际编辑）的部件不插译文部件（避免逐页「相同页翻两遍」）。OPF 非
+/// UTF-8 返回 `corrupt`（译文部件的挂载骨架不可缺，见模块级文档）；其余
+/// 失败同样返回 `corrupt`。
+pub fn writeback_epub_alternating(
+    in_path: impl AsRef<Path>,
+    translated: &[(String, String)],
+    out: impl AsRef<Path>,
+) -> Result<()> {
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
+
+    // A–E 共用管线；策略固定 TranslationOnly——译文部件 = 该部件全部命中
+    // 单元的纯译文渲染（未命中单元原样，部件仍是完整合法 XHTML）。
+    let mut plan = plan_epub_edits(in_path, translated, BiStrategy::TranslationOnly)?;
+
+    // OPF 通道：包内路径 + 文本（非 UTF-8 整体拒绝，见函数头）。
+    let (opf_name, opf_xml) = opf_channel(in_path)?;
+    // 全 manifest id 的查重集合（撞名防御不限于 spine 部件之间）。
+    let (items, _) = parse_opf_spine(&opf_xml)?;
+    let mut used_ids: std::collections::HashSet<String> =
+        items.into_iter().map(|(id, _)| id).collect();
+    // OPF 插入点：`</manifest>` 前（新 item 统一挂这里）+ 各原部件
+    // itemref 之后（译文 itemref 原位插入，翻页序即 原/译交替）。
+    let points = opf_insert_points(&opf_xml, &plan.parts)?;
+
+    let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut added: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut opf_edits: Vec<Edit> = Vec::new();
+    let mut manifest_items = String::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (i, part) in plan.parts.iter_mut().enumerate() {
+        let edits = std::mem::take(&mut plan.edits[i]);
+        if edits.is_empty() {
+            continue; // 无命中单元（无实际编辑）→ 不插译文部件（防「相同页翻两遍」）
+        }
+        if std::str::from_utf8(&part.bytes).is_err() {
+            continue; // 非 UTF-8 部件不改写（与 writeback_epub 同款守卫）：不插译文页
+        }
+        let tr_name = tr_part_name(&part.name);
+        // 同一部件在 spine 重复出现（EPUB3 违规形态）：只挂一次译文部件
+        if !seen_names.insert(tr_name.clone()) {
+            continue;
+        }
+        let tr_id = tr_manifest_id(&part.id, &mut used_ids);
+        let tr_xhtml = apply_edits(&part.xhtml, edits);
+        added.push((tr_name, tr_xhtml.into_bytes()));
+        manifest_items.push_str(&format!(
+            "<item id=\"{tr_id}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
+            tr_part_href(&part.href),
+        ));
+        let pos = points.itemrefs.get(&part.id).copied().ok_or_else(|| {
+            DocError::corrupt(format!("OPF spine 缺部件 {} 的 itemref", part.id))
+        })?;
+        opf_edits.push(Edit::Insert(pos, format!("<itemref idref=\"{tr_id}\"/>")));
+    }
+
+    if added.is_empty() {
+        // 全书无命中：输出 = 原包透传（OPF 也不动）
+        return rewrite_zip(in_path, out, &[]);
+    }
+    opf_edits.push(Edit::Insert(points.manifest, manifest_items));
+    replaced.push((opf_name, apply_edits(&opf_xml, opf_edits).into_bytes()));
+    rewrite_zip_added(in_path, out, &replaced, &added)
+}
+
+// ---------------------------------------------------------------------------
+// 回写共用前半（A–E）：两种回写形态的公共管线
+// ---------------------------------------------------------------------------
+
+/// [`plan_epub_edits`] 的产物：spine 部件通道 + 逐部件编辑。`writeback_epub`
+/// 拿它替换原部件字节；`writeback_epub_alternating` 拿它另立译文部件。
+struct EpubPlan {
+    /// spine 部件通道（id/href 供 alternating 派生译文部件的 OPF 条目）。
+    parts: Vec<SpinePart>,
+    /// 逐部件编辑（与 parts 同下标；空 = 该部件无命中/无编辑）。
+    edits: Vec<Vec<Edit>>,
+}
+
+/// A–E 公共管线：权威解析 → spine 部件 → 重块化 → provenance → 按策略
+/// 产逐部件编辑（含 OriginalPlusAppendix 的附录追加）。两种回写形态的
+/// 差异全部在各自收尾（替换原部件字节 vs 另立译文部件 + OPF 编辑）。
+fn plan_epub_edits(
+    in_path: &Path,
+    translated: &[(String, String)],
+    strategy: BiStrategy,
+) -> Result<EpubPlan> {
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
     let raw = EpubRawBackend::default().parse(in_path)?;
     let doc = EpubPlugin.assemble(&raw);
@@ -69,7 +195,7 @@ pub fn writeback_epub(
     let map = translation_map(translated);
 
     // B. spine 部件通道（与 EpubRawBackend::parse 的 spine 循环同款跳过规则）
-    let mut parts = spine_parts(in_path)?;
+    let parts = spine_parts(in_path)?;
     if parts.len() != raw.pages.len() {
         return Err(DocError::corrupt(
             "epub spine 对齐失败：部件通道与解析器页数不一致",
@@ -243,19 +369,48 @@ pub fn writeback_epub(
         }
     }
 
-    // F. 改写并重打包（非 UTF-8 条目不改写，防编码声明失配）
-    let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
-    for (i, part) in parts.iter_mut().enumerate() {
-        if edits[i].is_empty() {
-            continue;
-        }
-        if std::str::from_utf8(&part.bytes).is_err() {
-            continue;
-        }
-        part.xhtml = apply_edits(&part.xhtml, std::mem::take(&mut edits[i]));
-        replaced.push((part.name.clone(), part.xhtml.clone().into_bytes()));
+    Ok(EpubPlan { parts, edits })
+}
+
+// ---------------------------------------------------------------------------
+// 译文部件命名 / id 派生（alternating）
+// ---------------------------------------------------------------------------
+
+/// 译文部件包内名：`{原部件名去扩展}.tr.xhtml`（与原部件同目录——原部件
+/// head 里 `<link>` 的相对 href 天然不变，无相对路径重算）。
+fn tr_part_name(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    format!("{stem}.tr.xhtml")
+}
+
+/// 译文部件的 manifest href：原 href 换末段文件名（同目录命名 ⇒ 目录段
+/// 原样）。与 [`tr_part_name`] 自洽：`resolve(opf_dir, tr_href)` 恰等于
+/// `tr_part_name(resolve(opf_dir, href))`（resolve 逐段归一路径，末段文件
+/// 名原样拼接）。
+fn tr_part_href(href: &str) -> String {
+    let href = href.split('#').next().unwrap_or(href);
+    match href.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/{}", tr_part_name(file)),
+        None => tr_part_name(href),
     }
-    rewrite_zip(in_path, out, &replaced)
+}
+
+/// 译文 manifest id：`{原 id}-tr`；已被占用则 `-tr2`、`-tr3`…（手工件 /
+/// 重复处理的书撞名防御）。新 id 即刻入集合——同书多次派生互不撞名。
+fn tr_manifest_id(orig: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let mut n = 1usize;
+    loop {
+        let cand = if n == 1 {
+            format!("{orig}-tr")
+        } else {
+            format!("{orig}-tr{n}")
+        };
+        if !used.contains(&cand) {
+            used.insert(cand.clone());
+            return cand;
+        }
+        n += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +482,11 @@ struct SpinePart {
     bytes: Vec<u8>,
     /// 与提取侧 `decode_entry` 同口径解码出的 XHTML。
     xhtml: String,
+    /// manifest id（= spine idref；alternating 的译文 id 派生基）。
+    id: String,
+    /// manifest href（OPF 目录相对路径，未 resolve；alternating 的译文
+    /// href 派生基）。
+    href: String,
 }
 
 /// 条目解码（镜像 `backends/epub.rs::decode_entry`）：
@@ -383,15 +543,35 @@ fn read_entry_bytes(
     }
 }
 
+/// container.xml → rootfile 的 OPF 包内路径（spine_parts 与 opf_channel
+/// 共用的容器定位头）。
+fn root_opf_path(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<String> {
+    let container = read_entry_bytes(zip, "META-INF/container.xml")?
+        .map(|b| decode_entry(&b))
+        .ok_or_else(|| DocError::corrupt("EPUB 缺 META-INF/container.xml"))?;
+    crate::backends::epub::find_rootfile(&container)?
+        .ok_or_else(|| DocError::corrupt("container.xml 缺 rootfile"))
+}
+
+/// OPF 通道（alternating 专用）：包内路径 + 解码文本。OPF 非 UTF-8 → Err：
+/// OPF 是全部译文部件的挂载骨架，静默跳过会产出「有条目无挂载」的哑书，
+/// 这里宁响勿哑（EPUB OCF 规范本就要求 OPF 用 UTF-8/UTF-16）。
+fn opf_channel(path: &Path) -> Result<(String, String)> {
+    let mut zip = open_zip(path)?;
+    let opf_path = root_opf_path(&mut zip)?;
+    let bytes = read_entry_bytes(&mut zip, &opf_path)?
+        .ok_or_else(|| DocError::corrupt(format!("EPUB 缺 OPF: {opf_path}")))?;
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(DocError::corrupt(format!("EPUB OPF 非 UTF-8: {opf_path}")));
+    }
+    Ok((opf_path, decode_entry(&bytes)))
+}
+
 /// spine 阅读序的部件列表：linear="no" / manifest 缺项 / .ncx / 缺条目一律跳过
 /// （与 `EpubRawBackend::parse` 同款规则，保证与 raw.pages 一一同位）。
 fn spine_parts(path: &Path) -> Result<Vec<SpinePart>> {
     let mut zip = open_zip(path)?;
-    let container = read_entry_bytes(&mut zip, "META-INF/container.xml")?
-        .map(|b| decode_entry(&b))
-        .ok_or_else(|| DocError::corrupt("EPUB 缺 META-INF/container.xml"))?;
-    let opf_path = crate::backends::epub::find_rootfile(&container)?
-        .ok_or_else(|| DocError::corrupt("container.xml 缺 rootfile"))?;
+    let opf_path = root_opf_path(&mut zip)?;
     let opf_xml = read_entry_bytes(&mut zip, &opf_path)?
         .map(|b| decode_entry(&b))
         .ok_or_else(|| DocError::corrupt(format!("EPUB 缺 OPF: {opf_path}")))?;
@@ -417,9 +597,20 @@ fn spine_parts(path: &Path) -> Result<Vec<SpinePart>> {
             name: full,
             bytes: bytes.clone(),
             xhtml: decode_entry(&bytes),
+            id: idref,
+            href: href.clone(),
         });
     }
     Ok(parts)
+}
+
+/// 元素某属性的原始值（未反转义——回写侧把这些值原样拼回 XML，已转义
+/// 形态保持合法；quick-xml 的 `value` 即原始字节）。
+fn xml_attr(e: &quick_xml::events::BytesStart, k: &str) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == k)
+        .map(|a| a.value.to_string())
 }
 
 /// OPF 只取 manifest `(id, href)` 与 spine `(idref, linear)`（导航/封面与回写无关）。
@@ -434,21 +625,15 @@ fn parse_opf_spine(xml: &str) -> Result<(Vec<(String, String)>, Vec<(String, boo
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.local_name().as_ref().to_string();
-                let attr = |k: &str| {
-                    e.attributes()
-                        .flatten()
-                        .find(|a| a.key.local_name().as_ref() == k)
-                        .map(|a| a.value.to_string())
-                };
                 match name.as_str() {
                     "item" => {
-                        if let (Some(id), Some(href)) = (attr("id"), attr("href")) {
+                        if let (Some(id), Some(href)) = (xml_attr(e, "id"), xml_attr(e, "href")) {
                             items.push((id, href));
                         }
                     }
                     "itemref" => {
-                        if let Some(idref) = attr("idref") {
-                            let linear = attr("linear").map(|v| v != "no").unwrap_or(true);
+                        if let Some(idref) = xml_attr(e, "idref") {
+                            let linear = xml_attr(e, "linear").map(|v| v != "no").unwrap_or(true);
                             spine.push((idref, linear));
                         }
                     }
@@ -462,6 +647,147 @@ fn parse_opf_spine(xml: &str) -> Result<(Vec<(String, String)>, Vec<(String, boo
         buf.clear();
     }
     Ok((items, spine))
+}
+
+/// OPF 插入点扫描：`</manifest>` 之前（新 `<item>` 的统一插入位）+ 各
+/// spine 部件 `<itemref>` 元素之后（译文 itemref 的原位插入位）。
+struct OpfInsertPoints {
+    /// `</manifest>` 的 `<` 偏移（manifest 条目统一插这里）。
+    manifest: usize,
+    /// 部件 id → 其 itemref 元素终点（闭标签 `>` 之后）。
+    itemrefs: std::collections::HashMap<String, usize>,
+}
+
+/// 一次 quick_xml 扫描拿全部插入位（`buffer_position` = 刚读完的事件终点，
+/// 对 `Reader::from_str` 即源串字节偏移）。itemref 覆盖自闭合与
+/// Start/End 对两种形态；manifest 取 End 事件终点回退闭标签长度——
+/// `e.name()` 是含前缀的原始名，长度精确（XML 闭标签不可能带属性）。
+fn opf_insert_points(opf_xml: &str, parts: &[SpinePart]) -> Result<OpfInsertPoints> {
+    let mut reader = Reader::from_str(opf_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let wanted: std::collections::HashSet<&str> = parts.iter().map(|p| p.id.as_str()).collect();
+    let mut itemrefs = std::collections::HashMap::new();
+    let mut manifest = None;
+    let mut pending: Option<String> = None; // Start 形态 itemref：等它的 End
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() == "itemref" {
+                    if let Some(id) =
+                        xml_attr(e, "idref").filter(|id| wanted.contains(id.as_str()))
+                    {
+                        pending = Some(id);
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                if e.local_name().as_ref() == "itemref" {
+                    if let Some(id) =
+                        xml_attr(e, "idref").filter(|id| wanted.contains(id.as_str()))
+                    {
+                        itemrefs.insert(id, reader.buffer_position() as usize);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let raw = e.name();
+                if raw.local_name().as_ref() == "itemref" {
+                    if let Some(id) = pending.take() {
+                        itemrefs.insert(id, reader.buffer_position() as usize);
+                    }
+                } else if raw.local_name().as_ref() == "manifest" {
+                    manifest =
+                        Some(reader.buffer_position() as usize - (raw.as_ref().len() + 3));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(DocError::corrupt(format!("OPF 解析失败: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(OpfInsertPoints {
+        manifest: manifest.ok_or_else(|| DocError::corrupt("OPF 缺 </manifest> 闭标签"))?,
+        itemrefs,
+    })
+}
+
+/// [`rewrite_zip`] 的带新增变体（alternating 专用）：`replaced` 换既有条目
+/// 字节、`added` 追加新条目。共用件的 replaced 机制按名匹配既有条目、天然
+/// 只换不加（包外名字静默丢弃），译文部件是新条目，故在本文件内镜像一份
+/// 加 `added` 参数——mimetype 首条目 + Stored、既有条目原序透传等约定与
+/// zip_util::rewrite_zip 一致；added 追加在末尾（EPUB 不约束条目物理序）。
+fn rewrite_zip_added(
+    in_path: &Path,
+    out_path: &Path,
+    replaced: &[(String, Vec<u8>)],
+    added: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let mut zip = open_zip(in_path)?;
+
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip
+            .by_index(i)
+            .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {i} 失败: {e}")))?;
+        if f.is_dir() {
+            continue;
+        }
+        let name = f
+            .name()
+            .map_err(|e| DocError::corrupt(format!("ZIP 条目 {i} 名字损坏: {e}")))?
+            .into_owned();
+        let mut data = Vec::with_capacity(f.size() as usize);
+        std::io::Read::read_to_end(&mut f, &mut data)
+            .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
+        entries.push((name, data));
+    }
+
+    let apply = |name: &str, data: &mut Vec<u8>| {
+        for (rn, rdata) in replaced {
+            if rn.as_str() == name {
+                *data = rdata.clone();
+            }
+        }
+    };
+
+    let out_file = std::fs::File::create(out_path).map_err(|e| {
+        DocError::corrupt(format!("cannot create {}: {e}", out_path.display()))
+    })?;
+    let mut zw = zip::ZipWriter::new(out_file);
+    let mut wrote_mimetype = false;
+    // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
+    if let Some((_, data)) = entries.iter().find(|(n, _)| n == "mimetype") {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("mimetype", opts)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+        std::io::Write::write_all(&mut zw, data)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+        wrote_mimetype = true;
+    }
+    for (name, mut data) in entries {
+        if wrote_mimetype && name == "mimetype" {
+            continue;
+        }
+        apply(&name, &mut data);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file(name.as_str(), opts)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        std::io::Write::write_all(&mut zw, &data)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+    }
+    for (name, data) in added {
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file(name.as_str(), opts)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        std::io::Write::write_all(&mut zw, data)
+            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+    }
+    zw.finish()
+        .map_err(|e| DocError::corrupt(format!("ZIP 收尾失败: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +836,19 @@ mod tests {
 <tr><td>电压</td><td>伏</td></tr>\
 <tr><td colspan=\"2\">跨列说明</td></tr></table>\
 <h2>结论节</h2><p>综上各条。</p></body></html>";
+    /// ch1/ch2 带 head 样式表的变体（alternating 的 CSS 同目录收益断言；
+    /// head 在 SKIP_TAGS，块流与单元 id 与 CH1/CH2 完全同口径）。样式表在
+    /// OEBPS/style.css，章文件在 OEBPS/text/ ⇒ 相对 href = ../style.css。
+    const CH1_CSS: &str = "<html><head><title>c1</title>\
+<link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\
+<body><h1>第一章</h1><p>正文一。</p><p>正文二。</p></body></html>";
+    const CH2_CSS: &str = "<html><head><title>c2</title>\
+<link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\
+<body><h2>甲节</h2><p>甲正文，段落测试。</p>\
+<h2>乙节</h2><ul><li>要点一。</li><li>要点二。</li></ul></body></html>";
+    /// 样式表条目（build_epub_parts_in 的 extra 注入件，配 CH*_CSS 用）。
+    const CSS_ITEM: &str = r#"<item id="css" href="style.css" media-type="text/css"/>"#;
+    const STYLE_CSS: &str = "body { font-family: serif; }";
 
     fn case_dir(case: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -524,6 +863,18 @@ mod tests {
     /// N 章 epub：manifest/spine 按 chs 动态生成（ch{i} → text/ch{i}.xhtml；
     /// 章名 nav 只给前两章，后续章页名走文档内标题口径）。
     fn build_epub_parts(dir: &Path, chs: &[&str]) -> PathBuf {
+        build_epub_parts_in(dir, chs, "", &[])
+    }
+
+    /// [`build_epub_parts`] 的带注入变体（alternating 测试用）：`extra_manifest`
+    /// 追加 manifest 条目（样式表 / id 撞名防御件），`extra_files` 追加
+    /// ZIP 条目。
+    fn build_epub_parts_in(
+        dir: &Path,
+        chs: &[&str],
+        extra_manifest: &str,
+        extra_files: &[(&str, &str)],
+    ) -> PathBuf {
         let path = dir.join("book.epub");
         let f = std::fs::File::create(&path).unwrap();
         let mut zw = zip::ZipWriter::new(f);
@@ -532,7 +883,7 @@ mod tests {
             zw.start_file(name, opts).unwrap();
             zw.write_all(body.as_bytes()).unwrap();
         };
-        let items = (1..=chs.len())
+        let mut items = (1..=chs.len())
             .map(|i| {
                 format!(
                     r#"<item id="ch{i}" href="text/ch{i}.xhtml" media-type="application/xhtml+xml"/>"#
@@ -540,6 +891,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n    ");
+        if !extra_manifest.is_empty() {
+            items.push_str("\n    ");
+            items.push_str(extra_manifest);
+        }
         let spine = (1..=chs.len())
             .map(|i| format!(r#"<itemref idref="ch{i}"/>"#))
             .collect::<Vec<_>>()
@@ -566,6 +921,9 @@ mod tests {
         for (i, ch) in chs.iter().enumerate() {
             put(&format!("OEBPS/text/ch{}.xhtml", i + 1), ch);
         }
+        for (name, body) in extra_files {
+            put(name, body);
+        }
         zw.finish().unwrap();
         path
     }
@@ -577,7 +935,7 @@ mod tests {
     /// 提取侧同管线（EpubRawBackend + EpubPlugin::assemble）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = EpubRawBackend::default()
-            .parse(&path)
+            .parse(path)
             .unwrap();
         EpubPlugin.assemble(&raw)
     }
@@ -593,6 +951,71 @@ mod tests {
         let translated: Vec<(String, String)> =
             tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         writeback_epub(in_path, &translated, strategy, out_path).unwrap();
+    }
+
+    /// alternating 便捷入口（与 write 同款）。
+    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) {
+        let translated: Vec<(String, String)> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        writeback_epub_alternating(in_path, &translated, out_path).unwrap();
+    }
+
+    /// 读 ZIP 条目为字符串（UTF-8 断言件）。
+    fn zip_entry_string(path: &Path, name: &str) -> String {
+        let mut zip = open_zip(path).unwrap();
+        let mut s = String::new();
+        zip.by_name(name).unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    /// ZIP 是否含某条目名。
+    fn zip_has_entry(path: &Path, name: &str) -> bool {
+        let mut zip = open_zip(path).unwrap();
+        (0..zip.len()).any(|i| zip.by_index(i).unwrap().name().unwrap() == name)
+    }
+
+    /// OPF spine 的 itemref idref 序（alternating 的翻页序断言）。
+    fn spine_idrefs(opf: &str) -> Vec<String> {
+        let mut reader = Reader::from_str(opf);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    if e.local_name().as_ref() == "itemref" {
+                        if let Some(id) = xml_attr(e, "idref") {
+                            out.push(id);
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        out
+    }
+
+    /// 把某条目字节整体换掉（OPF 非 UTF-8 拒绝测试的畸形书构造）。
+    fn replace_zip_entry(in_path: &Path, out_path: &Path, name: &str, data: &[u8]) {
+        let mut zin = open_zip(in_path).unwrap();
+        let f = std::fs::File::create(out_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let n = f.name().unwrap().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            zw.start_file(n.as_str(), opts).unwrap();
+            if n == name {
+                zw.write_all(data).unwrap();
+            } else {
+                zw.write_all(&buf).unwrap();
+            }
+        }
+        zw.finish().unwrap();
     }
 
     /// 金测（核心验收）：BilingualInline 往返 —— 坍缩页插在最后非空块后、
@@ -915,6 +1338,277 @@ mod tests {
         // 其余 spine 文档不动
         assert_eq!(raw_in.pages[0].items[0].text, raw_out2.pages[0].items[0].text);
         assert_eq!(raw_in.pages[1].items[0].text, raw_out2.pages[1].items[0].text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 部件级交替（writeback_epub_alternating）
+    // -------------------------------------------------------------------------
+
+    /// 交替结构金测：spine 序 = 原1/译1/原2/译2，manifest 条目齐且 href 与
+    /// 包内名 resolve 自洽，全部既有条目字节与输入完全一致（原部件不动），
+    /// mimetype 仍居首且 Stored。
+    #[test]
+    fn alternating_spine_order_and_untouched_originals() {
+        let dir = case_dir("alt-structure");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2]);
+        let out_path = dir.join("out.epub");
+
+        // 与 writeback_epub 完全同一单元流（无新锚点体系）
+        assert_eq!(
+            unit_ids(&in_path),
+            ["p第一章-b0", "p甲节-b0", "p乙节-b0", "p乙节-b1"]
+        );
+
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p第一章-b0", "Chapter 1"),
+                ("p甲节-b0", "Section A body."),
+                ("p乙节-b0", "Point one."),
+                ("p乙节-b1", "Point two."),
+            ],
+        );
+
+        // spine 序 = 原1/译1/原2/译2（itemref 原位插入）
+        let opf = zip_entry_string(&out_path, "OEBPS/content.opf");
+        assert_eq!(spine_idrefs(&opf), ["ch1", "ch1-tr", "ch2", "ch2-tr"]);
+        // manifest 条目齐：同目录 href；包内名 = resolve(opf_dir, href)
+        assert!(
+            opf.contains(
+                r#"<item id="ch1-tr" href="text/ch1.tr.xhtml" media-type="application/xhtml+xml"/>"#
+            ),
+            "{opf}"
+        );
+        assert!(opf.contains(
+            r#"<item id="ch2-tr" href="text/ch2.tr.xhtml" media-type="application/xhtml+xml"/>"#
+        ));
+        for (href, name) in [
+            ("text/ch1.tr.xhtml", "OEBPS/text/ch1.tr.xhtml"),
+            ("text/ch2.tr.xhtml", "OEBPS/text/ch2.tr.xhtml"),
+        ] {
+            assert!(zip_has_entry(&out_path, name), "{name} 存在");
+            assert_eq!(
+                crate::backends::epub::resolve("OEBPS", href),
+                name,
+                "manifest href resolve 回包内名"
+            );
+        }
+
+        // 全部既有条目字节透传——唯二例外是设计内的编辑点：OPF 替换 +
+        // 新增译文部件（原 spine 部件 / nav / container / mimetype 均不动）
+        let mut zin = open_zip(&in_path).unwrap();
+        let mut zout = open_zip(&out_path).unwrap();
+        assert_eq!(zout.len(), zin.len() + 2, "只增两个译文部件");
+        for i in 0..zin.len() {
+            let mut f = zin.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            if name == "OEBPS/content.opf" {
+                continue; // 设计内编辑：manifest/spine 插条目（上面已断言内容）
+            }
+            let mut a = Vec::new();
+            f.read_to_end(&mut a).unwrap();
+            let mut b = Vec::new();
+            zout.by_name(&name).unwrap().read_to_end(&mut b).unwrap();
+            assert_eq!(a, b, "{name} 字节透传");
+        }
+        // mimetype 仍为首条目且 Stored
+        assert_eq!(zout.by_index(0).unwrap().name().unwrap(), "mimetype");
+        assert_eq!(
+            zout.by_index(0).unwrap().compression(),
+            zip::CompressionMethod::Stored
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 译文部件内容：命中单元已替换（坍缩页首块换译、切节页逐块换译）、
+    /// 未命中单元原样、切节页表格格单元逐格替换；译文部件仍是完整合法
+    /// XHTML（结构元素保留，重解析页数翻倍）。
+    #[test]
+    fn alternating_translation_parts_content() {
+        let dir = case_dir("alt-content");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2, CH3]);
+        let out_path = dir.join("out.epub");
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p第一章-b0", "Chapter 1"),
+                ("p甲节-b0", "Section A body."),
+                ("p乙节-b0", "Point one."),
+                // p乙节-b1 不喂：未命中单元原样保留
+                ("p参数节-b0", "See the table."),
+                ("p参数节-b1-r0c0", "Name"),
+                ("p参数节-b1-r0c1", "Unit"),
+                ("p参数节-b1-r1c0", "Voltage"),
+                ("p参数节-b1-r1c1", "V"),
+                ("p参数节-b1-r2c0", "Spanning note"),
+                ("p结论节-b0", "As shown above."),
+            ],
+        );
+
+        // ch1 译文部件（坍缩页）：首块换译、其余可翻译块清空；表格是结构块
+        //（坍缩页无格单元）原样——部件仍是完整合法 XHTML
+        let tr1 = zip_entry_string(&out_path, "OEBPS/text/ch1.tr.xhtml");
+        assert!(tr1.contains("<h1>Chapter 1</h1>"), "{tr1}");
+        assert!(!tr1.contains("第一章"));
+        assert!(!tr1.contains("正文一。"), "非首块文本清空");
+        assert!(tr1.contains("<td>格甲</td>"), "表格结构块原样");
+        assert!(tr1.contains("</body>"), "完整合法 XHTML");
+
+        // ch2 译文部件（切节页）：逐块替换；未命中的 要点二。 原样
+        let tr2 = zip_entry_string(&out_path, "OEBPS/text/ch2.tr.xhtml");
+        assert!(tr2.contains("<p>Section A body.</p>"), "{tr2}");
+        assert!(tr2.contains("<li>Point one.</li>"));
+        assert!(tr2.contains("<li>要点二。</li>"), "未命中单元原样");
+
+        // ch3 译文部件（切节页 + 表格）：格单元逐格替换（colspan 行单格）
+        let tr3 = zip_entry_string(&out_path, "OEBPS/text/ch3.tr.xhtml");
+        assert!(tr3.contains("<p>See the table.</p>"), "{tr3}");
+        assert!(tr3.contains("<th>Name</th>"));
+        assert!(tr3.contains("<th>Unit</th>"));
+        assert!(tr3.contains("<td>Voltage</td>"));
+        assert!(tr3.contains("<td>V</td>"));
+        assert!(tr3.contains(r#"<td colspan="2">Spanning note</td>"#));
+        assert!(!tr3.contains("电压"), "全格已替换");
+        assert!(tr3.contains("<h2>参数节</h2>"), "切节标题不是单元，原样保留");
+
+        // 重解析：spine 部件翻倍（6 = 原3 + 译3）
+        let raw = EpubRawBackend::default().parse(&out_path).unwrap();
+        assert_eq!(raw.pages.len(), 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CSS 同目录收益：译文部件 head 的 stylesheet 相对 href 与原部件相同
+    ///（head 原样透传，无相对路径重算），且指向包内存在的条目。
+    #[test]
+    fn alternating_translation_parts_keep_stylesheet() {
+        let dir = case_dir("alt-css");
+        let in_path =
+            build_epub_parts_in(&dir, &[CH1_CSS, CH2_CSS], CSS_ITEM, &[("OEBPS/style.css", STYLE_CSS)]);
+        let out_path = dir.join("out.epub");
+        // head 在 SKIP_TAGS：单元 id 与无 head 版本完全同口径
+        assert_eq!(
+            unit_ids(&in_path),
+            ["p第一章-b0", "p甲节-b0", "p乙节-b0", "p乙节-b1"]
+        );
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p第一章-b0", "Chapter 1"),
+                ("p甲节-b0", "Section A body."),
+                ("p乙节-b0", "Point one."),
+                ("p乙节-b1", "Point two."),
+            ],
+        );
+
+        let link = r#"href="../style.css""#;
+        for name in [
+            "OEBPS/text/ch1.xhtml",
+            "OEBPS/text/ch1.tr.xhtml",
+            "OEBPS/text/ch2.xhtml",
+            "OEBPS/text/ch2.tr.xhtml",
+        ] {
+            let s = zip_entry_string(&out_path, name);
+            assert!(s.contains(link), "{name} 样式表 href 与原部件相同：{s}");
+        }
+        assert!(zip_has_entry(&out_path, "OEBPS/style.css"), "href 指向存在的条目");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无命中不插译文部件（防「相同页翻两遍」）：空译文 map → 输出 = 原包
+    /// 透传（OPF 不膨胀、条目数不变、Document 逐块一致）；部分命中 → 只有
+    /// 命中的部件插译文部件。
+    #[test]
+    fn alternating_no_hit_no_translation_parts() {
+        let dir = case_dir("alt-empty");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2]);
+        let out_path = dir.join("out.epub");
+
+        // 空译文：全书无命中
+        alternating_write(&in_path, &out_path, &[]);
+        let opf = zip_entry_string(&out_path, "OEBPS/content.opf");
+        assert!(!opf.contains("-tr"), "OPF 不膨胀：{opf}");
+        assert_eq!(spine_idrefs(&opf), ["ch1", "ch2"]);
+        let zin = open_zip(&in_path).unwrap();
+        let zout = open_zip(&out_path).unwrap();
+        assert_eq!(zout.len(), zin.len(), "无新增条目");
+        assert_eq!(parse_doc(&out_path), parse_doc(&in_path), "输出 = 原包");
+
+        // 部分命中：只有 ch1 有译文部件
+        let dir2 = case_dir("alt-partial");
+        let in2 = build_epub_parts(&dir2, &[CH1, CH2]);
+        let out2 = dir2.join("out.epub");
+        alternating_write(&in2, &out2, &[("p第一章-b0", "Chapter 1")]);
+        let opf2 = zip_entry_string(&out2, "OEBPS/content.opf");
+        assert_eq!(spine_idrefs(&opf2), ["ch1", "ch1-tr", "ch2"]);
+        assert!(opf2.contains(r#"<item id="ch1-tr" href="text/ch1.tr.xhtml""#));
+        assert!(!opf2.contains("ch2-tr"), "未命中部件不插译文部件：{opf2}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// id 撞名防御：manifest 已有 id="ch1-tr"（手工件/重复处理形态）→
+    /// 译文 id 顺延 -tr2，原条目保留、spine 顺序不受扰。
+    #[test]
+    fn alternating_manifest_id_collision_defense() {
+        let dir = case_dir("alt-idclash");
+        let in_path = build_epub_parts_in(
+            &dir,
+            &[CH1, CH2],
+            r#"<item id="ch1-tr" href="extra.xhtml" media-type="application/xhtml+xml"/>"#,
+            &[],
+        );
+        let out_path = dir.join("out.epub");
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p第一章-b0", "Chapter 1"),
+                ("p甲节-b0", "Section A body."),
+                ("p乙节-b0", "Point one."),
+                ("p乙节-b1", "Point two."),
+            ],
+        );
+        let opf = zip_entry_string(&out_path, "OEBPS/content.opf");
+        assert!(
+            opf.contains(r#"<item id="ch1-tr2" href="text/ch1.tr.xhtml""#),
+            "撞名顺延 -tr2：{opf}"
+        );
+        assert!(opf.contains(r#"<item id="ch2-tr" href="text/ch2.tr.xhtml""#));
+        assert!(
+            opf.contains(r#"<item id="ch1-tr" href="extra.xhtml""#),
+            "原 ch1-tr 条目保留"
+        );
+        assert_eq!(spine_idrefs(&opf), ["ch1", "ch1-tr2", "ch2", "ch2-tr"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OPF 非 UTF-8（UTF-16LE BOM 件）：alternating 整体拒绝——OPF 是译文
+    /// 部件的挂载骨架，宁响勿哑（writeback_epub 不动 OPF，无此约束）。
+    #[test]
+    fn alternating_rejects_non_utf8_opf() {
+        let dir = case_dir("alt-opf-enc");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2]);
+        let opf = zip_entry_string(&in_path, "OEBPS/content.opf");
+        let mut utf16: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM（解码链 BOM 段命中）
+        for u in opf.encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        let bad = dir.join("bad.epub");
+        replace_zip_entry(&in_path, &bad, "OEBPS/content.opf", &utf16);
+        let out = dir.join("out.epub");
+        let translated = vec![("p第一章-b0".to_string(), "Chapter 1".to_string())];
+        let err = writeback_epub_alternating(&bad, &translated, &out).unwrap_err();
+        assert!(err.to_string().contains("OPF 非 UTF-8"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

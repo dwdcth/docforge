@@ -627,7 +627,10 @@ pub(crate) fn truncate_budget(path: &Path, threshold: u64, size: usize) -> usize
 
 /// 表格行 → raw 项：`text` 保留展开文本（页文本层，与 Python `_item_text` 同口径：
 /// 行内 `,` 连接、行间 `\n`），`table` 携带行列结构供 `assemble` 产出 `BlockKind::Table`。
+/// 调用点只在 docx/pptx 提取路径（xlsx 用带表头版）——docx/pptx 单开时调用点归零，
+/// 允许 dead（与 stream.rs 的 `unsupported` 同款处理）。
 #[cfg(any(feature = "docx", feature = "xlsx", feature = "pptx"))]
+#[allow(dead_code)]
 pub(crate) fn table_item(rows: Vec<Vec<String>>) -> crate::plugin::RawTextItem {
     table_item_with_header(rows, 0)
 }

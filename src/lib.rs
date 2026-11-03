@@ -71,7 +71,7 @@ pub use registry::{Registry, RegistryError};
 fn default_registry() -> Registry {
     let mut registry = Registry::new();
     plugins::text::register_defaults(&mut registry);
-    #[cfg(feature = "docx")]
+    #[cfg(any(feature = "docx", feature = "pptx", feature = "xlsx"))]
     crate::backends::office::register_defaults(&mut registry);
     #[cfg(feature = "epub")]
     crate::backends::epub::register_defaults(&mut registry);

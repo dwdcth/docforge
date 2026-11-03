@@ -150,6 +150,9 @@ pub(crate) fn make_image(zip: &mut zip::ZipArchive<std::fs::File>, part: &str) -
 
 /// 图片项：`text` 为空、`image` 置位——`assemble` 据此产出 `BlockKind::Image`
 /// （对齐 Python `items.append(("image", im))`）。
+/// 调用点只在 docx/pptx 提取路径（xlsx 的图走 `Page.images`）——二者单开时
+/// 调用点归零，允许 dead（与 stream.rs 的 `unsupported` 同款处理）。
+#[allow(dead_code)]
 pub(crate) fn image_item(im: RawImage) -> RawTextItem {
     RawTextItem {
         image: Some(im),
@@ -162,11 +165,14 @@ pub(crate) fn image_item(im: RawImage) -> RawTextItem {
 ///
 /// 去重**先于**构造：同一部件不会被二次读取，且「太小的图」也占名额
 /// （对齐 Python `media_seen.add(part)` 在 `_make_image` 之前的顺序）。
+/// docx/pptx 单开时调用点归零，允许 dead。
+#[allow(dead_code)]
 pub(crate) struct ImageReader<'a> {
     zip: &'a mut zip::ZipArchive<std::fs::File>,
     seen: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl<'a> ImageReader<'a> {
     pub(crate) fn new(zip: &'a mut zip::ZipArchive<std::fs::File>) -> Self {
         Self {

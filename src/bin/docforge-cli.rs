@@ -215,7 +215,7 @@ fn build_engine(ocr: &str) -> docforge::DocumentEngine {
     let _ = ocr;
     let mut registry = docforge::Registry::new();
     docforge::plugins::text::register_defaults(&mut registry);
-    #[cfg(feature = "docx")]
+    #[cfg(any(feature = "docx", feature = "pptx", feature = "xlsx"))]
     docforge::backends::office::register_defaults(&mut registry);
     #[cfg(feature = "epub")]
     docforge::backends::epub::register_defaults(&mut registry);

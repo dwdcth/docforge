@@ -604,7 +604,7 @@ mod tests {
 
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }
-            .parse(&path)
+            .parse(path)
             .unwrap();
         HtmlPlugin.assemble(&raw)
     }
@@ -790,7 +790,7 @@ mod tests {
             &bad,
             &[("p0-b0".to_string(), "x".to_string())],
             BiStrategy::BilingualInline,
-            &dir.join("bad-out.html"),
+            dir.join("bad-out.html"),
         )
         .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");

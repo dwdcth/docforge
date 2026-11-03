@@ -27,7 +27,12 @@
 //! * 三策略的表格口径：`TranslationOnly` 格内首 `w:t` 换译文、其余清空
 //!   （多段落格的其余段一并清空——重解析格文本 = 译文，与提取侧 join 口径
 //!   一致）；`BilingualInline` 格内最后一个 `w:p` 之后追加译段（复制格内
-//!   首段 `w:pPr`；不用 `w:br` 软换行——会破 docx 表格行高语义）；
+//!   首段 `w:pPr`；译文 run 带全新最小 `w:rPr`，固定小字号 `w:sz`/`w:szCs`
+//!   = 18 半点 = 9pt——窄列长译文会把表格撑乱，小字号显著缓解；不复制原
+//!   run 的 rPr，run 级属性本就不该跨语言复制，字体由主题默认继承；固定
+//!   9pt 不解析 styles.xml 继承链（成本不成比例），对正文 10.5-12pt 是
+//!   明确的"译文辅文"层级，未来可做样式感知；不用 `w:br` 软换行——会破
+//!   docx 表格行高语义）；
 //!   `OriginalPlusAppendix` 表格不进附录（附录只收段落/标题位），格位照常
 //!   配对消费保流对齐、正文表格原样不动。
 //! * v1 简化（写入侧，文本守卫兜底）：含嵌套表的格不写（清空/追加会破坏
@@ -586,8 +591,9 @@ fn matched_translations(
 }
 
 /// BilingualInline：在原 `</w:p>` 后插入译文段（复制原段 pPr，文本 = 译文）；
-/// 格位则追在格内最后一个 `w:p` 之后（复制格内首段的 pPr；含嵌套表的格
-/// v1 不写，见模块头）。
+/// 格位则追在格内最后一个 `w:p` 之后（复制格内首段的 pPr；译段 run 用全新
+/// 最小 rPr——仅 `w:sz`/`w:szCs` = 18 半点 = 9pt 的固定小字号，不复制原
+/// run 的 rPr，见模块头；含嵌套表的格 v1 不写，见模块头）。
 fn apply_inline(
     xml: &str,
     slots: &[Slot],
@@ -622,10 +628,18 @@ fn apply_inline(
                     continue;
                 };
                 let ppr = c.paras[0].ppr.clone().unwrap_or_default();
+                // 译段 run 带全新最小 rPr：固定小字号 sz/szCs = 18 半点 =
+                // 9pt（窄列长译文把表格撑乱的缓解项；不复制原 run 的 rPr——
+                // run 级属性不跨语言复制，字体由主题默认继承）。元素顺序按
+                // OOXML CT_RPr 序列（sz 在 szCs 前），rPr 居 w:r 首位，两个
+                // 子元素即天然合法；固定值不解析 styles.xml 继承链，未来可
+                // 做样式感知（见模块头）。段落级 Inline 不带此 rPr（正文
+                // 整段宽度充足，无需缩字号）。
                 edits.push((
                     last.end,
                     format!(
-                        "<w:p>{ppr}<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+                        "<w:p>{ppr}<w:r><w:rPr><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr>\
+                         <w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
                         escape_xml_text(&tr)
                     ),
                 ));
@@ -825,7 +839,7 @@ mod tests {
     /// 与 writeback 同一套装配（= 提取侧 register_defaults 的行为）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = DocxRawBackend::default()
-            .parse(&path)
+            .parse(path)
             .unwrap();
         OfficePlugin::default().assemble(&raw)
     }
@@ -1238,8 +1252,8 @@ mod tests {
     }
 
     /// BilingualInline：格内最后一段之后追加译段（复制格内首段 pPr，独成
-    /// `w:p` 而非 `w:br` 软换行）；多段落格重解析 = 原文 join 译文（提取侧
-    /// 格内多段落 join 同口径）。
+    /// `w:p` 而非 `w:br` 软换行；译段 run 带固定 9pt 小字号 rPr）；多段落格
+    /// 重解析 = 原文 join 译文（提取侧格内多段落 join 同口径）。
     #[test]
     fn bilingual_inline_appends_translation_paragraph_in_cell() {
         let dir = case_dir("tbl_inline");
@@ -1282,11 +1296,21 @@ mod tests {
                 "乙\nBeta".to_string(),
             ]]
         );
-        // 追加段复制格内首段的 pPr（Heading2），独成 w:p
+        // 追加段复制格内首段的 pPr（Heading2），独成 w:p；译段 run 带 9pt
+        // 小字号（sz/szCs = 18 半点，全新最小 rPr 不复制原 run rPr）
         let out_xml = entry_str(&out_path, "word/document.xml");
         assert!(out_xml.contains(
-            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t xml:space="preserve">Cell translation</w:t></w:r></w:p>"#
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:rPr><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">Cell translation</w:t></w:r></w:p>"#
         ));
+        // 无 pPr 的格（乙）：译段同样带小字号 rPr（rPr 居 w:r 首位）
+        assert!(out_xml.contains(
+            r#"<w:p><w:r><w:rPr><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">Beta</w:t></w:r></w:p>"#
+        ));
+        // 译文 run 全部带 sz/szCs（每个 sz 都配对 szCs，值恒 18 半点 = 9pt）
+        assert_eq!(out_xml.matches(r#"<w:sz w:val="18"/>"#).count(), 2);
+        assert_eq!(out_xml.matches(r#"<w:szCs w:val="18"/>"#).count(), 2);
+        // 原段 run 无 rPr（小字号只落在追加的译段上；甲段二无 pPr，字节原样）
+        assert!(out_xml.contains("<w:p><w:r><w:t>甲段二</w:t></w:r></w:p>"));
         assert_eq!(
             out_xml.matches("<w:p>").count(),
             5,

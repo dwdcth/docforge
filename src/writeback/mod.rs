@@ -37,10 +37,12 @@
 //!
 //! # 覆盖格式与门控
 //!
-//! docx / epub / html / fb2 / odt / txt 六种（md 走
+//! docx / epub / html / fb2 / odt / xlsx / txt 七种（md 走
 //! [`crate::emit::to_bilingual_markdown`] 纯文本重组，不经本模块）。txt 零依赖
 //! 恒开；html 随 feature `html`、fb2 随 `fb2`、odt 随 `odt`（各自复用提取侧
-//! feature 的解析管线，无新依赖）。单文件编码取舍：txt 支持 UTF-8 逐字节
+//! feature 的解析管线，无新依赖）；xlsx 随 `xlsx`（格单元改写为 inlineStr，
+//! 附录策略追加「译文」sheet，见 [`xlsx`] 模块头）。单文件编码取舍：txt 支持
+//! UTF-8 逐字节
 //! 保真 + 解码链命中件转存 UTF-8（lossy 兜底件拒绝）；html / fb2 仅 UTF-8
 //! （避免文件内编码声明失配）；zip 容器格式（docx/epub/odt）由共用
 //! `rewrite_zip` 字节透传非正文部件。
@@ -56,6 +58,8 @@ pub mod html;
 #[cfg(feature = "odt")]
 pub mod odt;
 pub mod txt;
+#[cfg(feature = "xlsx")]
+pub mod xlsx;
 
 /// PDF 双语附录载荷（合作形态：docforge 出 IR/译文序列，PDF 页生成在
 /// 消费者侧——rumi 的 oxidize-pdf 双层经验）。
@@ -68,7 +72,7 @@ pub mod stream;
 #[cfg(feature = "docx")]
 pub use docx::writeback_docx;
 #[cfg(feature = "epub")]
-pub use epub::writeback_epub;
+pub use epub::{writeback_epub, writeback_epub_alternating};
 #[cfg(feature = "fb2")]
 pub use fb2::writeback_fb2;
 #[cfg(feature = "html")]
@@ -76,6 +80,8 @@ pub use html::writeback_html;
 #[cfg(feature = "odt")]
 pub use odt::writeback_odt;
 pub use txt::writeback_txt;
+#[cfg(feature = "xlsx")]
+pub use xlsx::writeback_xlsx;
 
 /// XML / XHTML 文本节点的最小转义：`&` `<` `>`（属性场景不经过此函数——
 /// 本模块只写固定属性值）。译文与追加段统一走这里。

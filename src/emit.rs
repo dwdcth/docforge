@@ -189,6 +189,57 @@ impl TranslationUnit {
     pub fn is_ocr(&self) -> bool {
         self.source == BlockSource::Ocr
     }
+
+    /// 单元文本是否含可翻译的自然语言（[`has_translatable_text`] 的便捷
+    /// 委托）——翻译管线送译前的防幻觉过滤：`220V` / `-10 to 50 C` 这类
+    /// 纯数字/单位文本送引擎只会得到 "220V 电话" 式幻觉，不是漏翻。
+    pub fn has_translatable_text(&self) -> bool {
+        has_translatable_text(&self.text)
+    }
+}
+
+/// 文本是否含**可翻译的自然语言**（事实谓词；策略归消费者）。
+///
+/// 这是三级"什么值得翻译"判据的第三级事实：块类白名单（[`is_translatable`]）
+/// → 噪声块（`min_chars`）→ **语言性**（本谓词）。判定规则（保守偏向）：
+///
+/// - 任一**非 ASCII 字母**（CJK / 西里尔等）→ `true`（几乎必是自然语言）；
+/// - 存在 **≥3 连续 ASCII 字母**的词 → `true`（"hello"、"Version 2 released"；
+///   "mod"/"err" 这类短代码词会被判 true——**宁多送不漏翻**：漏翻=永远不翻，
+///   多送=最坏一次幻觉，且消费者可再过滤）；
+/// - 其余 → `false`：纯数字/符号/短单位串——`220`、`220V`、`1.2.3`、`v2.0`、
+///   `±5%`、`-10 to 50 C`（连接词/单位均 ≤2 字母）、`50 Hz`、`5V2A`、
+///   `2024-01-01`、`#FF00AA`。非字母符号（`℃` 等）不触发 true。
+///
+/// **只判事实，不做策略**：跳过送译还是仍送（如医疗场景 "50 mg"→"50 毫克"
+/// 的单位本地化）由消费者决定；本谓词也不改变 [`to_translation_units`]
+/// 的输出——单元照发（锚点契约不动），消费者按谓词过滤送译清单即可，
+/// 回写侧"未命中 = 原样"天然组合。rumi docmt 的送译前过滤建议直接复用，
+/// 避免双侧正则口径漂移。
+pub fn has_translatable_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // 非 ASCII 字母（CJK/西里尔/带变音符拉丁等）一票判定
+    if t.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
+        return true;
+    }
+    // 逐个极大 ASCII 字母 run：出现 ≥3 连字母即视为自然语言词
+    let mut run = 0usize;
+    for c in t.chars() {
+        if c.is_ascii_alphabetic() {
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    // 无任何 ≥3 字母 run：纯数字/符号/短单位串（阈值 3 由实测痛点样本定：
+    // "-10 to 50 C" 的连接词 to=2、单位 V/Hz/C ≤2 都必须判 false）
+    false
 }
 
 /// 可翻译块白名单：Heading / Paragraph / Quote / List（Code/Note 等结构性
@@ -808,6 +859,57 @@ mod tests {
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].text, "正式句子。");
+    }
+
+    // -------------------------------------------------------------------------
+    // 语言性谓词（防幻觉过滤的事实层，doc 注释见 has_translatable_text）
+    // -------------------------------------------------------------------------
+
+    /// 痛点样本全集：送引擎只会得到 "220V 电话" 式幻觉的文本，一律 false。
+    #[test]
+    fn has_translatable_text_filters_numeric_symbol_units() {
+        for t in [
+            "220", "220V", "1.2.3", "v2.0", "±5%", "-10 to 50 C", "50 Hz", "5V2A",
+            "2024-01-01", "10:30", "#FF00AA", "A1", "x", "±5%℃", "", "   ",
+        ] {
+            assert!(!has_translatable_text(t), "{t:?} 应判 false");
+        }
+    }
+
+    /// 自然语言一律 true；短代码词（mod/err）也 true——宁多送不漏翻
+    ///（漏翻=永远不翻，多送=最坏一次幻觉且消费者可再过滤）。
+    #[test]
+    fn has_translatable_text_passes_natural_language() {
+        for t in [
+            "你好", "第2章", "hello world", "Version 2 released", "UTF-8 编码",
+            "OK 了", "额定电压与频率", "mod",
+        ] {
+            assert!(has_translatable_text(t), "{t:?} 应判 true");
+        }
+    }
+
+    /// 单元照发（锚点契约不动）+ 方法委托：纯数字格仍是翻译单元，
+    /// 消费者按谓词过滤**送译清单**——回写侧"未命中 = 原样"天然组合。
+    #[test]
+    fn units_still_emitted_for_numeric_text_with_predicate_available() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![Block {
+                    kind: BlockKind::Table,
+                    table: Some(crate::model::TableData {
+                        rows: vec![vec!["参数".into(), "220V".into()]],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 2, "纯数字格照发单元（锚点契约不动）");
+        assert!(units[0].has_translatable_text(), "「参数」是自然语言");
+        assert!(!units[1].has_translatable_text(), "「220V」由消费者过滤送译");
     }
 
     // -------------------------------------------------------------------------

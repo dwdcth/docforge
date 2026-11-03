@@ -625,7 +625,7 @@ mod tests {
 
     /// 提取侧同管线（OdtRawBackend + OdfPlugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
-        let raw = OdtRawBackend.parse(&path).unwrap();
+        let raw = OdtRawBackend.parse(path).unwrap();
         OdfPlugin.assemble(&raw)
     }
 

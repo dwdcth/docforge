@@ -21,7 +21,7 @@ fn main() {
     register(&mut registry, PdfOptions::default());
     let engine = DocumentEngine::new(registry);
 
-    let doc = match engine.parse(path.to_str().unwrap()) {
+    let doc = match engine.parse(&path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("解析失败：{e}");

@@ -156,7 +156,7 @@ mod tests {
     ///（header），测试一律不手写其字面量——临时件 → `docforge::parse` →
     /// `to_translation_units`。
     fn units_of(path: &Path) -> Vec<TranslationUnit> {
-        to_translation_units(&crate::parse(&path).unwrap())
+        to_translation_units(&crate::parse(path).unwrap())
     }
 
     const SRT: &str = "\

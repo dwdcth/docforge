@@ -19,6 +19,7 @@ pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译
 | 格式扩展轮 | 图像直读（png/jpg/webp/bmp/tiff）、azw3/KF8（自研记录解析）、CHM（libchm+SVN Book 真件金测）、压缩包（zip/rar/7z，rar=纯 Rust rars） | ✅ |
 | 翻译闭环轮 | 双语回写器七形态（md/docx/epub/txt/html/fb2/odt，定位改写保原格式）、流式消费两层（engine PageSink + pdf 深度流式）、engine/pdf 双级进度钩子 | ✅ |
 | 痛点收口轮 | **表格进翻译流**（单元格级单元 + docx/html/epub/odt 格内回写替换）、极简 docx 产行块、块级语言检测（`lang_detect_per_block`）、流式回写会话（`WritebackSession`）、PDF 附录载荷、公开 benchmark（[BENCHMARK.md](BENCHMARK.md)）、非 UTF-8 路径全链路（`AsRef<Path>` + CLI `args_os`） | ✅ |
+| rumi 接入轮 | **xlsx 回写器**（格单元 inlineStr 改写 + 译文 sheet 附录，翻译闭环第八格式）、**EPUB 部件交替**（`writeback_epub_alternating`：spine 每部件后插纯译文部件，真·一页原文一页译文）、防幻觉事实谓词（`has_translatable_text`：纯数字/单位/版本号单元不送引擎，策略归消费者）、docx 表格译段小字号（9pt） | ✅ |
 
 环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
 ghostscript shim；详见 docs/开发记录.md）。
@@ -89,8 +90,6 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
 - PDF 双语输出：格内替换不可行（无重排），走**附录页模式**——
   `writeback::appendix` 出按原文页分组的结构化译文序列，PDF 页生成在
   消费者侧（rumi 的 oxidize-pdf）。
-- xlsx 回写器（sharedStrings/inlineStr 单元格替换）：表格翻译对 xlsx 的
-  完整闭环，有真实场景再开工。
 - crates.io 发布：依赖面已收敛（oar-ocr 移出发布面），待维护者邮箱验证。
 
 ## 许可

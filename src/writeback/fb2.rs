@@ -879,7 +879,7 @@ mod tests {
     /// 提取侧同管线（Fb2RawBackend + Fb2Plugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = Fb2RawBackend::default()
-            .parse(&path)
+            .parse(path)
             .unwrap();
         Fb2Plugin.assemble(&raw)
     }
@@ -1113,7 +1113,7 @@ mod tests {
             &zip_path,
             &[("p第一章-b1".to_string(), "x".to_string())],
             BiStrategy::BilingualInline,
-            &dir.join("zip-out.fb2"),
+            dir.join("zip-out.fb2"),
         )
         .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
@@ -1126,7 +1126,7 @@ mod tests {
             &bad,
             &[],
             BiStrategy::BilingualInline,
-            &dir.join("bad-out.fb2"),
+            dir.join("bad-out.fb2"),
         )
         .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");

@@ -390,7 +390,7 @@ impl<'a> PageProducer<'a> {
             // 损耗）。取消只能经由驱动方回调 / sink 置位，本函数入口未取消
             // 才进入本分支——"区间渲染前查取消"由此覆盖：取消页起的区间
             // 整段不发起渲染。
-            if self.pending.as_ref().map_or(true, |pi| pi.next_page != p) {
+            if self.pending.as_ref().is_none_or(|pi| pi.next_page != p) {
                 let mut last = p;
                 while last < self.page_count && self.raster_pages.contains(&(last + 1)) {
                     last += 1;

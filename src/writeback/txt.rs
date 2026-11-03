@@ -355,7 +355,7 @@ mod tests {
     /// 提取侧同管线（TextParseCapability 默认规则 + TextPlugin）。
     fn parse_doc(path: &Path) -> crate::model::Document {
         let raw = TextParseCapability::default()
-            .parse(&path)
+            .parse(path)
             .unwrap();
         TextPlugin.assemble(&raw)
     }
@@ -600,7 +600,7 @@ mod tests {
             let src = "第一章 起\n\n中文正文段落。\n\n尾段一个句子。\n";
             let (gbk_bytes, _, had_errors) = encoding_rs::GB18030.encode(src);
             assert!(!had_errors);
-            std::fs::write(&bad_path, gbk_bytes.into_owned()).unwrap();
+            std::fs::write(&bad_path, &gbk_bytes).unwrap();
             // 解码链命中：回写成功，输出转存 UTF-8
             write(
                 &bad_path,
