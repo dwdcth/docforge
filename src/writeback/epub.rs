@@ -17,8 +17,18 @@
 //!   顺序 / 空白跳过 / 实体解码），带字节 span。简化取舍：BilingualInline
 //!   一律插 `<p class="docforge-tr">`（heading 后也是 p；`</li>` 后插入落在
 //!   列表容器内，阅读器容忍）；TranslationOnly 只动可翻译块的文本节点，
-//!   Table/Image/Code 结构块原样保留——坍缩页含表格时表格文本会残留在
-//!   坍缩段文本里。
+//!   Image/Code 结构块原样保留。
+//! * 表格格级回写（wave2，与 `writeback::html` 同构，机制详见其模块头
+//!   「表格格级回写」）：切节页的 Table 块在表格位逐格消费格单元——扫描的
+//!   非空格序列与提取侧格单元同序同数（解析侧无 colspan 展开：td/th 文档序
+//!   即列序），逐格配对 + 格文本守卫（不一致跳过该格不写，宁漏勿错）；
+//!   TranslationOnly 格内首文本节点换译、其余清空，BilingualInline 格内
+//!   `<br class="docforge-tr"/>` 分隔原/译，OriginalPlusAppendix 表格原样
+//!   （格译文不进附录）。
+//! * **单节坍缩边界**：`EpubPlugin::assemble`（Document 口径）把单节 spine
+//!   文档坍缩成一段（`_xhtml_text` 回退同款，表格文本并入段落单元），该形态
+//!   不产 Table 块 → 格单元不存在，格替换自动无操作（表格文本仍残留在坍缩
+//!   段文本里）；多节（切节）文档表格保留结构块，格替换生效。
 //! * 双保险：单元文本与重块化文本一致性比对，不一致跳过该单元（宁漏勿错）；
 //!   非 UTF-8 的 spine 条目（罕见，如 GBK 声明件）不做改写（避免改写后
 //!   字节与编码声明失配），其余条目照常透传。
@@ -54,14 +64,9 @@ pub fn writeback_epub(
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
     let raw = EpubRawBackend::default().parse(path_str)?;
     let doc = EpubPlugin.assemble(&raw);
-    let units: Vec<_> = crate::emit::to_translation_units(&doc)
-        .into_iter()
-        // 表格单元格单元（kind = Table）不进本回写：内联候选复刻（is_translatable
-        // 本就排除 Table）按块序消费 units[cursor]，单元流同步排除才不错位；
-        // 表格在 XHTML 里保持原样。
-        // TODO(表格回写 wave2)：单元格级替换（table 树扫描 + colspan 对齐）
-        .filter(|u| u.kind != BlockKind::Table)
-        .collect();
+    // 单元流全量（含表格格单元 kind = Table）：块级候选按块序消费、表格格
+    // 在表格位逐格消费（见主循环的 Table 分支），两段消费拼满同一单元流。
+    let units = crate::emit::to_translation_units(&doc);
     let map = translation_map(translated);
 
     // B. spine 部件通道（与 EpubRawBackend::parse 的 spine 循环同款跳过规则）
@@ -96,6 +101,53 @@ pub fn writeback_epub(
         let doc_i = prov[page_idx].doc;
         let raw_slots = &slots[doc_i];
         for (b_idx, b) in page.blocks.iter().enumerate() {
+            if b.kind == BlockKind::Table {
+                // 表格格级回写（wave2）：仅切节页有 Table 块（坍缩页的表格
+                // 文本已并入段落单元，见模块头「单节坍缩边界」）。扫描格序列
+                // ↔ 格单元顺序配对 + 文本守卫；OriginalPlusAppendix 表格原样
+                // （格译文不进附录）。无 rows 结构的 Table 块防御性跳过。
+                if b.table.is_none() {
+                    continue;
+                }
+                let slot = &raw_slots[prov[page_idx].blocks[b_idx]];
+                for cell in &slot.cells {
+                    let Some(unit) = units.get(cursor) else { break };
+                    cursor += 1;
+                    // 双保险：格文本 ≠ 单元文本 → 该格不写（宁漏勿错；单元照常消费）
+                    if unit.kind != BlockKind::Table || cell.text != unit.text {
+                        continue;
+                    }
+                    let Some(tr) = map.get(unit.id.as_str()) else {
+                        continue;
+                    };
+                    let tr = tr.trim();
+                    if tr.is_empty() {
+                        continue;
+                    }
+                    match strategy {
+                        BiStrategy::BilingualInline => {
+                            // 格内容终点（闭标签前）插 <br class="docforge-tr"/> + 译文
+                            edits[doc_i].push(Edit::Insert(
+                                cell.end,
+                                format!("<br class=\"{TR_CLASS}\"/>{}", escape_xml_text(tr)),
+                            ));
+                        }
+                        BiStrategy::TranslationOnly => {
+                            // 格内首文本节点换译文、其余清空（与段落同款）
+                            for (k, (s, e)) in cell.text_spans.iter().enumerate() {
+                                if k == 0 {
+                                    edits[doc_i]
+                                        .push(Edit::Replace(*s, *e, escape_xml_text(tr)));
+                                } else {
+                                    edits[doc_i].push(Edit::Replace(*s, *e, String::new()));
+                                }
+                            }
+                        }
+                        BiStrategy::OriginalPlusAppendix => {}
+                    }
+                }
+                continue;
+            }
             let t = b.content.trim();
             if !crate::emit::is_translatable(b.kind) || t.is_empty() || t.chars().count() < 2 {
                 continue;
@@ -140,7 +192,8 @@ pub fn writeback_epub(
                 }
                 BiStrategy::TranslationOnly => {
                     // 首个贡献块的首文本节点换译文；其余可翻译块的文本节点清空。
-                    // Table/Image/Code 结构块的文本不动（见模块注释的简化口径）。
+                    // Image/Code 结构块的文本不动；坍缩页贡献块中的 Table 槽位
+                    // 同样不动（坍缩页无格单元，见模块头「单节坍缩边界」）。
                     let mut first = true;
                     for i in &contrib {
                         let slot = &raw_slots[*i];
@@ -174,6 +227,8 @@ pub fn writeback_epub(
     if strategy == BiStrategy::OriginalPlusAppendix && !units.is_empty() && !parts.is_empty() {
         let matched: Vec<&str> = units
             .iter()
+            // 表格格译文不进附录（附录是段落流；表格正文原样）
+            .filter(|u| u.kind != BlockKind::Table)
             .filter_map(|u| map.get(u.id.as_str()))
             .map(|t| t.trim())
             .filter(|t| !t.is_empty())
@@ -434,23 +489,6 @@ mod tests {
   <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
 </container>"#;
 
-    const OPF: &str = r#"<?xml version="1.0"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>测试书</dc:title>
-    <dc:language>zh</dc:language>
-  </metadata>
-  <manifest>
-    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
-    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
-    <item id="ch2" href="text/ch2.xhtml" media-type="application/xhtml+xml"/>
-  </manifest>
-  <spine>
-    <itemref idref="ch1"/>
-    <itemref idref="ch2"/>
-  </spine>
-</package>"#;
-
     const NAV: &str = r#"<?xml version="1.0"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><body>
 <nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
@@ -460,12 +498,19 @@ mod tests {
   </ol>
 </nav></body></html>"#;
 
-    /// ch1：单节文档（坍缩页）；含表格（非翻译块）。
+    /// ch1：单节文档（坍缩页）；含表格——坍缩形态下表格文本并入段落单元、
+    /// 格单元不存在（见模块头「单节坍缩边界」）。
     const CH1: &str = "<html><body><h1>第一章</h1><p>正文一。</p><p>正文二。</p>\
 <table><tr><td>格甲</td><td>格乙</td></tr></table></body></html>";
     /// ch2：两个 h2 → 切节页。
     const CH2: &str = "<html><body><h2>甲节</h2><p>甲正文，段落测试。</p>\
 <h2>乙节</h2><ul><li>要点一。</li><li>要点二。</li></ul></body></html>";
+    /// ch3：两个 h2 → 切节页；首节含表格（格级回写目标，colspan 行无展开）。
+    const CH3: &str = "<html><body><h2>参数节</h2><p>如下表所示。</p>\
+<table><tr><th>名称</th><th>单位</th></tr>\
+<tr><td>电压</td><td>伏</td></tr>\
+<tr><td colspan=\"2\">跨列说明</td></tr></table>\
+<h2>结论节</h2><p>综上各条。</p></body></html>";
 
     fn case_dir(case: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -477,7 +522,9 @@ mod tests {
         dir
     }
 
-    fn build_epub(dir: &Path, ch1: &str, ch2: &str) -> PathBuf {
+    /// N 章 epub：manifest/spine 按 chs 动态生成（ch{i} → text/ch{i}.xhtml；
+    /// 章名 nav 只给前两章，后续章页名走文档内标题口径）。
+    fn build_epub_parts(dir: &Path, chs: &[&str]) -> PathBuf {
         let path = dir.join("book.epub");
         let f = std::fs::File::create(&path).unwrap();
         let mut zw = zip::ZipWriter::new(f);
@@ -486,14 +533,46 @@ mod tests {
             zw.start_file(name, opts).unwrap();
             zw.write_all(body.as_bytes()).unwrap();
         };
+        let items = (1..=chs.len())
+            .map(|i| {
+                format!(
+                    r#"<item id="ch{i}" href="text/ch{i}.xhtml" media-type="application/xhtml+xml"/>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        let spine = (1..=chs.len())
+            .map(|i| format!(r#"<itemref idref="ch{i}"/>"#))
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        let opf = format!(
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>测试书</dc:title>
+    <dc:language>zh</dc:language>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    {items}
+  </manifest>
+  <spine>
+    {spine}
+  </spine>
+</package>"#
+        );
         put("mimetype", "application/epub+zip");
         put("META-INF/container.xml", CONTAINER);
-        put("OEBPS/content.opf", OPF);
+        put("OEBPS/content.opf", &opf);
         put("OEBPS/nav.xhtml", NAV);
-        put("OEBPS/text/ch1.xhtml", ch1);
-        put("OEBPS/text/ch2.xhtml", ch2);
+        for (i, ch) in chs.iter().enumerate() {
+            put(&format!("OEBPS/text/ch{}.xhtml", i + 1), ch);
+        }
         zw.finish().unwrap();
         path
+    }
+
+    fn build_epub(dir: &Path, ch1: &str, ch2: &str) -> PathBuf {
+        build_epub_parts(dir, &[ch1, ch2])
     }
 
     /// 提取侧同管线（EpubRawBackend + EpubPlugin::assemble）。
@@ -704,6 +783,139 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Chapter 1", "Section A body.", "Point one.", "Point two."]
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 表格格级回写（wave2 金测，切节页）：TranslationOnly 全格替换——格单元
+    /// 全译后重解析，格文本 == 译文；colspan 行无展开（跨列文本落 (r,0)、
+    /// 无续位）；单节坍缩页（ch1）不产格单元，表格文本随坍缩段原样。
+    #[test]
+    fn table_cells_translation_only_sectioned() {
+        let dir = case_dir("cell-tonly");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2, CH3]);
+        let out_path = dir.join("out.epub");
+
+        // ch1 坍缩：无格单元（坍缩边界）；ch3 切节：表格按格展开，
+        // 空格不发单元、单字符格照收、colspan 行只占 (r,0)
+        assert_eq!(
+            unit_ids(&in_path),
+            [
+                "p第一章-b0",
+                "p甲节-b0",
+                "p乙节-b0",
+                "p乙节-b1",
+                "p参数节-b0",
+                "p参数节-b1-r0c0",
+                "p参数节-b1-r0c1",
+                "p参数节-b1-r1c0",
+                "p参数节-b1-r1c1",
+                "p参数节-b1-r2c0",
+                "p结论节-b0",
+            ]
+        );
+
+        write(
+            &in_path,
+            &out_path,
+            &[
+                ("p参数节-b0", "See the table."),
+                ("p参数节-b1-r0c0", "Name"),
+                ("p参数节-b1-r0c1", "Unit"),
+                ("p参数节-b1-r1c0", "Voltage"),
+                ("p参数节-b1-r1c1", "V"),
+                ("p参数节-b1-r2c0", "Spanning note"),
+                ("p结论节-b0", "As shown above."),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        let doc = parse_doc(&out_path);
+        assert_eq!(doc.pages.len(), 5);
+        // ch1 坍缩页：未喂译文，表格文本随坍缩段原样
+        assert_eq!(
+            doc.pages[0].blocks[0].content,
+            "第一章\n\n正文一。\n\n正文二。\n\n格甲 | 格乙"
+        );
+        // 参数节（切节页）：段落替换 + 表格格全替换（colspan 行落 (r,0) 单格）
+        assert_eq!(doc.pages[3].blocks[0].content, "See the table.");
+        let rows = &doc.pages[3].blocks[1].table.as_ref().unwrap().rows;
+        assert_eq!(
+            rows,
+            &vec![
+                vec!["Name".to_string(), "Unit".to_string()],
+                vec!["Voltage".to_string(), "V".to_string()],
+                vec!["Spanning note".to_string()],
+            ]
+        );
+        assert_eq!(doc.pages[4].blocks[0].content, "As shown above.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BilingualInline 格内对照 + OriginalPlusAppendix 附录排除（切节页）：
+    /// 格内 `<br class="docforge-tr"/>` 分隔原/译（重解析为原/译直连拼接）、
+    /// 未命中格原样；格译文不进附录（附录只收段落类）、表格原样。
+    #[test]
+    fn table_cells_inline_and_appendix_sectioned() {
+        let dir = case_dir("cell-inline");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2, CH3]);
+
+        // BilingualInline：只给电压格译文 → 该格 br 对照，其余格原样
+        let out_path = dir.join("inline.epub");
+        write(
+            &in_path,
+            &out_path,
+            &[("p参数节-b1-r1c0", "Voltage")],
+            BiStrategy::BilingualInline,
+        );
+        let raw_out = EpubRawBackend::default()
+            .parse(out_path.to_str().unwrap())
+            .unwrap();
+        let ch3 = &raw_out.pages[2].items[0].text;
+        assert!(
+            ch3.contains(r#"<td>电压<br class="docforge-tr"/>Voltage</td>"#),
+            "格内 br 对照插在格内容终点：{ch3}"
+        );
+        assert!(ch3.contains("<td>伏</td>"), "未命中格原样：{ch3}");
+        let book = read_epub(out_path.to_str().unwrap()).unwrap();
+        let tbl = book.chapters[3].blocks[1].table.as_ref().unwrap();
+        assert_eq!(
+            tbl.rows[1],
+            vec!["电压Voltage".to_string(), "伏".to_string()],
+            "重解析：格文本原/译直连（br 不拆格）"
+        );
+        assert_eq!(tbl.rows[0], vec!["名称".to_string(), "单位".to_string()]);
+
+        // OriginalPlusAppendix：格译文不进附录（附录只收段落类），表格原样
+        let out2 = dir.join("appendix.epub");
+        write(
+            &in_path,
+            &out2,
+            &[
+                ("p参数节-b0", "See the table."),
+                ("p参数节-b1-r1c0", "Voltage"),
+            ],
+            BiStrategy::OriginalPlusAppendix,
+        );
+        let raw_out2 = EpubRawBackend::default()
+            .parse(out2.to_str().unwrap())
+            .unwrap();
+        // 附录落在最后 spine 文档（ch3，表格所在部件）；表格原样、格译文
+        // 不入正文也不入附录（附录只收段落类）
+        let raw_in = EpubRawBackend::default()
+            .parse(in_path.to_str().unwrap())
+            .unwrap();
+        let ch3_out = &raw_out2.pages[2].items[0].text;
+        assert!(ch3_out.contains("<p>See the table.</p>"), "段落译文进附录");
+        assert!(!ch3_out.contains("Voltage"), "格译文不进附录：{ch3_out}");
+        assert!(ch3_out.contains("<td>电压</td>"), "表格原样");
+        let body_end = ch3_out.rfind("</body>").unwrap();
+        let h2 = ch3_out.find("<h2>译文</h2>").unwrap();
+        assert!(h2 < body_end, "附录在 </body> 之前");
+        // 其余 spine 文档不动
+        assert_eq!(raw_in.pages[0].items[0].text, raw_out2.pages[0].items[0].text);
+        assert_eq!(raw_in.pages[1].items[0].text, raw_out2.pages[1].items[0].text);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
