@@ -9,5 +9,7 @@ pub mod epub;
 
 #[cfg(any(feature = "odt", feature = "ods", feature = "odp"))]
 pub mod odf;
+#[cfg(feature = "cbz")]
+pub mod cbz;
 #[cfg(feature = "pdf")]
 pub mod pdf;

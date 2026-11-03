@@ -33,6 +33,8 @@ epub = ["dep:zip", "dep:quick-xml", "html"]
 # XLSX/PPTX（docparser-office 吸收；xlsx 含 chrono 日期单元格）
 xlsx = ["dep:chrono", "dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
 pptx = ["dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
+# CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
+cbz = ["dep:zip", "dep:image"]
 # ODF 家族（docparser-odf 吸收）
 odt = ["dep:quick-xml", "dep:zip"]
 ods = ["dep:quick-xml", "dep:zip"]
