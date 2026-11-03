@@ -216,8 +216,11 @@ RawTextItem / assemble / 两层能力模型 / Registry / BackendPolicy **原样�
   图片占位 `[image]`）、`to_json`（serde 直出）、**翻译友好 emit**（段落级原文输出
   带 block 序号/页号/lang，供翻译管线对齐回写双语）。docparser emit 思路 + 表格
   管道符对齐。
-- `adapt::ocr_lines(&Document) -> Vec<OcrLine>`：rumi 采用时的适配层（含坐标系
-  契约平移、四点框↔Rect 转换）——**预留接口位，rumi 采用期实现，不在主线里程碑**。
+- **rumi 采用适配（修订 2026-11-03，用户定夺）**：docforge 是通用库（OCR/翻译/
+  RAG 的公共底座），不为任何特定消费者内置适配层——`adapt::ocr_lines` 从本计划
+  移除。rumi（或任何消费者）采用时**在消费者侧写适配器**（依赖方向决定适配方向：
+  IR→OcrLine 的转换、引擎 wrapper 等属于 rumi 仓库的代码）；docforge 侧的对接面
+  就是公共 API 本身（Document/Block/emit/注入式 OcrEngine）。
 
 ## 10. 与 rumi-ocr 的关系（独立开发，后期采用）
 
