@@ -34,10 +34,13 @@
 //! 接入其它格式只需注册对应后端（`backends::pdf::register` 等，M1+ 提供），
 //! 见 [`Registry`] 与 [`DocumentEngine`]。
 
+pub mod backends;
 pub mod emit;
 pub mod engine;
 pub mod error;
 pub mod model;
+#[cfg(feature = "ocr")]
+pub mod ocr;
 pub mod plugin;
 pub mod plugins;
 pub mod policy;
@@ -54,3 +57,31 @@ pub use plugin::{
     RawTextItem,
 };
 pub use registry::{Registry, RegistryError};
+
+/// 便捷解析：默认 Registry 装配（文本族内置 + pdf feature 开启时注册
+/// `PdfOptions::default()`，引擎自动取 `ocr-oar` feature 的全局 oar 实例）。
+///
+/// 自定义装配（注入引擎/选项/后端）用 [`Registry`] + [`DocumentEngine`]。
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let doc = docforge::parse("note.md")?;
+/// println!("{} 页", doc.pages.len());
+/// # Ok(()) }
+/// ```
+pub fn parse(path: &str) -> Result<Document> {
+    let mut registry = Registry::new();
+    plugins::text::register_defaults(&mut registry);
+    #[cfg(feature = "pdf")]
+    {
+        let opts = crate::backends::pdf::PdfOptions {
+            #[cfg(feature = "ocr-oar")]
+            engine: Some(crate::ocr::oar::OarOcrEngine::shared()),
+            #[cfg(not(feature = "ocr-oar"))]
+            engine: None,
+            ..Default::default()
+        };
+        crate::backends::pdf::register(&mut registry, opts);
+    }
+    DocumentEngine::new(registry).parse(path)
+}

@@ -13,10 +13,38 @@ md = []
 csv = []
 html = []
 rtf = []
+# pdf 页级路由（pdf-inspector default 面 = 纯 Rust：lopdf，无 ort/pyo3/pdfium；
+# Auto/On 模式的引擎注入需要 ocr trait，image 依赖与 ocr 重叠）
+pdf = ["dep:pdf-inspector", "dep:image", "ocr"]
+# OCR 引擎抽象（trait + 类型）
+ocr = ["dep:image"]
+# oar-ocr 默认引擎（重依赖 ort 隔离于此；含 pdf 路由接线）
+ocr-oar = ["ocr", "pdf", "dep:oar-ocr"]
 
 [dependencies.serde]
 version = "1"
 features = ["derive"]
 
+[dependencies.pdf-inspector]
+version = "1"
+default-features = false
+optional = true
+
+[dependencies.image]
+version = "0.25"
+optional = true
+
+# oar-ocr 必须 git 版：crates.io 0.1.1 是旧版，没有 auto-download（rumi 实测同款结论）
+[dependencies.oar-ocr]
+git = "https://github.com/GreatV/oar-ocr"
+features = ["auto-download"]
+optional = true
+
+[[example]]
+name = "pdf_dump"
+path = "examples/pdf_dump.rs"
+required-features = ["pdf"]
+
 [dev-dependencies]
 serde_json = "1"
+oxidize-pdf = "5"

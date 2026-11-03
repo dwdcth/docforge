@@ -1,5 +1,6 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
-// docforge 改动：仅 crate 名引用替换。
+// docforge 改动：① RawTextItem 新增 source/confidence；② RawPage 新增 coord_units
+// （M1：pdf 页级路由把 OCR 语义透传到 IR，docforge-spec-m1.md §4）。
 //! 能力抽象（与 Python `capability.py` 对齐）：
 //! 解析能力（格式绑定）→ RawDoc；处理能力（全局共享，就地增强）。
 
@@ -8,13 +9,19 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use crate::error::Result;
-use crate::model::{MetaValue, Rect, TableData};
+use crate::model::{BlockSource, CoordUnits, MetaValue, Rect, TableData};
 
 /// 解析产出的原始文本项：text + 可选 bbox。
 #[derive(Debug, Clone, Default)]
 pub struct RawTextItem {
     pub text: String,
     pub bbox: Option<Rect>,
+    /// 块来源（pdf 页级路由标 `TextLayer`/`Ocr`；其余格式缺省 `Native`）。
+    /// `assemble` 透传至 `Block.source`。
+    pub source: BlockSource,
+    /// OCR 置信度（`source = Ocr` 时 Some；文字层/原生结构为 None——
+    /// 文字层的语义是"零识别"，恒 1.0 的分数留给 OcrLine 适配层补）。
+    pub confidence: Option<f32>,
     /// 标题层级（1–6）：Some 表示这一项是标题（ODF `text:outline-level` 等），
     /// None 表示普通段落。插件 `assemble` 据此产出 `BlockKind::Heading`。
     pub level: Option<u8>,
@@ -92,6 +99,9 @@ pub struct RawPage {
     pub width: Option<f32>,
     pub height: Option<f32>,
     pub rotation: Option<i32>,
+    /// 本页 items bbox 的坐标单位（pdf 文字层页 `Pt` / OCR 页 `Px{dpi}`）。
+    /// `assemble` 透传至 `Page.coord_units`；无几何格式为 None。
+    pub coord_units: Option<CoordUnits>,
     /// 解析即已得到的表格结构 rows × cells
     pub tables: Vec<Vec<Vec<String>>>,
     /// 快路径页文本（`structure_mode` 非语义分支）：`Some` 时该页**不出块**，
