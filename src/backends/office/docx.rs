@@ -25,7 +25,7 @@ pub struct DocxRawBackend {
     /// XML 解析，默认路径不为它付费（对齐 Python `ctx.options["include_regions"]`）。
     pub include_regions: bool,
     /// 结构还原三态（对齐 Python `policy.structure_mode`）：非语义时整篇压成
-    /// 一段行文本（`RawPage::flat_text`），不产块。
+    /// 行文本（`RawPage::flat_text`），组装层按行产 `Paragraph` 块（无结构块）。
     pub structure_mode: StructureMode,
     /// 是否提取内嵌位图（对齐 Python `policy.ocr_images`，默认关）：命中
     /// `word/media/*` 白名单且足够大的图按文档序产「图片项」。
@@ -137,7 +137,8 @@ impl ParseCapability for DocxRawBackend {
         };
 
         // 非语义：整篇压成行文本（表格按 `行内 join(",") / 行间 \n` 展开，与 Python
-        // `"\n".join(",".join(r) for r in rows)` 一致），assemble 侧不产块。
+        // `"\n".join(",".join(r) for r in rows)` 一致），assemble 侧按行产纯
+        // `Paragraph` 块（刻意偏离 Python 零块形态的理由见 `assemble` 内注释）。
         // items 仍保留（图片项要走它才能进 `Page.images`），图片项的 text 为空，
         // 所以不会被拼进行文本；`flat_text_of` 天然跳过。
         let flat_text = if semantic {
@@ -1298,8 +1299,8 @@ mod tests {
         let raw = DocxRawBackend::default()
             .parse(path.to_str().unwrap())
             .unwrap();
-        // 该文件没有任何结构信号 → 默认 `auto` 会走 raw 快路径（不出块）；本用例
-        // 要验的是事件解析，所以显式 `semantic` 才会产出 items
+        // 该文件没有任何结构信号 → 默认 `auto` 会走 raw 快路径；本用例
+        // 要验的是事件解析，所以另用显式 `semantic` 对照产项
         let sem = DocxRawBackend::default()
             .with_structure_mode(StructureMode::Semantic)
             .parse(path.to_str().unwrap())
@@ -1307,12 +1308,69 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(raw.pages.len(), 1);
-        // raw 仍产项（图片位置要靠 items 承载），只是组装侧不出块、文本走 flat_text
+        // raw 仍产项（图片位置要靠 items 承载），组装侧按行产 Paragraph 块、文本走 flat_text
         assert_eq!(raw.pages[0].items.len(), 2);
         assert_eq!(raw.pages[0].flat_text.as_deref(), Some("Smoke 文本\na & b"));
         assert_eq!(sem.pages[0].items.len(), 2);
         assert_eq!(sem.pages[0].items[0].text, "Smoke 文本");
         assert_eq!(sem.pages[0].items[1].text, "a & b");
+    }
+
+    /// 极简 docx（纯 `w:p`/`w:t` 段落，零结构信号）端到端：默认 `auto` 判非语义
+    /// 走快路径 → 组装层按行产 `Paragraph` 块 → `to_translation_units` 非空。
+    ///
+    /// 痛点验收：程序生成物 / pandoc 极简输出这类 docx（七信号全无）曾因快路径
+    /// 零块被翻译/RAG 消费者报"文档无可翻译文本单元"。
+    #[test]
+    fn minimal_plain_docx_yields_paragraph_blocks_and_translation_units() {
+        use std::io::Write;
+
+        const DOCUMENT_XML: &str = concat!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+            r#"<w:p><w:r><w:t>第一段正文</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>第三段正文</w:t></w:r></w:p>"#,
+            r#"</w:body></w:document>"#
+        );
+
+        let dir = std::env::temp_dir().join("docparser_office_docx_minimal_plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.docx");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("word/document.xml", opts).unwrap();
+            zw.write_all(DOCUMENT_XML.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        // 七信号全无 → 默认 auto 走快路径（flat_text 有值、items 不产结构判定）
+        let raw = DocxRawBackend::default()
+            .parse(path.to_str().unwrap())
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            raw.pages[0].flat_text.is_some(),
+            "零信号极简 docx 应走快路径"
+        );
+
+        use crate::plugin::FormatPlugin;
+        let doc = crate::backends::office::OfficePlugin::default().assemble(&raw);
+        let page = &doc.pages[0];
+        assert_eq!(page.blocks.len(), 3);
+        assert!(
+            page.blocks
+                .iter()
+                .all(|b| b.kind == crate::model::BlockKind::Paragraph),
+            "快路径只产纯段落块"
+        );
+        assert_eq!(page.blocks[1].content, "Second paragraph");
+        assert_eq!(page.text, "第一段正文\nSecond paragraph\n第三段正文");
+        // 痛点验收：极简 docx 必须产翻译单元
+        let units = crate::emit::to_translation_units(&doc);
+        assert_eq!(units.len(), 3, "极简 docx 必须产翻译单元");
+        assert_eq!(units[1].text, "Second paragraph");
     }
 
     /// 区域部件（页眉/页脚/脚注）：只在 opt-in 时解析，且输出顺序固定为
@@ -1479,8 +1537,9 @@ mod tests {
         assert_eq!(with_regions.pages[0].items[0].text, "正文");
     }
 
-    /// `raw` 快路径：标题/列表/表格全部压平为行文本，**不产项**；`auto` 因
-    /// `Heading1` 命中 probe 而仍走 semantic（对齐 Python `_DOCX_PROBE` 同源判据）。
+    /// `raw` 快路径：标题/列表/表格全部压平为行文本（`flat_text`，组装层按行产
+    /// 纯 `Paragraph` 块）；`auto` 因 `Heading1` 命中 probe 而仍走 semantic
+    /// （对齐 Python `_DOCX_PROBE` 同源判据）。
     #[test]
     fn raw_mode_flattens_to_text_only() {
         use std::io::Write;
@@ -1517,8 +1576,8 @@ mod tests {
         let auto = DocxRawBackend::default().parse(&p).unwrap();
         std::fs::remove_file(&path).ok();
 
-        // raw：组装侧一块不出，文本按 "\n" 拼接，表格行内 "," 行间 "\n"
-        // （items 仍在，但 `flat_text` 有值时 assemble 直接按纯文本处理）
+        // raw：页文本按 "\n" 拼接，表格行内 "," 行间 "\n"
+        // （items 仍在；`flat_text` 有值时 assemble 按行产纯 Paragraph 块）
         let page = &raw.pages[0];
         assert_eq!(page.items.len(), 4);
         assert_eq!(

@@ -25,6 +25,12 @@ pub struct BackendPolicy {
     pub ocr_dpi: u32,
     pub ocr_drop_score: f32,
     pub max_pages: usize,
+    /// 块级语言检测（中英混排文档逐块走不同翻译方向的钥匙）：assemble 后由
+    /// engine 后置遍历给可检测块填 `Block.lang`（ISO 639-3 码，与文档级
+    /// `DocMeta.extra["language"]` 同码制），`to_translation_units` 复制进
+    /// `TranslationUnit.lang` 供逐单元路由方向。需 feature `lang-detect` 才
+    /// 实际生效——策略是纯数据，不绑编译开关：feature 关闭时本字段静默无效。
+    pub lang_detect_per_block: bool,
 }
 
 impl BackendPolicy {

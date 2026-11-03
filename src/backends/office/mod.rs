@@ -159,8 +159,9 @@ pub struct OfficeOptions {
     /// （对应 Python `policy.max_slides`）。
     pub max_slides: usize,
     /// 结构还原三态（对应 Python `policy.structure_mode`，默认 `auto`）。
-    /// `raw` / `auto` 判定为 raw 时：docx/pptx **不产块**、页文本按 `\n` 拼接，
-    /// 表格压平成一段文本，pptx 备注丢弃；xlsx 不受影响（Python 侧同样不看）。
+    /// `raw` / `auto` 判定为 raw 时：docx/pptx 走行文本快路径（`flat_text`），
+    /// 不做结构还原（无标题/列表/表格块），组装层按行产 `Paragraph` 块；
+    /// pptx 备注丢弃；xlsx 不受影响（Python 侧同样不看）。
     pub structure_mode: StructureMode,
     /// 是否提取内嵌位图（对应 Python `policy.ocr_images`，默认 `false`）：
     /// 命中白名单且 `min(w,h) >= 50` 的图进 `Page.images`（`dedup_key` = md5），
@@ -271,10 +272,28 @@ fn assemble(raw: &RawDoc, options: &OfficeOptions) -> crate::model::Document {
                 }
             }
             // 快路径（`structure_mode` 非语义，docx/pptx 解析阶段置 `flat_text`）：
-            // **不产块**，页文本直接用解析阶段拼好的行文本；区域/批注仍按
-            // `include_regions` 产 Note 块，备注（`notes`）整体忽略
-            // （对齐 Python 非语义分支 `Page(blocks=_region_blocks(...)); text="\n".join(texts)`）。
+            // 页文本直接用解析阶段拼好的行文本；块层面**按行产 `Paragraph` 块**
+            // （trim 后非空的行才产，空行跳过，与 txt 插件"空行不作为块"同口径）。
+            //
+            // 刻意偏离 Python 非语义分支 `Page(blocks=_region_blocks(...))` 的零块形态：
+            // 零块文档对翻译/RAG 消费者（`emit::to_translation_units` 等）等于不可用
+            // ——纯段落极简 docx/pptx 会直接报"无可翻译文本单元"。Python 对齐性
+            // 在此让位于消费者可用性，`flat_text` 的语义相应降级为"无**结构**块"
+            // （页文本层不受影响，仍取 flat 原串，零文本面回归）。
+            // 区域/批注仍按 `include_regions` 产 Note 块（排在正文行块之后），
+            // 备注（`notes`）整体忽略（Python 非语义分支同样不看 notes）。
             if let Some(flat) = rp.flat_text.as_deref() {
+                for line in flat.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    blocks.push(crate::model::Block {
+                        kind: crate::model::BlockKind::Paragraph,
+                        content: trimmed.to_string(),
+                        ..Default::default()
+                    });
+                }
                 if options.include_regions {
                     push_region_notes(&mut blocks, rp);
                 }
@@ -1081,5 +1100,73 @@ mod tests {
         let off = OfficePlugin::default().assemble(&raw);
         assert_eq!(off.pages[0].blocks.len(), 1);
         assert_eq!(off.pages[0].text, "员工");
+    }
+
+    /// 快路径（`flat_text`）：逐行产 `Paragraph` 块，空行不产块（与 txt 插件
+    /// "空行不作为块"同口径）；`Page.text` 仍取 flat 原串（不按块重算）。
+    ///
+    /// 这是消费者可用性痛点回归：极简 docx/pptx 曾因快路径零块被
+    /// `to_translation_units` 判为"无可翻译文本单元"。
+    #[test]
+    fn flat_text_produces_paragraph_blocks_per_line() {
+        use super::OfficePlugin;
+        use crate::model::BlockKind;
+        use crate::plugin::{FormatPlugin, RawDoc, RawPage};
+
+        let raw = RawDoc {
+            pages: vec![RawPage {
+                flat_text: Some("甲行\n\n乙行\n".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let doc = OfficePlugin::default().assemble(&raw);
+        let page = &doc.pages[0];
+        assert_eq!(page.blocks.len(), 2, "空行不产块");
+        assert!(page.blocks.iter().all(|b| b.kind == BlockKind::Paragraph));
+        assert_eq!(page.blocks[0].content, "甲行");
+        assert_eq!(page.blocks[1].content, "乙行");
+        assert_eq!(page.text, "甲行\n\n乙行\n", "页文本保持 flat 原串");
+    }
+
+    /// 快路径 + `include_regions`：区域 `Note` 块行为不变，且排在正文行块之后
+    /// （先正文、后区域），`Page.text` 同样不受区域影响。
+    #[test]
+    fn flat_text_keeps_region_notes_after_paragraphs() {
+        use super::{OfficeOptions, OfficePlugin};
+        use crate::model::{BlockKind, MetaValue};
+        use crate::plugin::{FormatPlugin, RawDoc, RawPage, RawRegion};
+
+        let raw = RawDoc {
+            pages: vec![RawPage {
+                flat_text: Some("甲行\n乙行".into()),
+                regions: vec![RawRegion {
+                    kind: "header".into(),
+                    text: "页眉内容".into(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plugin = OfficePlugin {
+            options: OfficeOptions::new().with_include_regions(true),
+        };
+
+        let page = &plugin.assemble(&raw).pages[0];
+        assert_eq!(page.blocks.len(), 3);
+        assert_eq!(page.blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(page.blocks[1].kind, BlockKind::Paragraph);
+        assert_eq!(page.blocks[2].kind, BlockKind::Note);
+        assert_eq!(page.blocks[2].content, "页眉内容");
+        assert_eq!(
+            page.blocks[2].meta.get("region"),
+            Some(&MetaValue::Str("header".into()))
+        );
+        assert_eq!(page.text, "甲行\n乙行", "区域不进页文本");
+
+        // 默认关：只有正文行块
+        let off = OfficePlugin::default().assemble(&raw);
+        assert_eq!(off.pages[0].blocks.len(), 2);
     }
 }

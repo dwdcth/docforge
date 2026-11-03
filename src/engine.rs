@@ -6,7 +6,9 @@
 // 边界各通知一次；页级粒度与取消仍在各后端 Options，如 PdfOptions.on_progress）；
 // ⑤ engine 级流式解析（PageSink / parse_streaming：assemble 后逐页投递，统计
 // 按已投递页回填、warnings 记中止；pdf 千页件的最坏场景另有
-// backends::pdf::parse_streaming 深度流式入口，页产即吐、峰值 = 单页）。
+// backends::pdf::parse_streaming 深度流式入口，页产即吐、峰值 = 单页）；
+// ⑥ 块级语言检测后置遍历（policy.lang_detect_per_block × feature lang-detect
+// 双闸：assemble 后、finalize/页投递前逐块填 Block.lang，见 detect_block_langs）。
 //! 文档引擎：sniff → 解析链（回退保留原始错误码）→ 处理链（失败仅记录）→ assemble。
 //!
 //! 可选引擎级进度钩子（[`ProgressFn`]）在各阶段边界发粗粒度通知，覆盖全部
@@ -142,10 +144,23 @@ impl DocumentEngine {
 
     pub fn parse(&self, path: &str) -> Result<Document> {
         let (fmt, plugin, raw) = self.run_parse_chain(path)?;
+        // mut 随 feature：块级语言检测（仅 lang-detect 有检测函数）需要就地
+        // 改块；无该 feature 时 finalize 按值消费，绑定无需 mut（避免
+        // unused_mut 告警）
+        #[cfg(feature = "lang-detect")]
+        let mut doc = Self::assemble_document(fmt, plugin.as_ref(), &raw);
+        #[cfg(not(feature = "lang-detect"))]
         let doc = Self::assemble_document(fmt, plugin.as_ref(), &raw);
         // ③ 组装完成：finalize 统计回填前发出（文档结构已就绪，仅差
         // text_length 等统计字段；无附加标识，通知体空串）
         self.notify(ParsePhase::Assembled, "");
+        // ③⁺ 块级语言检测（policy 开关 × feature 双闸）：放 Assembled 通知
+        // 之后、finalize 之前——Assembled 语义是"结构就绪"，不含语言填充，
+        // 先后皆可；落 finalize 前保证返回的 Document 已带块级 lang。
+        #[cfg(feature = "lang-detect")]
+        if self.policy.lang_detect_per_block {
+            detect_block_langs(&mut doc);
+        }
         Ok(doc.finalize())
     }
 
@@ -260,6 +275,13 @@ impl DocumentEngine {
         drop(raw); // 流式：处理链已结束，RawDoc 先于页投递释放（不再双驻留）
         // ③ 组装完成：通知点与 parse 一致（finalize 统计回填前发出）
         self.notify(ParsePhase::Assembled, "");
+        // ③⁺ 块级语言检测（policy 开关 × feature 双闸）：必须在页投递之前
+        // ——mem::take 把页交出去后再填，块级 lang 就随引擎侧副本丢了，
+        // sink 收到的页永远不带检测结论。
+        #[cfg(feature = "lang-detect")]
+        if self.policy.lang_detect_per_block {
+            detect_block_langs(&mut doc);
+        }
 
         // ④ 逐页投递：mem::take 消费组装页，sink false 即中止（余页不产）。
         // 统计幽灵先于投递构建（只克隆 finalize 读取的字段），载荷随 Page
@@ -317,6 +339,55 @@ fn append_warning(extra: &mut std::collections::BTreeMap<String, String>, msg: S
     }
 }
 
+/// 块级语言检测的样本下限（chars 计）。whatlang 对短文本不可靠：文档级
+/// `lang_detect.rs` 的 MIN_SAMPLE_CHARS = 50 面向的是跨页段落聚合样本
+/// （天然更长），块级单块普遍更短，取 20 折中——够滤掉标题/短句噪声，
+/// 又不至于让普通段落的块全部哑火。
+#[cfg(feature = "lang-detect")]
+const BLOCK_MIN_SAMPLE_CHARS: usize = 20;
+
+/// 块级语言检测（feature = "lang-detect"）：给可检测且未标语言的块填
+/// `Block.lang`（ISO 639-3 码，与文档级 `plugins/lang_detect.rs` 同码制）。
+///
+/// 为什么走 engine 组装后置遍历、而非 RawTextItem 透传：ProcessCapability
+/// 按 trait 设计工作在 RawDoc（组装前）层，若在 item 层填 lang，15+ 个解析
+/// 后端的 assemble 都要逐个透传 `RawTextItem.lang → Block.lang`，散且漏。
+/// 块级检测的输入就是块文本，engine 在 assemble 之后单点遍历一次，全部
+/// 格式一处覆盖。
+///
+/// 样本口径：
+/// - 普通块用 `content.trim()`；Table 块的 content 只是表头摘要，改用
+///   `table.rows` 的非空格单元格 `join("\n")` 作样本；
+/// - 样本 < [`BLOCK_MIN_SAMPLE_CHARS`] 的块跳过（理由见常量注释）；
+/// - 已有 `lang` 的块不覆盖（尊重后端自带结论），`whatlang::detect` 未
+///   命中同样保持 None（静默，合法）。
+#[cfg(feature = "lang-detect")]
+fn detect_block_langs(doc: &mut Document) {
+    for page in &mut doc.pages {
+        for block in &mut page.blocks {
+            if block.lang.is_some() {
+                continue;
+            }
+            let sample = match block.table.as_ref() {
+                Some(t) => t
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter().map(|cell| cell.trim()))
+                    .filter(|cell| !cell.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                None => block.content.trim().to_string(),
+            };
+            if sample.chars().count() < BLOCK_MIN_SAMPLE_CHARS {
+                continue;
+            }
+            if let Some(info) = whatlang::detect(&sample) {
+                block.lang = Some(info.lang().code().to_string());
+            }
+        }
+    }
+}
+
 // 导出方便错误码检查（示例用）
 #[allow(dead_code)]
 fn _code(e: &DocError) -> ErrorCode {
@@ -332,6 +403,14 @@ mod tests {
         let mut reg = Registry::new();
         register_defaults(&mut reg);
         DocumentEngine::new(reg)
+    }
+
+    /// 带 policy 的引擎（块级语言检测开关经此传入）。
+    #[cfg(feature = "lang-detect")]
+    fn engine_with_policy(policy: BackendPolicy) -> DocumentEngine {
+        let mut reg = Registry::new();
+        register_defaults(&mut reg);
+        DocumentEngine::new(reg).with_policy(policy)
     }
 
     fn write_tmp(name: &str, content: &str) -> String {
@@ -656,5 +735,134 @@ mod tests {
         assert_eq!(meta.text_length, "第一页内容".chars().count());
         let w = meta.extra.get("warnings").expect("应有中止告警");
         assert!(w.contains("流式消费中止于第 1 页"), "实际告警：{w}");
+    }
+
+    // ------------------------------------------------------------------
+    // 块级语言检测（policy.lang_detect_per_block × feature lang-detect）
+    // ------------------------------------------------------------------
+
+    /// 中英混排 txt 的块级语言检测：开关开 → 两块分别 cmn / eng（逐块
+    /// 走不同翻译方向的钥匙）；开关关（默认）→ 全部 None。两层检测并存
+    /// 不冲突：文档级 `meta.extra["language"]` 在两种开关状态下照旧存在。
+    #[test]
+    #[cfg(feature = "lang-detect")]
+    fn per_block_lang_detect_mixed_txt() {
+        let cn = "深秋的校园格外安静，银杏叶铺满了整条林荫道，图书馆的阅览室里学生们埋头整理着各自的手稿与读书笔记。";
+        let en = "The rendering pipeline assembles each frame from a queue of command buffers before the final image is presented to the display.";
+        let p = write_tmp("mixlang.txt", &format!("{cn}\n\n{en}\n"));
+
+        let on = engine_with_policy(BackendPolicy {
+            lang_detect_per_block: true,
+            ..Default::default()
+        })
+        .parse(&p)
+        .unwrap();
+        let off = engine().parse(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+
+        let blocks = &on.pages[0].blocks;
+        assert_eq!(blocks.len(), 2, "空行分段：中文段 + 英文段各一块");
+        assert_eq!(blocks[0].lang.as_deref(), Some("cmn"), "中文块");
+        assert_eq!(blocks[1].lang.as_deref(), Some("eng"), "英文块");
+
+        // 开关关（默认 false）：块 lang 保持 None（feature 在、策略不开）
+        assert!(
+            off.pages[0].blocks.iter().all(|b| b.lang.is_none()),
+            "per_block 关闭时不得填块级 lang"
+        );
+
+        // 文档级检测不受块级开关影响：主导语言照旧写 extra（两层并存）
+        assert!(on.meta.extra.contains_key("language"));
+        assert!(off.meta.extra.contains_key("language"));
+    }
+
+    /// 流式路径同验：sink 收到的页上块 lang 已填——证明调用点在
+    /// `mem::take` 页投递之前（页交出去后再填就随引擎侧副本丢了）。
+    #[test]
+    #[cfg(feature = "lang-detect")]
+    fn per_block_lang_detect_streaming_filled_before_take() {
+        let cn = "深秋的校园格外安静，银杏叶铺满了整条林荫道，图书馆的阅览室里学生们埋头整理着各自的手稿与读书笔记。";
+        let en = "The rendering pipeline assembles each frame from a queue of command buffers before the final image is presented to the display.";
+        let p = write_tmp("mixlang_stream.txt", &format!("{cn}\n\n{en}\n"));
+        let mut got: Vec<Page> = Vec::new();
+        let meta = engine_with_policy(BackendPolicy {
+            lang_detect_per_block: true,
+            ..Default::default()
+        })
+        .parse_streaming(
+            &p,
+            &mut |page: Page| {
+                got.push(page);
+                true
+            },
+        )
+        .unwrap();
+        std::fs::remove_file(&p).ok();
+
+        assert_eq!(got.len(), 1);
+        let blocks = &got[0].blocks;
+        assert_eq!(blocks[0].lang.as_deref(), Some("cmn"));
+        assert_eq!(blocks[1].lang.as_deref(), Some("eng"));
+        // 文档级结论照旧随 meta 返回
+        assert!(meta.extra.contains_key("language"));
+    }
+
+    /// 短块阈值：样本 < 20 chars 的块即使开关打开也不判（whatlang 短文本
+    /// 不可靠）；同文档里的长块照常判出——阈值按块独立，不按文档。
+    #[test]
+    #[cfg(feature = "lang-detect")]
+    fn per_block_lang_skips_short_blocks() {
+        let p = write_tmp(
+            "shortlang.txt",
+            "短说明。\n\nThe rendering pipeline assembles each frame from a queue of command buffers before presenting.\n",
+        );
+        let doc = engine_with_policy(BackendPolicy {
+            lang_detect_per_block: true,
+            ..Default::default()
+        })
+        .parse(&p)
+        .unwrap();
+        std::fs::remove_file(&p).ok();
+
+        let blocks = &doc.pages[0].blocks;
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].lang.is_none(), "短块（4 chars < 20）不判");
+        assert_eq!(blocks[1].lang.as_deref(), Some("eng"), "同文档长块照常判出");
+    }
+
+    /// Table 块样本口径：content 只是表头摘要（这里刻意 < 20 字符，若误用
+    /// content 作样本将保持 None），实际样本取 `table.rows` 非空格单元格
+    /// join → 判出全中文表格的语言。直接喂手造 Document 验检测函数本体，
+    /// 不依赖任何格式 feature。
+    #[test]
+    #[cfg(feature = "lang-detect")]
+    fn table_block_sample_uses_rows_not_content() {
+        let mut doc = Document {
+            pages: vec![Page {
+                blocks: vec![crate::model::Block {
+                    kind: crate::model::BlockKind::Table,
+                    content: "字段与类型".into(),
+                    table: Some(crate::model::TableData {
+                        rows: vec![
+                            vec!["配置项说明".into(), "取值范围与默认行为说明".into()],
+                            vec![
+                                "超时重试次数决定请求失败前最多重发多少轮探测包。".into(),
+                                "缓存容量上限决定热数据在内存里最多保留多少条记录。".into(),
+                            ],
+                        ],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        detect_block_langs(&mut doc);
+        assert_eq!(
+            doc.pages[0].blocks[0].lang.as_deref(),
+            Some("cmn"),
+            "样本应取 table.rows（content 摘要不足 20 字符本会跳过）"
+        );
     }
 }

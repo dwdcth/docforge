@@ -294,6 +294,7 @@ fn render(format: &str, doc: &docforge::Document) -> Option<String> {
                         "confidence": u.confidence,
                         "lang": u.lang,
                         "chapter": u.chapter,
+                        "header": u.header,
                     })
                     .to_string()
                 })

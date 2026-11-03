@@ -165,6 +165,13 @@ name = "cli_convert"
 path = "tests/cli_convert.rs"
 required-features = ["json"]
 
+# 解析吞吐/内存基准（harness=false：自带 main，不走 libtest；
+# 跑法与数字见 BENCHMARK.md）
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
+
 [dev-dependencies]
 serde_json = "1"
 oxidize-pdf = "5"

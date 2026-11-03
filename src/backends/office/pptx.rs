@@ -30,7 +30,7 @@ pub struct PptxRawBackend {
     /// （对齐 Python `policy.max_slides`：列表切片后丢弃）。
     pub max_slides: usize,
     /// 结构还原三态（对齐 Python `policy.structure_mode`）：非语义时**逐页**判断，
-    /// 该页不产块、文本按 `\n` 拼接、备注不读。
+    /// 该页走行文本快路径（`flat_text`）、组装层按行产 `Paragraph` 块、备注不读。
     pub structure_mode: StructureMode,
     /// 是否提取内嵌位图（对齐 Python `policy.ocr_images`，默认关）。
     /// 注意：与 Python 一致，raw 页**不**提取图片（`_slide_items` 的快路径直接 return）。
@@ -1291,7 +1291,8 @@ mod tests {
         assert_eq!(all.pages.len(), 3, "0 = 不限");
     }
 
-    /// raw 快路径（`structure_mode` 非语义）：**不出块、不读备注**，页文本是
+    /// raw 快路径（`structure_mode` 非语义）：**不产结构块（组装层按行产
+    /// `Paragraph` 块，与 docx 快路径同口径）、不读备注**，页文本是
     /// 各形状文本按 `\n` 拼接——单形状页在 `auto` 下就会走这条路（对齐 Python
     /// `len(shapes) > 1 or tbl or chart` 的 probe）。
     #[test]
@@ -1316,6 +1317,16 @@ mod tests {
         assert_eq!(sem.pages[0].items.len(), 1, "semantic 照常成块");
         assert!(sem.pages[0].flat_text.is_none());
         assert_eq!(sem.pages[1].notes.as_deref(), Some("备注乙"));
+
+        // 组装层：raw 页也按行产 Paragraph 块（快路径不再是零块，翻译/RAG 可用）
+        use crate::plugin::FormatPlugin;
+        let doc = crate::backends::office::OfficePlugin::default().assemble(&auto);
+        for (page, head) in doc.pages.iter().zip(["甲乙", "丙丁", "戊己"]) {
+            assert_eq!(page.blocks.len(), 1);
+            assert_eq!(page.blocks[0].kind, crate::model::BlockKind::Paragraph);
+            assert_eq!(page.blocks[0].content, head);
+            assert_eq!(page.text, head);
+        }
     }
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {

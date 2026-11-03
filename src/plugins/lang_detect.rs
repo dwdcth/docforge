@@ -5,6 +5,15 @@
 //! `RawDoc.meta["language"]`（ISO 639-3 码，如 "cmn" 中文普通话 / "eng"），
 //! engine 通用搬运至 `DocMeta.extra["language"]`；失败不致命（处理链语义，
 //! 仅记 warnings）。rumi 翻译主线按此取源语言。
+//!
+//! 与块级检测的分工（两层并存、互不替代）：本模块是**文档级**——处理链
+//! 能力，整篇判一个语言，写 `meta → extra["language"]` 作管线的源语言；
+//! **块级**检测在 engine 组装后的后置遍历（`src/engine.rs`
+//! `detect_block_langs`，`BackendPolicy::lang_detect_per_block` 开关 +
+//! 本 feature），逐块填 `Block.lang`（同 ISO 639-3 码制），供中英混排
+//! 文档逐单元走不同翻译方向——`to_translation_units` 复制
+//! `block.lang → TranslationUnit.lang` 自动携带。混排文档两层不冲突：
+//! 文档级给主导语言，块级给逐块方向。
 
 use crate::error::Result;
 use crate::plugin::{ProcessCapability, RawDoc};

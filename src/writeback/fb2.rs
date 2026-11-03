@@ -79,7 +79,13 @@ pub fn writeback_fb2(
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
     let raw = Fb2RawBackend::default().parse(path_str)?;
     let doc = Fb2Plugin.assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）恒久不进 fb2 回写：fb2 v1 不承诺
+        // 表格回写（`<table>` 产 Table 块占槽位但不占翻译位，见模块文档），
+        // 单元流同步排除，表格在 XML 里保持原样。
+        .filter(|u| u.kind != crate::model::BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
 
     // B. 主文 body 重扫描（提取侧遍历的镜像，带字节锚点）

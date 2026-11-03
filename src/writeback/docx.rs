@@ -52,7 +52,14 @@ pub fn writeback_docx(
     // structure_mode=auto / include_regions=false / ocr_images=false）拿块序与 id。
     let raw = DocxRawBackend::default().parse(path_str)?;
     let doc = OfficePlugin::default().assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）不参与「第 k 单元 ↔ 第 k 段落位」
+        // 对齐：本扫描本就整棵跳过 w:tbl（表格不占位），单元流同步排除，
+        // 表格在文档里保持原样不翻译（行为等同表格进翻译流之前）。
+        // TODO(表格回写 wave2)：单元格级替换（w:tbl/table 树扫描 + gridSpan/colspan 对齐）
+        .filter(|u| u.kind != crate::model::BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
 
     // 第二遍：XML 扫描段落位，与单元按序对齐。
@@ -538,9 +545,12 @@ mod tests {
         parse_doc(path).pages[0].blocks.clone()
     }
 
+    /// 回写消费的单元 id（writeback_docx 过滤 Table 单元格单元，wave2 前
+    /// 表格不回写）——helper 与该消费口径一致，不是提取侧全量单元流。
     fn unit_ids(path: &Path) -> Vec<String> {
         to_translation_units(&parse_doc(path))
             .into_iter()
+            .filter(|u| u.kind != Table)
             .map(|u| u.id)
             .collect()
     }
@@ -581,7 +591,8 @@ mod tests {
             BiStrategy::BilingualInline,
         );
 
-        // 提取侧 id 口径（表格占 b3、短段占 b2，都不进翻译流）
+        // 回写消费 id 口径（表格占 b3：格单元被回写器过滤；短段占 b2 不进
+        // 翻译流；格单元本身已进提取侧单元流，wave2 起可回写）
         assert_eq!(
             unit_ids(&in_path),
             ["p0-b0", "p0-b1", "p0-b4"]

@@ -62,7 +62,14 @@ pub fn writeback_html(
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
     let raw = WholeTextParseCapability { id: "html.parse", fmt: "html" }.parse(path_str)?;
     let doc = HtmlPlugin.assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）不进本回写：内联候选复刻（is_translatable
+        // 本就排除 Table）按块序消费 units[cursor]，单元流同步排除才不错位；
+        // 表格在 HTML 里保持原样。
+        // TODO(表格回写 wave2)：单元格级替换（table 树扫描 + colspan 对齐）
+        .filter(|u| u.kind != BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
 
     // B. 读字节并解码：UTF-8（BOM 剥除后扫描、写回补回）；非 UTF-8 拒绝
@@ -483,9 +490,12 @@ mod tests {
         HtmlPlugin.assemble(&raw)
     }
 
+    /// 回写消费的单元 id（writeback_html 过滤 Table 单元格单元，wave2 前
+    /// 表格不回写）——helper 与该消费口径一致，不是提取侧全量单元流。
     fn unit_ids(path: &Path) -> Vec<String> {
         to_translation_units(&parse_doc(path))
             .into_iter()
+            .filter(|u| u.kind != Table)
             .map(|u| u.id)
             .collect()
     }
@@ -517,7 +527,8 @@ mod tests {
         )
         .unwrap();
 
-        // 提取侧 id 口径（短段乙占 b2、表格占 b6，都不进翻译流）
+        // 回写消费 id 口径（短段乙占 b2、表格占 b6：格单元进提取侧流但被
+        // 回写器过滤，wave2 起可回写）
         assert_eq!(
             unit_ids(&in_path),
             ["p0-b0", "p0-b1", "p0-b3", "p0-b4", "p0-b5"]

@@ -55,7 +55,14 @@ pub fn writeback_odt(
     // A. 权威解析（提取侧同管线）拿 id / 文本
     let raw = OdtRawBackend.parse(path_str)?;
     let doc = OdfPlugin.assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）不进本回写：内联候选复刻（is_translatable
+        // 本就排除 Table，表格块装配时统一排在段后）按块序消费 units[cursor]，
+        // 单元流同步排除才不错位；表格在 content.xml 里保持原样。
+        // TODO(表格回写 wave2)：单元格级替换（table:table 树扫描 + column span 对齐）
+        .filter(|u| u.kind != crate::model::BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
     if doc.pages.len() != 1 {
         return Err(DocError::corrupt("odt 对齐失败：Document 页数异常"));
@@ -382,9 +389,12 @@ mod tests {
         OdfPlugin.assemble(&raw)
     }
 
+    /// 回写消费的单元 id（writeback_odt 过滤 Table 单元格单元，wave2 前
+    /// 表格不回写）——helper 与该消费口径一致，不是提取侧全量单元流。
     fn unit_ids(path: &Path) -> Vec<String> {
         to_translation_units(&parse_doc(path))
             .into_iter()
+            .filter(|u| u.kind != Table)
             .map(|u| u.id)
             .collect()
     }
@@ -412,7 +422,8 @@ mod tests {
         build_odt(&in_path, BODY);
         let out_path = dir.join("out.odt");
 
-        // 提取侧 id 口径（乙 1 字符不发锚点；表格块排段后占 b5）
+        // 回写消费 id 口径（乙 1 字符不发锚点；表格块排段后占 b5，其格单元
+        // 进提取侧流但被回写器过滤，wave2 起可回写）
         assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b1", "p0-b3", "p0-b4"]);
 
         write(

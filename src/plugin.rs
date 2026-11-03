@@ -110,10 +110,11 @@ pub struct RawPage {
     pub coord_units: Option<CoordUnits>,
     /// 解析即已得到的表格结构 rows × cells
     pub tables: Vec<Vec<Vec<String>>>,
-    /// 快路径页文本（`structure_mode` 非语义分支）：`Some` 时该页**不出块**，
-    /// 页文本直接取此值（对齐 Python `blocks=[]` + `text="\n".join(texts)`）。
-    /// 仅 `regions`/`comments` 仍随 `include_regions` 产 `Note` 块；`notes` 被忽略
-    /// （Python 非语义分支不看 `meta["notes"]`）。
+    /// 快路径页文本（`structure_mode` 非语义分支）：页文本直接取此值
+    /// （`"\n".join(texts)`）。docforge 刻意偏离 Python 的 `blocks=[]`：
+    /// assemble 仍**按行产 Paragraph 块**（零块文档对翻译/RAG 消费者等于
+    /// 不可用）。仅 `regions`/`comments` 仍随 `include_regions` 产 `Note`
+    /// 块；`notes` 被忽略（Python 非语义分支不看 `meta["notes"]`）。
     pub flat_text: Option<String>,
 }
 

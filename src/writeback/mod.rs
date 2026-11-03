@@ -54,6 +54,14 @@ pub mod html;
 pub mod odt;
 pub mod txt;
 
+/// PDF 双语附录载荷（合作形态：docforge 出 IR/译文序列，PDF 页生成在
+/// 消费者侧——rumi 的 oxidize-pdf 双层经验）。
+pub mod appendix;
+
+/// 流式回写会话（push/finish：译文按单元喂入、spill 落盘、finish 打包——
+/// 与 engine 的 parse_streaming 组成「解析→翻→写」流式闭环的最后一环）。
+pub mod stream;
+
 #[cfg(feature = "docx")]
 pub use docx::writeback_docx;
 #[cfg(feature = "epub")]

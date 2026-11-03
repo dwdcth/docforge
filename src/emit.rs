@@ -2,7 +2,9 @@
 // docforge 改动：① Image 块渲染 [image] 占位；② feature `json` 下 to_json/
 // to_json_pretty；③ 新增 to_translation_units（翻译友好输出，docparse-plan §9）；
 // ④ 新增 to_rag_chunks（RAG 检索分块，docparse-plan §13 M4）；
-// ⑤ 新增双语回写（BiStrategy + to_bilingual_markdown[_with]，翻译闭环①）。
+// ⑤ 新增双语回写（BiStrategy + to_bilingual_markdown[_with]，翻译闭环①）；
+// ⑥ 表格进翻译流：Table 块按单元格展开（`-r{行}c{列}` 锚点 + header 表头
+//    标志），双语回写按译后网格渲染。
 //! 输出目标：text / markdown / JSON（feature `json`）/ 翻译单元
 //!（`to_translation_units`，翻译管线的工作单元与回写锚点）/ RAG 检索块
 //!（`to_rag_chunks`，向量化/检索管线的工作单元）/ 双语回写
@@ -32,7 +34,24 @@ pub fn to_json_pretty(doc: &Document) -> String {
     serde_json::to_string_pretty(doc).expect("Document 序列化不失败")
 }
 
+/// Markdown 表格格转义：裸 `|` 会撕裂表格结构（原文渲染与译文注入统一走这里，
+/// 译文里出现竖线时网格不被冲垮）。
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+}
+
 fn table_md(rows: &[Vec<String>]) -> String {
+    // 单元格统一过转义（现状未转义是缺陷：原文格含 `|` 时表格同样会被撕裂）
+    let escaped: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| escape_md_cell(c)).collect())
+        .collect();
+    table_rows_md(&escaped)
+}
+
+/// 按已就绪（已转义）的单元格网格渲染 Markdown 表格：补齐短行、首行 +
+/// 分隔行。[`table_md`]（原文渲染）与双语回写的译后网格共用。
+fn table_rows_md(rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -146,7 +165,9 @@ pub fn to_markdown(doc: &Document) -> String {
 /// 翻译单元：翻译管线的工作单元。`id` 是回写锚点（译后按 id 对齐双语）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationUnit {
-    /// 稳定 ID：`p{页号}-b{块序}`（页号取 Page.name，无名为页序）
+    /// 稳定 ID：块单元 `p{页号}-b{块序}`（页号取 Page.name，无名为页序）；
+    /// Table 展开的格单元 `p{页号}-b{块序}-r{行}c{列}`（见
+    /// [`to_translation_units_with`]）
     pub id: String,
     pub page: Option<String>,
     /// 单元种类（翻译通常只处理 Heading/Paragraph/Quote/List）
@@ -158,6 +179,9 @@ pub struct TranslationUnit {
     pub lang: Option<String>,
     /// 最近的上游 Heading 文本（章节上下文，供术语一致性；无则 None）
     pub chapter: Option<String>,
+    /// 表头单元格（Table 块展开且行号 < `TableData.header_rows`）；非表格单元
+    /// 恒 false。消费者可按此跳过表头翻译。
+    pub header: bool,
 }
 
 impl TranslationUnit {
@@ -167,8 +191,14 @@ impl TranslationUnit {
     }
 }
 
-/// 可翻译块白名单：Heading / Paragraph / Quote / List（Code/Table/Note 等
-/// 结构性内容默认不进翻译流）。
+/// 可翻译块白名单：Heading / Paragraph / Quote / List（Code/Note 等结构性
+/// 内容不进翻译流）。
+///
+/// **Table 不在本谓词——刻意不翻转**：块级 `content` 只是表头摘要，且六个
+/// 回写器（`writeback/*`）以内联复刻的本谓词做「第 k 单元 ↔ 第 k XML 位」
+/// 对齐，翻转会让提取侧单元流与回写侧位置序立即失控。语义等价承载：表格经
+/// [`to_translation_units`] 按单元格展开，单元 `kind = BlockKind::Table`
+/// 标识、`header` 标识表头行，外部消费者据此识别与过滤。
 pub fn is_translatable(kind: BlockKind) -> bool {
     matches!(kind, BlockKind::Heading | BlockKind::Paragraph | BlockKind::Quote | BlockKind::List)
 }
@@ -182,6 +212,14 @@ fn translation_id(page_name: &str, b_idx: usize) -> String {
     format!("p{page_name}-b{b_idx}")
 }
 
+/// 提取/回写两侧共用的单元格锚点：`p{页名}-b{块序}-r{行}c{列}`（如
+/// `p0-b2-r1c3`）。与 [`translation_id`] 并列单点定义——id 是回写锚点，
+/// 绝不允许两处 format! 口径漂移。与块锚点字符串形态不同（`p0-b2` 与
+/// `p0-b2-r1c3`），天然不冲突。
+fn translation_cell_id(page_name: &str, b_idx: usize, r: usize, c: usize) -> String {
+    format!("p{page_name}-b{b_idx}-r{r}c{c}")
+}
+
 /// 提取/回写两侧共用的候选判定：可翻译白名单 + 非空白 + 达到 min_chars。
 /// 直接复用 [`is_translatable`]；回写侧用同一谓词，保证「哪些块拥有锚点」
 /// 两侧完全一致（id 对得上）。
@@ -191,7 +229,9 @@ fn translation_candidate(b: &crate::model::Block, min_chars: usize) -> bool {
         && b.content.chars().count() >= min_chars
 }
 
-/// 提取翻译单元：按文档序遍历块，白名单 + 最小字符数过滤。
+/// 提取翻译单元：按文档序遍历块，白名单 + 最小字符数过滤；Table 块按
+/// 单元格展开进流（锚点 `p{页}-b{块序}-r{行}c{列}`，见
+/// [`to_translation_units_with`]）。
 ///
 /// `min_chars` 过滤超短块（默认 2：滤掉单字符噪声，保留绝大多数实词句）。
 /// 章节上下文 = 该块之前最近的 Heading 块文本（跨页不追踪）。
@@ -200,6 +240,12 @@ pub fn to_translation_units(doc: &Document) -> Vec<TranslationUnit> {
 }
 
 /// [`to_translation_units`] 带自定义最小字符数。
+///
+/// **表格单元格不受 `min_chars` 约束**：`cell.trim()` 非空即收（阈值恒 1）。
+/// 单字符格（是/否、单位 V/A、币种符号）是表格常态，min_chars=2 会把参数表
+/// 洗成空壳；数字/纯符号格翻译引擎自然原样返回，无害。表头行（行号 <
+/// `TableData.header_rows`）的单元 `header = true`，消费者可按此跳过表头
+/// 翻译；单元 `kind = BlockKind::Table`，外部消费者据此识别单元格单元。
 pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<TranslationUnit> {
     let mut out = Vec::new();
     for (p_idx, page) in doc.pages.iter().enumerate() {
@@ -211,6 +257,35 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
         for (b_idx, b) in page.blocks.iter().enumerate() {
             if b.kind == BlockKind::Heading {
                 chapter = Some(b.content.clone());
+            }
+            // 表格块按单元格展开进翻译流（此前表格文本完全不进翻译流——
+            // rumi 等「整份文档翻译」消费者拿不到参数表/对照表/数据字典）。
+            // 无 rows 结构的 Table 块防御性跳过（理论不出现：各解析后端
+            // 产 Table 块必带 table）。
+            if b.kind == BlockKind::Table {
+                let Some(t) = b.table.as_ref() else {
+                    continue;
+                };
+                for (r, row) in t.rows.iter().enumerate() {
+                    for (c, cell) in row.iter().enumerate() {
+                        let text = cell.trim();
+                        if text.is_empty() {
+                            continue; // 空格不发单元（合并格/留白格常态）
+                        }
+                        out.push(TranslationUnit {
+                            id: translation_cell_id(&page_name, b_idx, r, c),
+                            page: Some(page_name.clone()),
+                            kind: BlockKind::Table,
+                            text: text.to_string(),
+                            source: b.source,
+                            confidence: b.confidence,
+                            lang: b.lang.clone(),
+                            chapter: chapter.clone(),
+                            header: r < t.header_rows,
+                        });
+                    }
+                }
+                continue;
             }
             if !translation_candidate(b, min_chars) {
                 continue;
@@ -224,6 +299,7 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                 confidence: b.confidence,
                 lang: b.lang.clone(),
                 chapter: chapter.clone(),
+                header: false,
             });
         }
     }
@@ -237,8 +313,9 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
 /// 双语回写策略（Markdown 形态；docx/epub 回写器共用同一套语义）。
 ///
 /// 三种策略共用 [`to_translation_units`] 的锚点与过滤口径（页×块序、
-/// [`is_translatable`] 白名单、min_chars 2）：只有提取侧会发锚点的块才可能
-/// 被译文命中；无译文的块一律保留原文；未匹配的译文 id 忽略。
+/// [`is_translatable`] 白名单、min_chars 2；Table 块另发单元格锚点
+/// `p{页}-b{块序}-r{行}c{列}`）：只有提取侧会发锚点的块/格才可能被译文
+/// 命中；无译文的块一律保留原文；未匹配的译文 id 忽略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BiStrategy {
     /// 原/译同段交错（原文块后紧跟译文块）——阅读对照形态。
@@ -285,18 +362,21 @@ pub fn to_bilingual_markdown(doc: &Document, translated: &[(String, String)]) ->
 /// 各策略形态：
 ///
 /// - [`BiStrategy::BilingualInline`]：原文渲染后 `\n` 直连译文（不空行，
-///   同段对照）；Heading 译文保持同级标题；
+///   同段对照）；Heading 译文保持同级标题；Table 按格对照（格内
+///   `原文<br>译文`，Markdown 表格内换行本就用 `<br>`）；
 /// - [`BiStrategy::TranslationOnly`]：译文整体替换原块文本（Heading 保持
-///   层级，其余纯文本）；
+///   层级，其余纯文本）；Table 全命中格替换为译文；
 /// - [`BiStrategy::OriginalPlusAppendix`]：正文为 [`to_markdown`] 完整原文 +
 ///   `\n\n---\n\n# 译文\n\n`，译文按 chapter 分组（`##` 组标题，保持章节
 ///   首次出现序；chapter 为 None 归 `（无章节）`），组内按文档序以空行分段。
-///   附录内译文一律纯文本段落（标题层级归附录自身的分组结构）。全文无命中
-///   译文时不追加空附录（输出即 [`to_markdown`]）。
+///   附录内译文一律纯文本段落（标题层级归附录自身的分组结构）。**表格单元
+///   不进附录**（表格格译文无处安放——附录是段落流），正文表格原样渲染。
+///   全文无命中译文时不追加空附录（输出即 [`to_markdown`]）。
 ///
 /// 与 [`to_markdown`] 的渲染差异：双语遍历不做相邻列表合并（锚点对齐优先，
 /// 列表项逐条独立）；List/Quote 的译文为纯文本，Markdown 渲染中作为前文
-/// 续行/正文出现。
+/// 续行/正文出现；Table 块按译后网格渲染（单元格锚点逐格查译文，无任何
+/// 命中格时输出与 [`to_markdown`] 的表格渲染逐字节一致）。
 pub fn to_bilingual_markdown_with(
     doc: &Document,
     translated: &[(String, String)],
@@ -315,6 +395,48 @@ pub fn to_bilingual_markdown_with(
     for (p_idx, page) in doc.pages.iter().enumerate() {
         let page_name = page.name.clone().unwrap_or_else(|| p_idx.to_string());
         for (b_idx, b) in page.blocks.iter().enumerate() {
+            // 表格块：按单元格锚点查译文，渲染译后网格（与提取侧展开口径
+            // 同源——translation_cell_id 单点定义，两侧 id 不漂移）。无结构
+            // 的 Table 块与 to_markdown 同口径渲染为空、跳过。
+            if b.kind == BlockKind::Table {
+                let Some(t) = b.table.as_ref() else {
+                    continue;
+                };
+                let grid: Vec<Vec<String>> = t
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(r, row)| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(c, cell)| {
+                                // 原格与 table_md 同口径（不 trim，只转义）：
+                                // 无命中格的表格与 to_markdown 输出逐字节一致
+                                let orig = escape_md_cell(cell);
+                                match map
+                                    .get(translation_cell_id(&page_name, b_idx, r, c).as_str())
+                                {
+                                    None => orig,
+                                    Some(tr) => match strategy {
+                                        BiStrategy::TranslationOnly => escape_md_cell(tr.trim()),
+                                        BiStrategy::BilingualInline => {
+                                            format!("{orig}<br>{}", escape_md_cell(tr.trim()))
+                                        }
+                                        BiStrategy::OriginalPlusAppendix => {
+                                            unreachable!("已在分支前提前返回")
+                                        }
+                                    },
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let rendered = table_rows_md(&grid);
+                if !rendered.is_empty() {
+                    out.push(rendered);
+                }
+                continue;
+            }
             let rendered = block_md(b);
             if rendered.is_empty() {
                 continue;
@@ -353,6 +475,9 @@ fn original_plus_appendix(doc: &Document, map: &std::collections::HashMap<&str, 
             if b.kind == BlockKind::Heading {
                 chapter = Some(b.content.clone());
             }
+            // 表格单元格单元（kind = Table）不在 translation_candidate 白名单
+            // 内，结构性地不进附录（附录是段落流，格译文无处安放；表格正文
+            // 由 body = to_markdown 原样渲染）
             if !translation_candidate(b, DEFAULT_TRANSLATION_MIN_CHARS) {
                 continue;
             }
@@ -683,6 +808,248 @@ mod tests {
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].text, "正式句子。");
+    }
+
+    // -------------------------------------------------------------------------
+    // 表格进翻译流（提案 §3）：Table 块按单元格展开
+    // -------------------------------------------------------------------------
+
+    /// 带行列结构与表头行数的 Table 块（测试构造件）。
+    fn table(rows: &[&[&str]], header_rows: usize) -> Block {
+        Block {
+            kind: BlockKind::Table,
+            table: Some(crate::model::TableData {
+                rows: rows
+                    .iter()
+                    .map(|r| r.iter().map(|s| s.to_string()).collect())
+                    .collect(),
+                header_rows,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// 单元展开：混合文档（段落 + header_rows=1 的 3×3 表）——单元数、
+    /// id 形态（`p0-b2-r0c0`…）、header 标志（首行 true 其余 false）、
+    /// 单字符格与空格格口径、min_chars 只约束段落类。
+    #[test]
+    fn table_units_expand_by_cell() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![
+                    heading("附录 参数表"),   // b0：章节上下文
+                    para("如下表。"),         // b1：4 字符，默认口径进流、min_chars=5 被滤
+                    table(                    // b2：3×3，表头 1 行，r2c0 为空格
+                        &[&["名称", "单位", "默认"], &["电压", "V", "是"], &["", "A", "电流"]],
+                        1,
+                    ),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        // 2 个段落类单元 + 8 个非空格（3×3 减 1 个空格格）
+        assert_eq!(units.len(), 2 + 8);
+        // id 形态：块锚点与单元格锚点同流且不冲突（`p0-b2` 与 `p0-b2-r0c0`
+        // 字符串不同）；空格格 r2c0 不发单元
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            [
+                "p0-b0",
+                "p0-b1",
+                "p0-b2-r0c0",
+                "p0-b2-r0c1",
+                "p0-b2-r0c2",
+                "p0-b2-r1c0",
+                "p0-b2-r1c1",
+                "p0-b2-r1c2",
+                "p0-b2-r2c1",
+                "p0-b2-r2c2",
+            ]
+        );
+        // header 标志：行号 < header_rows(1) → 首行 true、其余行 false；
+        // 段落类单元恒 false
+        assert!(
+            units.iter().all(|u| match u.id.as_str() {
+                "p0-b2-r0c0" | "p0-b2-r0c1" | "p0-b2-r0c2" => u.header,
+                _ => !u.header,
+            }),
+            "首行格 header=true，其余单元 header=false"
+        );
+        // 格阈值恒 1：单字符格 "V"/"A"/"是" 在默认 min_chars=2 下仍进流
+        for (id, text) in [("p0-b2-r1c1", "V"), ("p0-b2-r1c2", "是"), ("p0-b2-r2c1", "A")] {
+            let u = units.iter().find(|u| u.id == id).unwrap();
+            assert_eq!(u.text, text, "单字符格 {text} 不受 min_chars 洗刷");
+        }
+        // min_chars 只约束段落类：min_chars=5 时 4 字符段落被滤，8 个格照收
+        let units5 = to_translation_units_with(&doc, 5);
+        assert_eq!(units5.iter().filter(|u| u.kind == BlockKind::Table).count(), 8);
+        assert!(!units5.iter().any(|u| u.id == "p0-b1"), "段落按 min_chars=5 过滤");
+        // 单元字段承自所在块；章节上下文继承所在位置
+        let cell = units.iter().find(|u| u.id == "p0-b2-r1c0").unwrap();
+        assert_eq!(cell.kind, BlockKind::Table);
+        assert_eq!(cell.text, "电压");
+        assert_eq!(cell.chapter.as_deref(), Some("附录 参数表"));
+        assert_eq!(cell.page.as_deref(), Some("0"));
+    }
+
+    /// 无 rows 结构的 Table 块防御性跳过（块级 content 只是表头摘要，不发单元）。
+    #[test]
+    fn table_block_without_data_stays_out() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![Block {
+                    kind: BlockKind::Table,
+                    content: "参数速览（表头摘要）".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(to_translation_units(&doc).is_empty());
+    }
+
+    /// 仅译文：表格全命中格替换为译文，网格结构（行数/列数/分隔行）不变。
+    #[test]
+    fn bilingual_table_translation_only() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![table(&[&["表头甲", "表头乙"], &["格一", "格二"]], 0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated: Vec<(String, String)> = to_translation_units(&doc)
+            .iter()
+            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .collect();
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
+        assert_eq!(md, "| 译表头甲 | 译表头乙 |\n| --- | --- |\n| 译格一 | 译格二 |");
+        assert!(!md.contains("| 格一 |"), "原格文本被替换（译格是另一格值）");
+    }
+
+    /// 原/译对照：格内 `原文<br>译文`（Markdown 表格内换行本就用 `<br>`）。
+    #[test]
+    fn bilingual_table_inline_br() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![table(&[&["表头甲", "表头乙"], &["格一", "格二"]], 0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated: Vec<(String, String)> = to_translation_units(&doc)
+            .iter()
+            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .collect();
+        assert_eq!(
+            to_bilingual_markdown(&doc, &translated),
+            "| 表头甲<br>译表头甲 | 表头乙<br>译表头乙 |\n| --- | --- |\n| 格一<br>译格一 | 格二<br>译格二 |"
+        );
+    }
+
+    /// 原文+附录：表格单元不进附录，正文表格原样渲染（原文格保留）。
+    #[test]
+    fn bilingual_table_appendix_excludes_cells() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("正文一段。"), table(&[&["表头甲", "表头乙"], &["格一", "格二"]], 0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated: Vec<(String, String)> = to_translation_units(&doc)
+            .iter()
+            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .collect();
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
+        // 正文 = to_markdown 原样（表格原文保留）；附录只收段落类译文
+        assert_eq!(
+            md,
+            format!(
+                "{}\n\n---\n\n# 译文\n\n## （无章节）\n\n译正文一段。",
+                to_markdown(&doc)
+            )
+        );
+        assert!(md.contains("| 表头甲 | 表头乙 |"), "正文表格原样");
+        assert!(!md.contains("译表头甲") && !md.contains("译格一"), "格译文不进附录");
+    }
+
+    /// 无任何命中格的表格：输出与 to_markdown 的表格渲染逐字节一致（回归保护）。
+    #[test]
+    fn bilingual_table_without_hits_unchanged() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("正文一段。"), table(&[&["表头甲", "表头乙"], &["格一", "格二"]], 0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 只命中段落，表格格全部未命中（默认 BilingualInline：段内对照）
+        let translated = vec![("p0-b0".to_string(), "译正文一段。".to_string())];
+        let md = to_bilingual_markdown(&doc, &translated);
+        assert_eq!(
+            md,
+            format!("正文一段。\n译正文一段。\n\n{}", to_markdown(&doc).split("\n\n").last().unwrap())
+        );
+    }
+
+    /// 竖线转义：原格与译格里的裸 `|` 一律渲染为 `\|`（否则撕裂表格结构）；
+    /// to_markdown 的原文渲染同口径修正。
+    #[test]
+    fn table_cell_pipe_escaped() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![table(&[&["a|b", "c"], &["d", "e"]], 0)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 原文渲染：原格转义
+        assert_eq!(
+            to_markdown(&doc),
+            "| a\\|b | c |\n| --- | --- |\n| d | e |"
+        );
+        // 仅译文：译格 r0c1 含竖线 → 转义后注入
+        let translated = vec![("p0-b0-r0c1".to_string(), "x|y".to_string())];
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
+        assert_eq!(md, "| a\\|b | x\\|y |\n| --- | --- |\n| d | e |");
+        // 对照形态：译文中竖线同样转义
+        let md_inline = to_bilingual_markdown(&doc, &translated);
+        assert!(md_inline.contains("c<br>x\\|y"), "{md_inline}");
+    }
+
+    /// 往返闭环：提取侧发出的全部 id（译文 = 单元文本加前缀）喂入仅译文
+    /// 回写——段落与表格格全替换，Heading 保持层级，网格结构不变。
+    #[test]
+    fn roundtrip_translation_only_full_feed() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![
+                    heading("数据字典"),
+                    para("字段说明如下。"),
+                    table(&[&["字段", "类型"], &["id", "整数"]], 1),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 2 + 4, "标题 + 段落 + 2×2 格");
+        let translated: Vec<(String, String)> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .collect();
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
+        assert_eq!(
+            md,
+            "# 译-数据字典\n\n译-字段说明如下。\n\n| 译-字段 | 译-类型 |\n| --- | --- |\n| 译-id | 译-整数 |"
+        );
+        // 原表格行不复存在（精确串等价已证明全替换；此处防「原样残留」回归）
+        assert!(!md.contains("| 字段 | 类型 |"), "原表格行不应残留：{md}");
+        assert!(!md.lines().any(|l| l == "数据字典" || l.starts_with("字段说明如下。")));
     }
 
     // -------------------------------------------------------------------------

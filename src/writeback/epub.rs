@@ -54,7 +54,14 @@ pub fn writeback_epub(
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
     let raw = EpubRawBackend::default().parse(path_str)?;
     let doc = EpubPlugin.assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）不进本回写：内联候选复刻（is_translatable
+        // 本就排除 Table）按块序消费 units[cursor]，单元流同步排除才不错位；
+        // 表格在 XHTML 里保持原样。
+        // TODO(表格回写 wave2)：单元格级替换（table 树扫描 + colspan 对齐）
+        .filter(|u| u.kind != BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
 
     // B. spine 部件通道（与 EpubRawBackend::parse 的 spine 循环同款跳过规则）

@@ -3,7 +3,9 @@
 //! `structure_mode` 三态（对齐 Python `ooxml._semantic`）：
 //!
 //! * `raw` —— 只出文本：不做标题/列表识别、不做几何排序、表格压平成一段文本、
-//!   pptx 备注整体丢弃；assemble 阶段**不产块**，页文本 = 各行文本按 `\n` 拼接。
+//!   pptx 备注整体丢弃；页文本 = 各行文本按 `\n` 拼接。assemble 阶段**按行产
+//!   Paragraph 块**（docforge 刻意偏离 Python 的 `blocks=[]`：零块文档对翻译/
+//!   RAG 消费者等于不可用，见 office/mod.rs 的 flat 分支注释）。
 //! * `semantic` —— 全结构（历史行为）。
 //! * `auto` —— 按 cheap probe 路由：docx 看 `document.xml` 原始字节里的结构信号，
 //!   pptx 按**每张幻灯片**自己的形状数/表格/图表判定。

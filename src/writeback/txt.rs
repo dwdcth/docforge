@@ -73,7 +73,13 @@ pub fn writeback_txt(
     // B. 权威解析（提取侧同管线、同默认规则）拿 id / 文本
     let raw = TextParseCapability::default().parse(path_str)?;
     let doc = TextPlugin.assemble(&raw);
-    let units = crate::emit::to_translation_units(&doc);
+    let units: Vec<_> = crate::emit::to_translation_units(&doc)
+        .into_iter()
+        // 表格单元格单元（kind = Table）恒久不进 txt 回写：txt 无表格结构
+        //（解析侧只产 Heading/Paragraph），过滤纯防御——单元流与块流同一
+        // 口径，未来 txt 管线若有变化也不会错位。
+        .filter(|u| u.kind != crate::model::BlockKind::Table)
+        .collect();
     let map = translation_map(translated);
 
     // C. 重扫描原文行，产块 × 行区间（解析侧同口径）
