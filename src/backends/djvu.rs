@@ -569,7 +569,7 @@ mod tests {
         // 渲染恒为原生 scale=1 → dpi = 页 dpi
         assert_eq!(rp.coord_units, Some(CoordUnits::Px { dpi: sample::PAGE_DPI as f32 }));
         assert!(raw.needs_ocr, "存在识别文本页应标记 needs_ocr");
-        assert!(raw.meta.get("warnings").is_none(), "已识别不应再有告警");
+        assert!(!raw.meta.contains_key("warnings"), "已识别不应再有告警");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

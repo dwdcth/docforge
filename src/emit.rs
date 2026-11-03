@@ -249,7 +249,7 @@ fn is_rag_body(kind: BlockKind) -> bool {
     matches!(kind, BlockKind::Paragraph | BlockKind::Quote | BlockKind::List)
 }
 
-/// 按 [`DEFAULT_RAG_MAX_CHARS`]（1000 字符）把 Document 切成 RAG 检索块。
+/// 按 `DEFAULT_RAG_MAX_CHARS`（1000 字符）把 Document 切成 RAG 检索块。
 pub fn to_rag_chunks(doc: &Document) -> Vec<RagChunk> {
     to_rag_chunks_with(doc, DEFAULT_RAG_MAX_CHARS)
 }
@@ -265,7 +265,7 @@ pub fn to_rag_chunks(doc: &Document) -> Vec<RagChunk> {
 ///    开新块——贪心装填，每块完整入块、绝不在块内截断；
 /// 4. **单块自身超预算不硬切**：保语义完整，允许超长块独占一个 chunk
 ///    （是否二次切分留给下游按 embedding 模型上限决定）；
-/// 5. **Code/Table/Image 不进 chunk**（Chart/Note 同理，见 [`is_rag_body`]）。
+/// 5. **Code/Table/Image 不进 chunk**（Chart/Note 同理，见 `is_rag_body`）。
 ///
 /// 与 [`to_translation_units`] 的两处口径差异（均为 chunk 语义所迫）：
 /// - **页边界不是块边界**：物理分页无语义，正文跨页续接同一 chunk

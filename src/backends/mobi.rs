@@ -9,7 +9,7 @@
 //!   `content_as_string_lossy()`（L321-327）按压缩类型（无压缩/PalmDoc/HUFF，
 //!   palmdoch.rs L20-28）解压 readable 记录区间（L216-219，
 //!   `first_content_record..first_non_book_index`）拼出**整篇 HTML**。
-//! * **azw3/KF8 走自研解析（子模块 [`kf8`]）**：mobi crate 对 KF8 文件
+//! * **azw3/KF8 走自研解析（子模块 `kf8`）**：mobi crate 对 KF8 文件
 //!   **打开不报错但正文是乱码**（`MobiMetadata::from_reader` 对记录 0 无版本
 //!   校验，headers/mod.rs L60-128；KF8 记录是 RESC/SKELETON/fragment 结构且
 //!   每条带 trailing bytes，crate 无对应处理）——比报错更糟，故 azw3 必须
@@ -48,7 +48,7 @@
 //! registry 缓存），故构造最小 MOBI7/KF8 二进制金测（手工编字节；MOBI7
 //! 构造法与 mobi-rs 自带 src/book.rs 同源，KF8 按 kf8 模块头语义构造，
 //! 含 EXTH 121 boundary、SKEL/FRAG INDX、FDST、multibyte trailing），
-//! 另留 #[ignore] 真件集成测试位。
+//! 另留 `#[ignore]` 真件集成测试位。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -682,16 +682,16 @@ mod tests {
         body[0..4].copy_from_slice(&2u32.to_be_bytes()); // mobi_type @24
         body[4..8].copy_from_slice(&65001u32.to_be_bytes()); // text_encoding = UTF-8 @28
         body[12..16].copy_from_slice(&6u32.to_be_bytes()); // gen_version @36
-        body[56..60].copy_from_slice(&((n_text + 1) as u32).to_be_bytes()); // first_non_book @80
+        body[56..60].copy_from_slice(&(n_text + 1).to_be_bytes()); // first_non_book @80
         body[80..84].copy_from_slice(&8u32.to_be_bytes()); // format_version = 8 @104
         body[104..108].copy_from_slice(&0x40u32.to_be_bytes()); // exth_flags @128
         body[144..148].copy_from_slice(&(if f.drm { 100 } else { !0u32 }).to_be_bytes()); // drm_offset @168
-        body[168..172].copy_from_slice(&((n_text + 5) as u32).to_be_bytes()); // fdst 记录号 @192（相对）
+        body[168..172].copy_from_slice(&(n_text + 5).to_be_bytes()); // fdst 记录号 @192（相对）
         body[172..176].copy_from_slice(&2u32.to_be_bytes()); // fdst_cnt @196（>1 才采信）
         body[216..220].copy_from_slice(&1u32.to_be_bytes()); // extra_flags = 0x1（multibyte）@240
         body[220..224].copy_from_slice(&(!0u32).to_be_bytes()); // first_index @244
-        body[224..228].copy_from_slice(&((n_text + 3) as u32).to_be_bytes()); // frag_idx @248（相对）
-        body[228..232].copy_from_slice(&((n_text + 1) as u32).to_be_bytes()); // skel_idx @252（相对）
+        body[224..228].copy_from_slice(&(n_text + 3).to_be_bytes()); // frag_idx @248（相对）
+        body[228..232].copy_from_slice(&(n_text + 1).to_be_bytes()); // skel_idx @252（相对）
         body[232..236].copy_from_slice(&(!0u32).to_be_bytes()); // guide @256
         rec0.extend_from_slice(&body);
 

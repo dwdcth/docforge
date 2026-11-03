@@ -599,16 +599,11 @@ fn build_page(title: &str, blocks: Vec<Block>) -> Page {
 // ── 能力 / 插件 ─────────────────────────────────────────────────────
 
 /// 原始读取：把 spine 顺序的 XHTML 原文放进 `RawPage.items[0]`，书籍元数据进 `RawDoc.meta`。
+#[derive(Default)]
 pub struct EpubRawBackend {
     /// 提取 manifest 图片字节进首页 `images`（docforge 五件套，opt-in；
     /// M3 的图像 OCR 处理能力消费 `RawPage.images`）。
     pub ocr_images: bool,
-}
-
-impl Default for EpubRawBackend {
-    fn default() -> Self {
-        Self { ocr_images: false }
-    }
 }
 
 impl ParseCapability for EpubRawBackend {

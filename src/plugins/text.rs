@@ -494,7 +494,6 @@ mod m2_tests {
                 extra: vec![CustomRule { prefix: "Step ".to_string(), level: 2 }],
                 replace_builtin: false,
             },
-            ..Default::default()
         }
         .parse(p.to_str().unwrap())
         .unwrap();

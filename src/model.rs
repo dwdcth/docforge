@@ -63,7 +63,7 @@ pub enum CoordUnits {
     Logical,
 }
 
-/// 结构化表格：rows[row][col] = 单元格文本。
+/// 结构化表格：`rows[row][col]` = 单元格文本。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TableData {
     pub rows: Vec<Vec<String>>,

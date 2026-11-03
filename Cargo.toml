@@ -6,6 +6,9 @@ description = "通用文档解析：统一块级 IR + 格式路由 + PDF 页级�
 license = "MIT OR Apache-2.0"
 keywords = ["document", "parser", "ocr", "ir", "pdf"]
 categories = ["parser-implementations", "text-processing"]
+# 发布面收敛：本地工具/溯源 tarball（NOTICES 有 URL）/过程文档/大 fixture
+# 不进 crate（真件金测在仓库跑，包内优雅 skip）
+exclude = [".claude", "vendor", "docparse-plan.md", "docforge-spec-*.md", "tests/fixtures/chm"]
 
 [features]
 default = ["md", "csv", "html", "rtf"]

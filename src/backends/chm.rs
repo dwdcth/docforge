@@ -34,7 +34,7 @@
 //! * code 3 Title → `chm.title`；code 2 Default topic → `chm.default_topic`；
 //!   code 4 首个 DWORD LCID → `chm.lcid`（十进制）；
 //!   code 0 Contents file → 阅读序定位（内部用，不落 extra）。
-//! * 串解码启发式 [`system_string`]：偶长且 UTF-16LE 特征（结尾 NUL 对或
+//! * 串解码启发式 `system_string`：偶长且 UTF-16LE 特征（结尾 NUL 对或
 //!   高位字节全零）→ UTF-16LE；否则统一解码链（chardetng 概率探测 +
 //!   GB18030/Big5 固定回退——中文 ANSI 代码页书的主力路径）。
 //!   libchm 无 chmlib 式 #SYSTEM 解封，此 TLV 解析为本模块实现；拿不到
@@ -375,12 +375,14 @@ fn parse_system(bytes: &[u8]) -> SystemMeta {
 /// 未开 `encoding` feature 时退化为 lossy-utf8）。
 fn system_string(raw: &[u8]) -> String {
     let looks_utf16 = raw.len() >= 2
-        && raw.len() % 2 == 0
+        && raw.len().is_multiple_of(2)
         && ((raw[raw.len() - 2] == 0 && raw[raw.len() - 1] == 0)
-            || raw.chunks_exact(2).all(|p| p[1] == 0x00));
+            || raw.as_chunks::<2>().0.iter().all(|p| p[1] == 0x00));
     if looks_utf16 {
         let units: Vec<u16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| u16::from_le_bytes([p[0], p[1]]))
             .collect();
         let s = String::from_utf16_lossy(&units)
@@ -444,7 +446,7 @@ impl ParseCapability for ChmRawBackend {
 
         let mut pages: Vec<RawPage> = Vec::new();
         if let Some(hp) = &toc_path {
-            if let Some(bytes) = chm.read_path(hp).ok() {
+            if let Ok(bytes) = chm.read_path(hp) {
                 let hhc = crate::encoding::decode(bytes);
                 // 同一文件的不同锚点在 TOC 里常列成多项：按路径去重（首次为准）
                 let mut seen: HashSet<String> = HashSet::new();

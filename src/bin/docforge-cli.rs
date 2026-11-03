@@ -1,6 +1,6 @@
 //! docforge-cli：通用文档解析命令行（M2 雏形）。
 //!
-//! 用法：docforge-cli <输入文件> [选项]
+//! 用法：`docforge-cli <输入文件> [选项]`
 //!   --format md|json|text|units   输出格式（默认 md；units = 翻译单元 JSON 行）
 //!   --ocr auto|on|off             PDF OCR 模式（默认 auto；需 pdf feature）
 //!   --out <文件>                  输出到文件（默认 stdout）

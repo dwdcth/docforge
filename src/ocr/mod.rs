@@ -5,7 +5,7 @@
 //! - 测试可注入 mock（金测不依赖模型缓存）；
 //! - 其它引擎（Paddle/Tesseract 绑定）无需改 pdf 后端即可接入。
 //!
-//! `ocr-oar` feature 提供 oar-ocr 默认实现（[`oar`] 模块）。
+//! `ocr-oar` feature 提供 oar-ocr 默认实现（`oar` 模块）。
 
 pub mod images;
 

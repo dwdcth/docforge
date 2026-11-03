@@ -276,7 +276,7 @@ fn classify_line(raw: &str, rules: &ChapterRules) -> Option<(String, HeadingKind
     }
     // 自定义章级规则（level 1）
     for rule in &rules.extra {
-        if rule.level == 1 && match_custom_rule(&s, rule) {
+        if rule.level == 1 && match_custom_rule(s, rule) {
             return Some((s.to_string(), HeadingKind::Explicit));
         }
     }
@@ -330,7 +330,7 @@ fn classify_subsection(raw: &str, rules: &ChapterRules) -> Option<(String, u8, S
     }
     // 自定义小节规则（level 2/3）
     for rule in &rules.extra {
-        if matches!(rule.level, 2..=3) && match_custom_rule(&s, rule) {
+        if matches!(rule.level, 2..=3) && match_custom_rule(s, rule) {
             return Some((s.to_string(), rule.level, SubKind::Custom));
         }
     }
@@ -445,14 +445,16 @@ fn confirmed_subheadings(lines: &[&str], base: usize, rules: &ChapterRules) -> V
     // 文档经典的大小节配对（"一、大节" 下挂 "（一）小节"），互为兼容。
     // 点分与中文数字体系不互证——两套编号并存时误判面更大。
     // 自定义候选（Custom）自成一类，同类互证。
-    let compatible = |a: SubKind, b: SubKind| match (a, b) {
-        (SubKind::Dotted, SubKind::Dotted)
-        | (SubKind::Dun, SubKind::Dun)
-        | (SubKind::Paren, SubKind::Paren)
-        | (SubKind::Dun, SubKind::Paren)
-        | (SubKind::Paren, SubKind::Dun)
-        | (SubKind::Custom, SubKind::Custom) => true,
-        _ => false,
+    let compatible = |a: SubKind, b: SubKind| {
+        matches!(
+            (a, b),
+            (SubKind::Dotted, SubKind::Dotted)
+                | (SubKind::Dun, SubKind::Dun)
+                | (SubKind::Paren, SubKind::Paren)
+                | (SubKind::Dun, SubKind::Paren)
+                | (SubKind::Paren, SubKind::Dun)
+                | (SubKind::Custom, SubKind::Custom)
+        )
     };
     let mut confirmed = Vec::new();
     for (idx, &(i, lv, k)) in candidates.iter().enumerate() {

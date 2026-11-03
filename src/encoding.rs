@@ -15,7 +15,7 @@
 //! 3. UTF-8 strict（绝大多数现代文件在此命中）；
 //! 4. feature `encoding`（M2 中文编码链）：
 //!    a. chardetng 概率探测（置信闸门见下）——覆盖 Big5/Shift-JIS/EUC-KR/
-//!       Windows-125x 等固定链之外的编码；
+//!    Windows-125x 等固定链之外的编码；
 //!    b. GB18030 固定回退（GBK 家族，要求全程无解码错误）；
 //!    c. Big5 固定回退（同上）；
 //! 5. 全链未命中 → lossy UTF-8（替换字符）。

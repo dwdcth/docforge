@@ -23,7 +23,7 @@ impl ProcessCapability for LangDetect {
     }
 
     fn should_apply(&self, raw: &RawDoc) -> bool {
-        !raw.pages.is_empty() && raw.meta.get("language").is_none()
+        !raw.pages.is_empty() && !raw.meta.contains_key("language")
     }
 
     fn process(&self, raw: &mut RawDoc) -> Result<()> {

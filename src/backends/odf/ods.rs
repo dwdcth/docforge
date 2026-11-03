@@ -5,7 +5,7 @@
 //! 单元格取值优先级：`text:p` 里的显示文本 → `office:value` / `office:date-value` /
 //! `office:time-value` / `office:boolean-value` / `office:string-value`（显示文本为空时兜底）。
 //! `table:number-columns-repeated` / `number-rows-repeated` 按次数展开（上限见
-//! [`super::super::MAX_REPEAT`]），这样空列/空行的压缩表示不会吃掉内存。
+//! `MAX_REPEAT` = 1024），这样空列/空行的压缩表示不会吃掉内存。
 
 use crate::error::{DocError, Result};
 use crate::plugin::{ParseCapability, RawDoc, RawPage};

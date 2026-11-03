@@ -120,10 +120,10 @@ fn extract_attr(raw: &str, name: &str) -> Option<String> {
     let pos = lower.find(&key)?;
     let rest = raw[pos + key.len()..].trim_start();
     // 带引号：取到闭合引号（值可含空格）；无引号：取到空白/标签边界
-    let (v, end_ch): (&str, &[char]) = if rest.starts_with('"') {
-        (&rest[1..], &['"'])
-    } else if rest.starts_with('\'') {
-        (&rest[1..], &['\''])
+    let (v, end_ch): (&str, &[char]) = if let Some(v) = rest.strip_prefix('"') {
+        (v, &['"'])
+    } else if let Some(v) = rest.strip_prefix('\'') {
+        (v, &['\''])
     } else {
         (rest, &[' ', '\t', '>'])
     };
