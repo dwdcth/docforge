@@ -663,6 +663,8 @@ pub(crate) mod sample {
         }
         v.push("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into());
         v.push("/usr/share/fonts/wps-office/HYZYB5.ttf".into());
+        // 文泉驿正黑：Debian/Ubuntu 默认 CJK 字体路径（ttc 抽面同 Noto）
+        v.push("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc".into());
         v
     }
 
@@ -893,6 +895,60 @@ mod tests {
         dir
     }
 
+    /// pdftoppm 依赖用例的串行闸：PATH 操纵是进程级全局态，且子进程按 PATH
+    /// 解析，并行跑会互踩（M4 页内分治用例也渲染，与其共享此闸）。
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// pdftoppm 是否可用（缺 poppler-utils 的环境可用 ghostscript 顶替，
+    /// 见 prepare_renderer；对齐字体缺失的 skip 策略）。须持 PATH_LOCK 后调用。
+    fn pdftoppm_available() -> bool {
+        Command::new("pdftoppm").arg("-v").output().is_ok()
+    }
+
+    /// 无真 pdftoppm 时用 ghostscript 顶替（仅测试）：render_pages 只依赖
+    /// `pdftoppm -png -r DPI -f F -l L INPUT PREFIX` 的命令面与 `PREFIX-页码.png`
+    /// 产物命名，shim 脚本按同参数面调 gs 产出同名 PNG。有真 pdftoppm 优先
+    /// 用真的（返回 None）；两者皆无时返回 Err 由调用方 skip。
+    /// 限制：gs `%d` 对输出序编号，多页区间渲染的产物名会偏离页码——本套件
+    /// 的用例全部单页渲染（-f N -l N），不受影响。
+    fn prepare_renderer() -> std::result::Result<Option<PathBuf>, &'static str> {
+        if pdftoppm_available() {
+            return Ok(None);
+        }
+        const GS_SHIM: &str = r#"#!/bin/sh
+# docforge 测试 shim：pdftoppm 命令面 → ghostscript 单页渲染
+dpi=72; first=1; last=1; rest=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -png) ;;
+    -r) shift; dpi=$1 ;;
+    -f) shift; first=$1 ;;
+    -l) shift; last=$1 ;;
+    *) rest="$rest $1" ;;
+  esac
+  shift
+done
+set -- $rest
+gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
+  -dFirstPage="$first" -dLastPage="$last" \
+  -sOutputFile="$2-%d.png" "$1" >/dev/null 2>&1
+"#;
+        if Command::new("gs").arg("--version").output().is_err() {
+            return Err("缺 pdftoppm（poppler-utils）且缺 ghostscript，渲染依赖用例不跑");
+        }
+        let dir = std::env::temp_dir().join(format!("docforge-gs-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|_| "gs shim 目录创建失败")?;
+        let script = dir.join("pdftoppm");
+        std::fs::write(&script, GS_SHIM).map_err(|_| "gs shim 写入失败")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .map_err(|_| "gs shim 加执行位失败")?;
+        }
+        Ok(Some(dir))
+    }
+
     /// 回归：assemble 曾漏赋 Page.blocks（M4 DjVu 工人发现），Document 层
     /// 必须携带块（emit/翻译单元/RAG 全都消费 blocks）。
     #[test]
@@ -1041,10 +1097,11 @@ mod tests {
     }
 
     /// PATH 操纵使 pdftoppm 不可见：验证友好错误（NotFound 分支）。
-    /// 本用例会临时改写进程 PATH——依赖子进程的用例仅此与 #[ignore] 的
-    /// OCR 端到端（默认不跑），无并行互踩。
+    /// 本用例会临时改写进程 PATH——依赖子进程的用例（含 M4 页内分治）经
+    /// PATH_LOCK 与其互斥，无并行互踩。
     #[test]
     fn pdftoppm_missing_has_friendly_error() {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = probe_dir("noppm");
         let pdf = dir.join("mixed.pdf");
         if sample::generate_mixed_pdf(&pdf).is_none() {
@@ -1078,6 +1135,272 @@ mod tests {
         let err = result.expect_err("pdftoppm 不可见应报错");
         assert!(err.message.contains("找不到 pdftoppm"), "实际：{}", err.message);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 页内分治 Mock 引擎：无视裁剪图内容，固定返回 2 行（crop 局部像素
+    /// 坐标、左上原点），校验坐标换算与 Ocr 语义透传（形态对齐 ocr/images.rs
+    /// 的 MockEngine）。
+    struct MockRegionEngine;
+    impl crate::ocr::OcrEngine for MockRegionEngine {
+        fn name(&self) -> &str {
+            "mock-region"
+        }
+        fn recognize(
+            &self,
+            _image: &image::RgbaImage,
+        ) -> std::result::Result<Vec<crate::ocr::RecognizedLine>, String> {
+            Ok(vec![
+                crate::ocr::RecognizedLine {
+                    text: "图区识别行一".into(),
+                    score: 0.9,
+                    quad: [[100.0, 120.0], [500.0, 120.0], [500.0, 160.0], [100.0, 160.0]],
+                },
+                crate::ocr::RecognizedLine {
+                    text: "图区识别行二".into(),
+                    score: 0.8,
+                    quad: [[100.0, 300.0], [420.0, 300.0], [420.0, 340.0], [100.0, 340.0]],
+                },
+            ])
+        }
+    }
+
+    /// 页内分治端到端：intra_page=true + Mock 引擎 → 页 1 同时有文字层行与
+    /// Ocr 行，coord_units 统一 Pt，OCR 行 bbox 落在图区 pt 范围（±30pt）内。
+    /// 需渲染：有真 pdftoppm 用真的，否则 gs shim 顶替（prepare_renderer）。
+    #[test]
+    fn intra_page_split_ocr_fills_image_region() {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let shim = match prepare_renderer() {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("skip：{msg}");
+                return;
+            }
+        };
+        let dir = probe_dir("intra-ocr");
+        let pdf = dir.join("intra.pdf");
+        if sample::generate_intra_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let opts = PdfOptions {
+            intra_page: true,
+            engine: Some(std::sync::Arc::new(MockRegionEngine)),
+            ..Default::default()
+        };
+        // shim 目录前插 PATH（PATH_LOCK 保证与 PATH 操纵用例互斥），跑完还原
+        let old = std::env::var_os("PATH");
+        if let Some(d) = &shim {
+            let new = match old.as_ref() {
+                Some(p) => format!("{}:{}", d.display(), p.to_string_lossy()),
+                None => d.display().to_string(),
+            };
+            std::env::set_var("PATH", new);
+        }
+        let result = parse_pdf(&pdf, &opts);
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let raw = result.expect("页内分治解析失败");
+        assert_eq!(raw.pages.len(), 1);
+        let page = &raw.pages[0];
+        assert_eq!(page.coord_units, Some(CoordUnits::Pt), "混合页统一 Pt");
+        let text_rows = page
+            .items
+            .iter()
+            .filter(|i| i.source == BlockSource::TextLayer)
+            .count();
+        assert!(text_rows >= 3, "文字层行数 {text_rows} < 3，分治前置不成立");
+        let ocr: Vec<_> = page
+            .items
+            .iter()
+            .filter(|i| i.source == BlockSource::Ocr)
+            .collect();
+        assert_eq!(
+            ocr.len(),
+            2,
+            "实际行集：{:?}",
+            page.items.iter().map(|i| (&i.source, &i.text)).collect::<Vec<_>>()
+        );
+        for it in &ocr {
+            assert!(it.confidence.unwrap_or(0.0) > 0.0, "OCR 行应带正置信度");
+            let b = it.bbox.expect("OCR 行应有 bbox");
+            // 图区 pt：x 40–460、y 40–340，±30pt 容差粗断言
+            assert!(b.x0 > 10.0 && b.x1 < 490.0, "OCR 行 x 越出图区±30pt：{b:?}");
+            assert!(b.y0 > 10.0 && b.y1 < 370.0, "OCR 行 y 越出图区±30pt：{b:?}");
+        }
+        // 阅读序合并：整页 y1 非升序（文字层在上、两行 OCR 在图区）
+        let bboxes: Vec<_> = page.items.iter().filter_map(|i| i.bbox).collect();
+        for w in bboxes.windows(2) {
+            assert!(w[0].y1 >= w[1].y1, "阅读序破坏：{bboxes:?}");
+        }
+        // 混合分治页顺手填页面 pt 尺寸（A4 ≈ 595×842，渲染反推）
+        let (w, h) = (page.width.unwrap_or(0.0), page.height.unwrap_or(0.0));
+        assert!(w > 560.0 && w < 630.0 && h > 810.0 && h < 870.0, "页面尺寸异常：{w}×{h}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// intra_page 缺省（false）与现状等价：同一件纯直提，无 Ocr 行。
+    #[test]
+    fn intra_page_off_by_default_equivalent() {
+        let dir = probe_dir("intra-off");
+        let pdf = dir.join("intra.pdf");
+        if sample::generate_intra_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let raw = parse_pdf(&pdf, &PdfOptions::default()).expect("默认解析失败");
+        assert_eq!(raw.pages.len(), 1);
+        assert!(!raw.pages[0].items.is_empty(), "文字层直提不应为空");
+        assert!(
+            raw.pages[0].items.iter().all(|i| i.source == BlockSource::TextLayer),
+            "默认不开 intra_page 不应出现 Ocr 行"
+        );
+        assert_eq!(raw.pages[0].coord_units, Some(CoordUnits::Pt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// intra_page 开 + 无引擎：判定为真也不失败，纯直提 + 一条"未 OCR"告警。
+    #[test]
+    fn intra_page_no_engine_warns_not_fails() {
+        let dir = probe_dir("intra-noeng");
+        let pdf = dir.join("intra.pdf");
+        if sample::generate_intra_mixed_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let opts = PdfOptions { intra_page: true, ..Default::default() };
+        let raw = parse_pdf(&pdf, &opts).expect("无引擎不应失败");
+        assert!(!raw.pages[0].items.is_empty(), "纯直提不应为空");
+        assert!(
+            raw.pages[0].items.iter().all(|i| i.source == BlockSource::TextLayer),
+            "无引擎不应出现 Ocr 行"
+        );
+        let w = raw.meta.get("warnings").expect("应有告警");
+        assert!(w.contains("未 OCR") && w.contains("无引擎"), "实际告警：{w}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// needs_intra_page_split 判定单测：大图+少文字→false（防越权）；
+    /// 大图+文字够+无覆盖→true；小图/扁条→false；文字覆盖图 30%+→false。
+    fn img_item(x: f32, y: f32, w: f32, h: f32) -> pdf_inspector::TextItem {
+        pdf_inspector::TextItem {
+            text: "[Image: t]".into(),
+            x,
+            y,
+            width: w,
+            height: h,
+            font: String::new(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
+            font_size: 0.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            font_weight: None,
+            bold_source: None,
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: ItemType::Image,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    fn text_line(x0: f32, y0: f32, x1: f32, y1: f32) -> RawTextItem {
+        RawTextItem {
+            text: "行".into(),
+            bbox: Some(Rect { x0, y0, x1, y1 }),
+            source: BlockSource::TextLayer,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn needs_intra_page_split_unit() {
+        // 大图：400×300 = 120_000 pt² ≥ 96_000，高 300 ≥ 60
+        let big = img_item(60.0, 40.0, 400.0, 300.0);
+        // 文字够：3 行，全在图外（上半页）
+        let lines = [
+            text_line(0.0, 600.0, 500.0, 614.0),
+            text_line(0.0, 620.0, 500.0, 634.0),
+            text_line(0.0, 640.0, 500.0, 654.0),
+        ];
+        // 大图 + 少文字 → false（文字太少的页归页级路由管，防越权）
+        assert!(!needs_intra_page_split(&lines[..2], std::slice::from_ref(&big)));
+        // 大图 + 文字够 + 无覆盖 → true
+        assert!(needs_intra_page_split(&lines, std::slice::from_ref(&big)));
+        // 小图（面积不足）→ false
+        let small = img_item(60.0, 40.0, 100.0, 40.0);
+        assert!(!needs_intra_page_split(&lines, std::slice::from_ref(&small)));
+        // 扁宽装饰条：面积够（100_000 pt²）但高 < 60 → false
+        let strip = img_item(0.0, 40.0, 2000.0, 50.0);
+        assert!(!needs_intra_page_split(&lines, &[strip]));
+        // 文字行覆盖图 41%（>30%）→ false（文字层已覆盖，防双份）
+        // 覆盖行 (70,50)-(450,180)：重叠 380×130 = 49_400 / 120_000 ≈ 41%
+        let cover = [text_line(70.0, 50.0, 450.0, 180.0), lines[1].clone(), lines[2].clone()];
+        assert!(!needs_intra_page_split(&cover, &[big]));
+    }
+
+    /// 裁剪探针引擎：把拿到的裁剪图尺寸作为"识别文本"返回，并把行画在
+    /// 裁剪图 (0,0)-(10,10)——借以精确校验 pt→px 裁剪矩形与 px→pt 翻转换算。
+    struct CropProbeEngine;
+    impl crate::ocr::OcrEngine for CropProbeEngine {
+        fn name(&self) -> &str {
+            "crop-probe"
+        }
+        fn recognize(
+            &self,
+            image: &image::RgbaImage,
+        ) -> std::result::Result<Vec<crate::ocr::RecognizedLine>, String> {
+            Ok(vec![crate::ocr::RecognizedLine {
+                text: format!("{}x{}", image.width(), image.height()),
+                score: 0.9,
+                quad: [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            }])
+        }
+    }
+
+    /// crop_and_ocr_region 坐标换算单测（无渲染依赖）：A4@200dpi 整页图
+    /// 1654×2339，图区 pt (60,40)-(460,340) → 裁剪 px x 166→1278、y 1394→2228
+    /// （1112×834）；探针行（裁剪图左上 10×10）→ 整页 pt x ≈59.76–63.36、
+    /// y ≈336.6–340.2（上缘贴图区上缘 340，y 已翻转）。
+    #[test]
+    fn crop_and_ocr_region_maps_coords() {
+        let page = image::RgbaImage::new(1654, 2339);
+        let h_pt = 2339.0 * 72.0 / 200.0; // 842.04，与渲染反推一致
+        let rect = Rect { x0: 60.0, y0: 40.0, x1: 460.0, y1: 340.0 };
+        let items = crop_and_ocr_region(&page, rect, 200, h_pt, &CropProbeEngine).unwrap();
+        assert_eq!(items.len(), 1);
+        // 裁剪矩形推导：x 166..1278、y 1394..2228
+        assert_eq!(items[0].text, "1112x834", "裁剪 px 尺寸不符");
+        // 翻转换算：探针行贴裁剪图左上 → 整页 pt 贴图区左上（60,340）
+        let b = items[0].bbox.expect("OCR 行应有 bbox");
+        assert!((b.x0 - 59.76).abs() < 1.5, "x0 实际 {}", b.x0);
+        assert!((b.x1 - 63.36).abs() < 1.5, "x1 实际 {}", b.x1);
+        assert!((b.y0 - 336.6).abs() < 1.5, "y0 实际 {}", b.y0);
+        assert!((b.y1 - 340.2).abs() < 1.5, "y1 实际 {}（应≈图区上缘 340）", b.y1);
+        assert!(b.y0 < b.y1, "翻转后 y 语义应保持 y0=下缘 < y1=上缘");
+    }
+
+    /// 阅读序合并单测：y1 降序（页面上方在前），同 y 按 x0 升序。
+    #[test]
+    fn merge_by_reading_order_sorts_y_desc_x_asc() {
+        let top = text_line(100.0, 700.0, 200.0, 714.0);
+        let low_left = text_line(10.0, 300.0, 90.0, 314.0);
+        let low_right = text_line(300.0, 300.0, 380.0, 314.0);
+        let merged =
+            merge_by_reading_order(vec![top.clone()], vec![low_right.clone(), low_left.clone()]);
+        assert_eq!(merged[0].bbox, top.bbox, "y1 大的行在前");
+        assert_eq!(merged[1].bbox, low_left.bbox, "同 y 按 x0 升序");
+        assert_eq!(merged[2].bbox, low_right.bbox);
     }
 
     /// 混合件 Auto + oar 引擎端到端：`cargo test --features ocr-oar -- --ignored`。
