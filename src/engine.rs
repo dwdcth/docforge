@@ -1,14 +1,57 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① crate 名引用替换；② 组装段在 finalize 前挂
 // FormatPlugin::enrich_meta 后置钩子（格式特有元数据 → DocMeta.extra）；
-// ③ 无插件报错附 feature 自查提示（fmt_feature_hint 静态映射 + 对应单测）。
+// ③ 无插件报错附 feature 自查提示（fmt_feature_hint 静态映射 + 对应单测）；
+// ④ engine 级粗粒度进度钩子（ParsePhase / ProgressFn / with_progress，四阶段
+// 边界各通知一次；页级粒度与取消仍在各后端 Options，如 PdfOptions.on_progress）。
 //! 文档引擎：sniff → 解析链（回退保留原始错误码）→ 处理链（失败仅记录）→ assemble。
+//!
+//! 可选引擎级进度钩子（[`ProgressFn`]）在各阶段边界发粗粒度通知，覆盖全部
+//! 格式（大 CHM / epub / 压缩包这类黑盒解析的最小观测面）；页级细粒度与
+//! 取消由各后端 Options 的回调提供（如 `PdfOptions::on_progress`），两者
+//! 并存、互不替代。未挂钩子时零开销（一次判空，无分配）。
 
 use crate::error::{DocError, ErrorCode, Result};
 use crate::model::Document;
 use crate::policy::BackendPolicy;
 use crate::registry::Registry;
 use crate::router;
+
+/// 引擎级解析阶段（粗粒度进度通知；页级粒度见各后端 Options 的回调，
+/// 如 `PdfOptions::on_progress`——本枚举只标注"走到哪一步"，不含取消语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsePhase {
+    /// 嗅探完成（通知体 = 嗅探出的格式名，如 `"txt"`）
+    Sniffed,
+    /// 解析能力完成（通知体 = 成功产出的解析能力 id，如 `"text.read.txt"`；
+    /// 解析链回退时只有最终成功的那一项通知）
+    Parsed,
+    /// 处理链单项完成（通知体 = 能力 id）。仅通知**实际执行**的单项：
+    /// `should_apply` 为 false 被跳过的不通知；`process` 失败也通知
+    /// （失败不致命，链继续，错误落 warnings）。
+    Processed,
+    /// 组装完成（`finalize` 统计回填前发出；无附加标识，通知体为空串）
+    Assembled,
+}
+
+impl ParsePhase {
+    /// 通知体描述符：该阶段回调第二参数承载的标识类型——`Sniffed` 为
+    /// 格式名、`Parsed` / `Processed` 为能力 id、`Assembled` 无附加标识
+    /// （空串）。实际值随 `parse` 的调用点给出（运行时数据），这里只给
+    /// 静态描述，供通用消费者（UI / 日志）解释第二参数的含义。
+    pub fn detail(&self) -> &'static str {
+        match self {
+            ParsePhase::Sniffed => "fmt",
+            ParsePhase::Parsed | ParsePhase::Processed => "capability id",
+            ParsePhase::Assembled => "",
+        }
+    }
+}
+
+/// 引擎级进度通知（只通知不取消——页级取消在各后端 Options，如
+/// `PdfOptions::on_progress` 返回 false 的截停语义）。全同步：实现方
+/// 不得在回调里重入同一 engine。
+pub type ProgressFn = std::sync::Arc<dyn Fn(ParsePhase, &str) + Send + Sync>;
 
 /// 格式名 → feature 自查提示：`没有可处理该格式的插件` 报错时的指路映射。
 ///
@@ -50,10 +93,12 @@ fn no_plugin_message(fmt: &str) -> String {
     format!("没有可处理该格式的插件: {fmt}{hint}")
 }
 
-/// 文档引擎：注册表 + 策略。
+/// 文档引擎：注册表 + 策略 + 可选进度钩子。
 pub struct DocumentEngine {
     pub registry: Registry,
     pub policy: BackendPolicy,
+    /// 引擎级进度钩子（默认 `None`：零回调、零分配）。
+    progress: Option<ProgressFn>,
 }
 
 impl DocumentEngine {
@@ -61,6 +106,7 @@ impl DocumentEngine {
         Self {
             registry,
             policy: BackendPolicy::default(),
+            progress: None,
         }
     }
 
@@ -69,8 +115,26 @@ impl DocumentEngine {
         self
     }
 
+    /// 挂引擎级进度钩子（builder 风格）。设置后 [`Self::parse`] 在各阶段
+    /// 边界回调（见 [`ParsePhase`]）；不设置则全程零回调。页级细粒度与
+    /// 取消走各后端 Options 的回调（如 `PdfOptions::on_progress`），与本
+    /// 钩子并存：前者回答"走到哪一步"，后者回答"第几页/能否停"。
+    pub fn with_progress(mut self, cb: ProgressFn) -> Self {
+        self.progress = Some(cb);
+        self
+    }
+
+    /// 进度分发：未挂钩子时一次判空即返回（无分配、无回调）。
+    fn notify(&self, phase: ParsePhase, detail: &str) {
+        if let Some(cb) = self.progress.as_ref() {
+            cb(phase, detail);
+        }
+    }
+
     pub fn parse(&self, path: &str) -> Result<Document> {
         let fmt = router::sniff(path)?;
+        // ⓪ 嗅探完成：通知体为格式名（此时插件可能仍缺失——格式已认定）
+        self.notify(ParsePhase::Sniffed, fmt);
         let plugin = self
             .registry
             .plugin_for(fmt)
@@ -85,6 +149,9 @@ impl DocumentEngine {
         for cap in caps {
             match cap.parse(path) {
                 Ok(r) => {
+                    // ① 解析链成功：通知体为最终成功的那项能力 id
+                    //（回退链里先失败的后端不通知，失败信息走错误返回）
+                    self.notify(ParsePhase::Parsed, cap.id());
                     raw = Some(r);
                     break;
                 }
@@ -109,7 +176,11 @@ impl DocumentEngine {
         let mut warnings = Vec::new();
         for proc in proc_chain {
             if proc.should_apply(&raw) {
-                if let Err(e) = proc.process(&mut raw) {
+                // ② 单项处理尝试结束即通知（失败也通知——失败不致命，
+                // 错误落 warnings，链继续）；被 should_apply 跳过的不通知
+                let outcome = proc.process(&mut raw);
+                self.notify(ParsePhase::Processed, proc.id());
+                if let Err(e) = outcome {
                     warnings.push(format!("{}: {e}", proc.id()));
                 }
             }
@@ -131,6 +202,9 @@ impl DocumentEngine {
         if let Some(lang) = raw.meta.get("language") {
             doc.meta.extra.insert("language".to_string(), lang.clone());
         }
+        // ③ 组装完成：finalize 统计回填前发出（文档结构已就绪，仅差
+        // text_length 等统计字段；无附加标识，通知体空串）
+        self.notify(ParsePhase::Assembled, "");
         Ok(doc.finalize())
     }
 }
@@ -245,6 +319,86 @@ mod tests {
             err.message,
             "没有可处理该格式的插件: docx（在 Cargo.toml 的 docforge 依赖加 features = [\"docx\"] 后重新编译）"
         );
+    }
+
+    /// 引擎级进度钩子按序通知：txt 件走 parse_with_progress，四阶段边界
+    /// 各一条（txt 无处理链 → 无 Processed；lang-detect feature 开启时
+    /// default_process_chain 含 "lang-detect"，多一条 Processed）。
+    #[test]
+    fn progress_phases_reported_in_order() {
+        // 长度越过 lang-detect 的最小采样线（MIN_SAMPLE_CHARS = 50），
+        // 让 Processed 分支对应一次真实检测而非仅空跑
+        let p = write_tmp(
+            "prog.txt",
+            "docforge 引擎级进度钩子端到端验证：嗅探、解析、处理链与组装四个阶段\
+             各在边界发出一条粗粒度通知，文本长度需越过语言检测的最小采样阈值。",
+        );
+        let phases: std::sync::Arc<std::sync::Mutex<Vec<(ParsePhase, String)>>> = Default::default();
+        let sink = phases.clone();
+        let cb: ProgressFn = std::sync::Arc::new(move |phase, detail| {
+            sink.lock().unwrap().push((phase, detail.to_string()));
+        });
+        let doc = crate::parse_with_progress(&p, cb).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(doc.meta.file_type, "txt");
+
+        // 阶段序列（cfg 分支：lang-detect 开/关决定是否含 Processed）
+        let got: Vec<ParsePhase> = phases.lock().unwrap().iter().map(|(ph, _)| *ph).collect();
+        #[cfg(feature = "lang-detect")]
+        {
+            assert_eq!(
+                got,
+                [
+                    ParsePhase::Sniffed,
+                    ParsePhase::Parsed,
+                    ParsePhase::Processed,
+                    ParsePhase::Assembled
+                ]
+            );
+        }
+        #[cfg(not(feature = "lang-detect"))]
+        {
+            assert_eq!(
+                got,
+                [ParsePhase::Sniffed, ParsePhase::Parsed, ParsePhase::Assembled]
+            );
+        }
+
+        // 通知体：Sniffed = 格式名，Parsed = 成功解析能力 id，
+        // Processed（lang-detect）= 能力 id，Assembled = 空串
+        let collected = phases.lock().unwrap();
+        let details: Vec<&str> = collected.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(details[0], "txt");
+        assert_eq!(details[1], "text.read.txt");
+        #[cfg(feature = "lang-detect")]
+        assert_eq!(details[2], "lang-detect");
+        assert_eq!(details[details.len() - 1], "");
+    }
+
+    /// 默认路径零回调：`parse()` 便捷函数与 `DocumentEngine::new` 均不挂钩子
+    /// （progress 字段为 None），全程通知计数保持 0。
+    #[test]
+    fn progress_disabled_by_default() {
+        let p = write_tmp("prog_off.txt", "hello\n");
+        // 已武装的计数钩子：不被任何默认装配持有——若默认路径错误触发了
+        // 通知，计数立即非零（含未来引入环境级/线程局部钩子的回归防护）
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = count.clone();
+        let _armed: ProgressFn = std::sync::Arc::new(move |_phase, _detail| {
+            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 便捷函数 parse()：自建默认引擎（无钩子）
+        let doc = crate::parse(&p).unwrap();
+        assert_eq!(doc.meta.file_type, "txt");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // 构造路径：builder 未调 with_progress 时字段保持 None
+        let eng = engine();
+        assert!(eng.progress.is_none());
+        assert!(eng.parse(&p).is_ok());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

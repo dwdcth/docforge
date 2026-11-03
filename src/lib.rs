@@ -48,7 +48,7 @@ pub mod policy;
 pub mod registry;
 pub mod router;
 
-pub use engine::DocumentEngine;
+pub use engine::{DocumentEngine, ParsePhase, ProgressFn};
 pub use error::{DocError, ErrorCode, Result};
 // 编码探测（横切能力）：decode 对外兼容（原 plugins::text::decode），
 // detect_and_decode 返回"解码结果 + 命中编码名"（rumi 等外部消费者入口）
@@ -62,19 +62,12 @@ pub use plugin::{
 };
 pub use registry::{Registry, RegistryError};
 
-/// 便捷解析：默认 Registry 装配（文本族内置 + pdf feature 开启时注册
+/// 默认 Registry 装配（文本族内置 + pdf feature 开启时注册
 /// `PdfOptions::default()`）。发布版不内置 OCR 引擎（git 依赖不上 crates.io），
-/// 引擎一律注入：见 [`ocr::OcrEngine`]。
-///
-/// 自定义装配（注入引擎/选项/后端）用 [`Registry`] + [`DocumentEngine`]。
-///
-/// ```no_run
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let doc = docforge::parse("note.md")?;
-/// println!("{} 页", doc.pages.len());
-/// # Ok(()) }
-/// ```
-pub fn parse(path: &str) -> Result<Document> {
+/// 引擎一律注入：见 [`ocr::OcrEngine`]。[`parse`] 与 [`parse_with_progress`]
+/// 共用此装配；自定义装配（注入引擎/选项/后端）用 [`Registry`] +
+/// [`DocumentEngine`]。
+fn default_registry() -> Registry {
     let mut registry = Registry::new();
     plugins::text::register_defaults(&mut registry);
     #[cfg(feature = "docx")]
@@ -114,5 +107,39 @@ pub fn parse(path: &str) -> Result<Document> {
         };
         crate::backends::pdf::register(&mut registry, opts);
     }
-    DocumentEngine::new(registry).parse(path)
+    registry
+}
+
+/// 便捷解析：默认 Registry 装配。
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let doc = docforge::parse("note.md")?;
+/// println!("{} 页", doc.pages.len());
+/// # Ok(()) }
+/// ```
+pub fn parse(path: &str) -> Result<Document> {
+    DocumentEngine::new(default_registry()).parse(path)
+}
+
+/// 便捷解析 + 引擎级进度钩子：[`parse`] 的默认装配外加
+/// [`DocumentEngine::with_progress`]——大文件黑盒格式（大 CHM / epub /
+/// 压缩包等无页级回调的后端）的最小进度观测面。只通知不取消；页级
+/// 细粒度与取消由对应后端 Options 提供（如 `PdfOptions::on_progress`），
+/// 与本钩子并存。
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use docforge::{parse_with_progress, ParsePhase};
+/// use std::sync::Arc;
+/// let doc = parse_with_progress("big.chm", Arc::new(|phase: ParsePhase, detail: &str| {
+///     println!("{phase:?}: {detail}");
+/// }))?;
+/// println!("{} 页", doc.pages.len());
+/// # Ok(()) }
+/// ```
+pub fn parse_with_progress(path: &str, cb: ProgressFn) -> Result<Document> {
+    DocumentEngine::new(default_registry())
+        .with_progress(cb)
+        .parse(path)
 }
