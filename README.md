@@ -10,11 +10,15 @@ pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译
 | 期 | 内容 | 状态 |
 | --- | --- | --- |
 | M0 | 工程骨架 + docparser-core 吸收 + IR 定稿（confidence/source/coord_units） | ✅ |
-| M1 | PDF 后端（页级路由 + oar-ocr OCR 接入） | — |
-| M2 | 文本族增强（GBK/Big5 编码链、中文章节切分）+ DOCX + EPUB + emit + cli | — |
-| M3 | XLSX/PPTX/ODF + RTF + 内嵌图片 OCR 链 | — |
-| M4 | DjVu + 页内混合路由 + RAG 分块 emit | — |
-| M5 | FB2/MOBI/CBZ 电子书扩展 | — |
+| M1 | PDF 后端（页级路由 + OcrEngine 注入式抽象） | ✅ |
+| M2 | 文本族增强（编码链/中文章节/翻译单元/emit/cli/lang-detect）+ DOCX/EPUB + HTML 修补 | ✅ |
+| M3 | XLSX/PPTX/ODF + RTF GBK + 内嵌图 OCR 处理链 | ✅ |
+| M4 | DjVu（djvu-rs）+ 页内混合路由（intra_page 实验特性）+ RAG 分块 emit | ✅ |
+| M5 | FB2 / MOBI（MOBI7）/ CBZ 电子书扩展 | ✅ |
+| 增强 | md 解析升级（pulldown-cmark+GFM+frontmatter）、TXT 分节（1.1/一、/（一））、chardetng 编码探测、章节规则可配置 | ✅ |
+
+环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
+ghostscript shim；详见 docs/开发记录.md）。
 
 规划：[docparse-plan.md](docparse-plan.md)；各期规格：`docforge-spec-*.md`。
 
