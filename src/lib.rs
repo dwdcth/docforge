@@ -82,6 +82,8 @@ pub fn parse(path: &str) -> Result<Document> {
     crate::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "archive")]
     crate::backends::archive::register_defaults(&mut registry);
+    #[cfg(feature = "chm")]
+    crate::backends::chm::register_defaults(&mut registry);
     #[cfg(feature = "cbz")]
     crate::backends::cbz::register_defaults(&mut registry);
     #[cfg(feature = "image-files")]

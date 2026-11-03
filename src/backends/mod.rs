@@ -13,6 +13,8 @@ pub mod odf;
 pub mod cbz;
 #[cfg(feature = "archive")]
 pub mod archive;
+#[cfg(feature = "chm")]
+pub mod chm;
 #[cfg(feature = "image-files")]
 pub mod image_files;
 #[cfg(feature = "djvu")]

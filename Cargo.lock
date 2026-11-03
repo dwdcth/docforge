@@ -957,6 +957,7 @@ dependencies = [
  "djvu-rs",
  "encoding_rs",
  "image",
+ "libchm",
  "log",
  "md-5 0.10.6",
  "mobi",
@@ -1721,6 +1722,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libchm"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "474e241c4bcbfe250a9b5658ae1844eb81c868c812fda38e926305facf046725"
+dependencies = [
+ "bitflags 2.13.2",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "libfuzzer-sys"

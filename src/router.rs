@@ -126,6 +126,11 @@ pub fn sniff(path: &str) -> Result<&'static str> {
     if h.starts_with(PDF_MAGIC) {
         return Ok("pdf");
     }
+
+    // CHM：ITSF 头 magic 直判；无 magic 的 .chm 扩展名兜底（伪装件由后端报 corrupt）
+    if h.starts_with(b"ITSF") || ext == "chm" {
+        return Ok("chm");
+    }
     if RTF_EXT.contains(&ext.as_str()) {
         // 内容合法性（`{\rtf` 头）由 rtf 后端判；这里不抢判，避免伪装件被当纯文本
         return Ok("rtf");

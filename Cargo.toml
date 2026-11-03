@@ -39,6 +39,8 @@ djvu = ["dep:djvu-rs", "ocr"]
 fb2 = ["dep:quick-xml", "dep:base64", "dep:zip"]
 # 图像直读（png/jpg 等单图即文档：字节透传 + ocr-images 图→文链）
 image-files = ["dep:image", "ocr"]
+# CHM（Microsoft 帮助文档：libchm 纯 Rust 读 + .hhc 阅读序 + #SYSTEM 元数据）
+chm = ["dep:libchm", "html"]
 # 压缩包容器（zip/rar/7z 内层文本多页合并；rar 走纯 Rust rars，7z 走 sevenz-rust2）
 archive = ["dep:zip", "dep:rars", "dep:sevenz-rust2"]
 # CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
@@ -68,6 +70,10 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.libchm]
+version = "0.3.1"
 optional = true
 
 [dependencies.rars]
