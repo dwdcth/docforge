@@ -36,6 +36,7 @@
 
 pub mod backends;
 pub mod emit;
+pub mod encoding;
 pub mod engine;
 pub mod error;
 pub mod model;
@@ -49,6 +50,9 @@ pub mod router;
 
 pub use engine::DocumentEngine;
 pub use error::{DocError, ErrorCode, Result};
+// 编码探测（横切能力）：decode 对外兼容（原 plugins::text::decode），
+// detect_and_decode 返回"解码结果 + 命中编码名"（rumi 等外部消费者入口）
+pub use encoding::{decode, detect_and_decode};
 pub use model::{
     Block, BlockKind, BlockSource, CoordUnits, DocMeta, Document, Image, Page, Rect, TableData,
 };

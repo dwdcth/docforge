@@ -471,12 +471,16 @@ fn read_entry_bytes(
 }
 
 /// 条目解码：UTF-8（绝大多数）→ XML 声明嗅探的非 UTF-8（docforge 五件套，
-/// feature `encoding` 下用 encoding_rs；未开则 lossy）→ lossy 兜底。
+/// feature `encoding` 下用 encoding_rs；未开则嗅探仅供参考）→
+/// [`crate::encoding::decode`] 兜底——嗅探未命中时走统一解码链（BOM/UTF-16
+/// / chardetng 概率探测 + GB18030/Big5 固定回退），EPUB 内非 UTF-8 且
+/// 无声明的条目同样受益；全链未命中才 lossy。
 fn decode_entry(bytes: &[u8]) -> String {
     if std::str::from_utf8(bytes).is_ok() {
         return String::from_utf8_lossy(bytes).into_owned();
     }
-    // XML 声明嗅探：前 1KB 内找 encoding="..."
+    // XML 声明嗅探（先验：XML 自带的 encoding 声明比概率探测可信）：前 1KB
+    // 内找 encoding="..."
     let head = &bytes[..bytes.len().min(1024)];
     let head_lossy = String::from_utf8_lossy(head);
     if let Some(enc) = head_lossy
@@ -495,7 +499,7 @@ fn decode_entry(bytes: &[u8]) -> String {
             for label in [&enc, &enc.replace('_', "-")] {
                 if let Some(cs) = encoding_rs::Encoding::for_label(label.as_bytes()) {
                     if cs == encoding_rs::UTF_8 {
-                        break; // 声明 UTF-8 但字节非法：走 lossy
+                        break; // 声明 UTF-8 但字节非法：交给统一解码链兜底
                     }
                     let (s, _, had_err) = cs.decode(bytes);
                     if !had_err {
@@ -504,9 +508,12 @@ fn decode_entry(bytes: &[u8]) -> String {
                 }
             }
         }
-        let _ = enc; // 未开 encoding feature：嗅探结果仅供参考，lossy 兜底
+        let _ = enc; // 未开 encoding feature：嗅探结果仅供参考，走统一解码链
     }
-    String::from_utf8_lossy(bytes).into_owned()
+    // 声明未命中 / 声明编码解码失败：统一解码链兜底（获得 chardetng +
+    // GB18030/Big5 能力；EPUB 条目不会有 BOM 开头的合法 UTF-8——strict 已在
+    // 入口命中，非 UTF-8 件由探测/固定链认领，最后才 lossy）
+    crate::encoding::decode(bytes.to_vec())
 }
 
 fn year_of(date: &str) -> String {

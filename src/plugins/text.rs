@@ -1,7 +1,8 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
-// docforge 改动：① feature `encoding` 下 decode 增加编码回退——chardetng
-//    概率探测（置信闸门，覆盖 Big5/Shift-JIS/EUC-KR/Windows-125x 等）
-//    + GB18030/Big5 固定回退（M2）；
+// docforge 改动：① feature `encoding` 下编码回退——chardetng 概率探测
+//    （置信闸门，覆盖 Big5/Shift-JIS/EUC-KR/Windows-125x 等）+ GB18030/Big5
+//    固定回退（M2）；解码链后抽出为横切能力模块 [`crate::encoding`]（本文件
+//    以 `pub use` 转发 [`decode`]，旧调用点零改动）；
 // ② parse 集成中文章节切分（chapter.rs：章标题产 level=1 item；章内小节
 //    产 level=2/3 item，小节行从段落剥离，按行号回插保序）；
 // ③ assemble 将 level 映射为 Heading 块；④ feature `lang-detect` 下
@@ -12,8 +13,10 @@
 //! 这四类**不走 PDF**：没有布局与坐标，转 PDF 是纯粹的有损往返，直接按语法解。
 //!
 //! 分工：
-//! * `text.rs`（本文件）—— 编码健壮读取、txt 段落/章节切分、注册入口；
-//! * [`super::chapter`] —— TXT 中文章节切分（零依赖，B 骨架 + 中文词表）；
+//! * `text.rs`（本文件）—— txt 段落/章节切分、注册入口（编码健壮读取的
+//!   解码链在 [`crate::encoding`]，本文件 `pub use` 转发 [`decode`]）；
+//! * [`super::chapter`] —— TXT 中文章节切分（零依赖，B 骨架 + 中文词表，
+//!   规则可用 [`super::chapter::ChapterRules`] 覆盖/补充）；
 //! * [`super::markdown`] —— md 块级语法（标题/列表/引用/代码/表格）；
 //! * [`super::csv`] —— RFC4180 解析为 `TableData`；
 //! * [`super::html`] —— 标准库级标签扫描（标题/段落/列表/代码/表格，跳过 script/style）。
@@ -34,80 +37,19 @@ use super::markdown;
 
 /// 编码健壮读取：UTF-8（含 BOM）→ UTF-16（BOM）→ UTF-8 strict →
 /// （feature `encoding`）chardetng 概率探测（置信闸门）→ GB18030 → Big5 → lossy。
+/// 解码链实现见 [`crate::encoding`]。
 pub fn read_text(path: &str) -> Result<String> {
     let raw =
         std::fs::read(path).map_err(|e| DocError::corrupt(format!("cannot read {path}: {e}")))?;
-    Ok(decode(raw))
+    Ok(crate::encoding::decode(raw))
 }
 
 /// 字节 → 字符串（BOM 感知，失败退化为 lossy）。
-pub fn decode(raw: Vec<u8>) -> String {
-    if let Some(rest) = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8_lossy(rest).into_owned();
-    }
-    if let Some(rest) = raw.strip_prefix(&[0xFF, 0xFE]) {
-        return decode_utf16(rest, true);
-    }
-    if let Some(rest) = raw.strip_prefix(&[0xFE, 0xFF]) {
-        return decode_utf16(rest, false);
-    }
-    match String::from_utf8(raw) {
-        Ok(s) => s,
-        Err(e) => {
-            let bytes = e.as_bytes();
-            // 中文/多编码回退链（GBK 家族优先，Big5 次之；各自要求全程无解码错误）
-            #[cfg(feature = "encoding")]
-            {
-                // —— chardetng 概率探测段（md/txt/csv/html 共用 read_text
-                //    一条链，先于固定链）：——
-                // 置信闸门两道：
-                //   ① guess_assess 的 bool（探测编码须胜过至少一个候选，
-                //      false = 探测"多半是错的"）；
-                //   ② 最小样本量 8 字节（频率模型要统计证据；实测 <8 字节
-                //      GBK 高频被 windows-1252/EUC-KR 劫持且解码无错，
-                //      ≥8 字节 CJK 判别稳定）。
-                // 探测命中 UTF-8 直接弃（strict 已失败 = 非法 UTF-8 混合件，
-                // 探测只是认出字节骨架）；闸门放行但探测编码解码有错也弃。
-                let mut det = chardetng::EncodingDetector::new();
-                det.feed(bytes, true);
-                let (enc, confident) = det.guess_assess(None, true);
-                if confident && bytes.len() >= 8 && enc != encoding_rs::UTF_8 {
-                    let (s, _, had_errors) = enc.decode(bytes);
-                    if !had_errors {
-                        return s.into_owned();
-                    }
-                }
-                // —— 固定链段（探测未采纳时兜底，M2 行为保持）：——
-                let (s_gb, _, err) = encoding_rs::GB18030.decode(bytes);
-                if !err {
-                    return s_gb.into_owned();
-                }
-                let (s_b5, _, err) = encoding_rs::BIG5.decode(bytes);
-                if !err {
-                    return s_b5.into_owned();
-                }
-            }
-            // 未开 encoding feature：GBK 等单/多字节中文编码退化为替换字符，
-            // 中文内容请以 UTF-8 保存（docparser 原注释语义保留）
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    }
-}
-
-fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
-    let units: Vec<u16> = bytes
-        .chunks(2)
-        .filter(|c| c.len() == 2)
-        .map(|c| {
-            if little_endian {
-                u16::from_le_bytes([c[0], c[1]])
-            } else {
-                u16::from_be_bytes([c[0], c[1]])
-            }
-        })
-        .collect();
-    String::from_utf16_lossy(&units)
-}
+///
+/// 转发到 [`crate::encoding::decode`]（横切能力模块化后的对外兼容 re-export，
+/// 旧调用点 `plugins::text::decode` 零改动）。编码名探测见
+/// [`crate::encoding::detect_and_decode`]。
+pub use crate::encoding::decode;
 
 /// 按空行切段落（与 Python `_split_paragraphs` 对齐：段内单换行保留）。
 pub fn split_paragraphs(text: &str) -> Vec<String> {
@@ -147,9 +89,25 @@ fn flush_paragraph(buf: &mut Vec<&str>, items: &mut Vec<RawTextItem>) {
 }
 
 /// 单格式纯文本解析后端（txt）。
+///
+/// `rules` 控制 TXT 章节切分（内置规则 + 自定义覆盖/补充，见
+/// [`super::chapter::ChapterRules`]）；`Default` 即默认装配（id/fmt 取 txt
+/// 内置值、rules 走内置规则），构造点可用 `..Default::default()` 补字段。
 pub struct TextParseCapability {
     pub id: &'static str,
     pub fmt: &'static str,
+    /// 章节切分规则（默认 [`super::chapter::ChapterRules::default`]，即纯内置规则）
+    pub rules: super::chapter::ChapterRules,
+}
+
+impl Default for TextParseCapability {
+    fn default() -> Self {
+        Self {
+            id: "text.read.txt",
+            fmt: "txt",
+            rules: super::chapter::ChapterRules::default(),
+        }
+    }
 }
 
 impl ParseCapability for TextParseCapability {
@@ -162,7 +120,7 @@ impl ParseCapability for TextParseCapability {
     fn parse(&self, path: &str) -> Result<RawDoc> {
         let content = read_text(path)?;
         let mut items: Vec<RawTextItem> = Vec::new();
-        for section in super::chapter::split_chapters(&content) {
+        for section in super::chapter::split_chapters_with(&content, &self.rules) {
             if let Some(h) = &section.heading {
                 // 章标题 → Heading（level=1；assemble 映射为 Heading 块）
                 items.push(RawTextItem {
@@ -327,6 +285,7 @@ pub fn register_defaults(reg: &mut Registry) {
         Arc::new(TextParseCapability {
             id: "text.read.txt",
             fmt: "txt",
+            ..Default::default()
         }),
         None,
     );
@@ -386,22 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_handles_bom_and_utf16() {
-        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
-        utf8_bom.extend_from_slice("你好".as_bytes());
-        assert_eq!(decode(utf8_bom), "你好");
-
-        let mut utf16 = vec![0xFF, 0xFE];
-        for u in "ab".encode_utf16() {
-            utf16.extend_from_slice(&u.to_le_bytes());
-        }
-        assert_eq!(decode(utf16), "ab");
-
-        // 非法 UTF-8 不 panic，退化为替换字符
-        assert!(decode(vec![0x61, 0xFF, 0x62]).contains('a'));
-    }
-
-    #[test]
     fn txt_plugin_splits_paragraphs() {
         let raw = RawDoc {
             pages: vec![RawPage {
@@ -431,19 +374,11 @@ mod m2_tests {
 
     #[test]
     #[cfg(feature = "encoding")]
-    fn gb18030_decoded_when_feature() {
-        // "你好，世界" 的 GBK 编码（非 UTF-8，无 BOM）
-        let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7];
-        assert_eq!(decode(gbk), "你好，世界");
-        // UTF-8 优先不受影响
-        assert_eq!(decode("常规".as_bytes().to_vec()), "常规");
-    }
-
-    #[test]
-    #[cfg(feature = "encoding")]
     fn gbk_markdown_decoded() {
         // GBK 字节的 md（非 UTF-8，无 BOM）：md 走 WholeTextParseCapability，
-        // 与 txt/csv/html 共用同一条 read_text → decode 链
+        // 与 txt/csv/html 共用同一条 read_text → crate::encoding::decode 链。
+        // decode 本体的直连断言（含 chardetng/GB18030/Big5/置信闸门）已随
+        // 解码链迁至 crate::encoding 的测试。
         let md = "# 中文标题\n\n正文段落。";
         let (bytes, _, had_errors) = encoding_rs::GB18030.encode(md);
         let bytes = bytes.into_owned();
@@ -460,38 +395,9 @@ mod m2_tests {
             .parse(p.to_str().unwrap())
             .unwrap();
         assert_eq!(raw.pages[0].items[0].text, md);
-        // decode 直连同链：BOM 无、UTF-16 无、UTF-8 strict 失败 → 编码回退
-        assert_eq!(decode(bytes.clone()), md);
-        assert_eq!(decode(bytes), md);
+        // read_text 直连同链：BOM 无、UTF-16 无、UTF-8 strict 失败 → 编码回退
+        assert_eq!(read_text(p.to_str().unwrap()).unwrap(), md);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[cfg(feature = "encoding")]
-    fn big5_text_detected_via_chardet() {
-        // Big5 长文本（≥200 字符）：Big5 字节同样能被 GB18030 无错解码成
-        // 乱码，所以固定链拿不到正确结果——逐字还原只能来自 chardetng
-        // 探测命中 Big5（置信闸门放行）
-        let line = "這是一份測試文件，用來驗證編碼自動識別對繁體中文內容的效果。";
-        let text = line.repeat(8);
-        assert!(text.chars().count() >= 200);
-        let (bytes, _, had_errors) = encoding_rs::BIG5.encode(&text);
-        assert!(!had_errors);
-        assert_eq!(decode(bytes.into_owned()), text);
-    }
-
-    #[test]
-    #[cfg(feature = "encoding")]
-    fn short_ambiguous_falls_back_to_fixed_chain() {
-        // 短且歧义的 GBK 字节：低于最小探测样本量（8 字节），置信闸门不放行
-        // → 固定链 GB18030 行为与 M2 保持一致
-        // "你好瞒" 的 GBK（6 字节）
-        assert_eq!(
-            decode(vec![0xC4, 0xE3, 0xBA, 0xC3, 0xC2, 0xF7]),
-            "你好瞒"
-        );
-        // "你" 的 GBK（2 字节）
-        assert_eq!(decode(vec![0xC4, 0xE3]), "你");
     }
 
     #[test]
@@ -507,7 +413,7 @@ mod m2_tests {
         )
         .unwrap();
 
-        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt" }
+        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt", ..Default::default() }
             .parse(p.to_str().unwrap())
             .unwrap();
         let doc = TextPlugin.assemble(&raw);
@@ -535,7 +441,7 @@ mod m2_tests {
         )
         .unwrap();
 
-        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt" }
+        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt", ..Default::default() }
             .parse(p.to_str().unwrap())
             .unwrap();
         let doc = TextPlugin.assemble(&raw);
@@ -561,6 +467,47 @@ mod m2_tests {
         assert_eq!(blocks[3].level, Some(2));
         assert_eq!(blocks[5].level, Some(1));
         assert_eq!(blocks[6].kind, crate::model::BlockKind::Paragraph);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_chapter_rules_flow_through_plugin() {
+        // 自定义规则经 TextParseCapability.rules 生效（parse 传规则给
+        // split_chapters_with）：level 2 自定义小节行从段落剥离、按行号
+        // 回插为 Heading item；默认规则构造点不受影响（前两个测试回归）。
+        use crate::plugins::chapter::{ChapterRules, CustomRule};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("m2-txt-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("manual.txt");
+        std::fs::write(
+            &p,
+            "第一章 部署\n\nStep 1 准备\n\n安装依赖。\n\nStep 2 启动\n\n运行服务。",
+        )
+        .unwrap();
+
+        let raw = TextParseCapability {
+            id: "text.read.txt",
+            fmt: "txt",
+            rules: ChapterRules {
+                extra: vec![CustomRule { prefix: "Step ".to_string(), level: 2 }],
+                replace_builtin: false,
+            },
+            ..Default::default()
+        }
+        .parse(p.to_str().unwrap())
+        .unwrap();
+        let doc = TextPlugin.assemble(&raw);
+        let blocks = &doc.pages[0].blocks;
+        assert_eq!(blocks[0].content, "第一章 部署");
+        assert_eq!(blocks[0].level, Some(1));
+        assert_eq!(blocks[1].content, "Step 1 准备");
+        assert_eq!(blocks[1].kind, crate::model::BlockKind::Heading);
+        assert_eq!(blocks[1].level, Some(2));
+        assert_eq!(blocks[2].content, "安装依赖。");
+        assert_eq!(blocks[3].content, "Step 2 启动");
+        assert_eq!(blocks[3].level, Some(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
