@@ -19,6 +19,10 @@ const SUB_EXT: &[&str] = &["srt", "vtt", "ass", "ssa"];
 /// RTF：有 magic（`{\rtf`），但按扩展名直连，头部合法性由后端判（避免伪装件被当纯文本）
 const RTF_EXT: &[&str] = &["rtf"];
 
+/// 图像直读：按扩展名直连（内容合法性由 image-files 后端解码判），
+/// 格式名 = 扩展名本身（jpg/jpeg、tif/tiff 各自成键，格式保真）
+const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
+
 fn head_of(path: &str, n: usize) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map(|v| v[..v.len().min(n)].to_vec())
@@ -48,6 +52,19 @@ pub fn sniff(path: &str) -> Result<&'static str> {
             "OLE 容器但扩展名不支持: {ext}"
         )));
     }
+    if IMAGE_EXT.contains(&ext.as_str()) {
+        // 返回 &'static（格式名 = 扩展名自身，逐键映射避免生命周期问题）
+        return Ok(match ext.as_str() {
+            "png" => "png",
+            "jpg" => "jpg",
+            "jpeg" => "jpeg",
+            "webp" => "webp",
+            "bmp" => "bmp",
+            "tif" => "tif",
+            _ => "tiff",
+        });
+    }
+
     // MOBI/PalmDOC：PalmDB 容器（BOOKMOBI magic 在 offset 60），按扩展名
     // 直连、头部校验由后端判（加密/DRM 在后端报 encrypted 终止码）
     if ext == "mobi" || ext == "prc" {

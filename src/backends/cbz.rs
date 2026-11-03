@@ -180,6 +180,9 @@ impl FormatPlugin for CbzPlugin {
                     .map(|im| crate::model::Image {
                         data: im.data.clone(),
                         bbox: im.bbox,
+                        // ocr_text 必须透传（ocr-images 链的产出落点）——
+                        // 图像直读工人交叉发现 cbz 曾在此丢弃（M5 修复）
+                        ocr_text: im.ocr_text.clone(),
                         ..Default::default()
                     })
                     .collect();

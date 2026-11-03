@@ -82,6 +82,8 @@ pub fn parse(path: &str) -> Result<Document> {
     crate::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "cbz")]
     crate::backends::cbz::register_defaults(&mut registry);
+    #[cfg(feature = "image-files")]
+    crate::backends::image_files::register_defaults(&mut registry);
     #[cfg(feature = "fb2")]
     crate::backends::fb2::register_defaults(&mut registry);
     #[cfg(feature = "mobi")]

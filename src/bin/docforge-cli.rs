@@ -69,6 +69,8 @@ fn main() {
     docforge::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "cbz")]
     docforge::backends::cbz::register_defaults(&mut registry);
+    #[cfg(feature = "image-files")]
+    docforge::backends::image_files::register_defaults(&mut registry);
     #[cfg(feature = "fb2")]
     docforge::backends::fb2::register_defaults(&mut registry);
     #[cfg(feature = "mobi")]

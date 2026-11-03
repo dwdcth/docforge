@@ -11,6 +11,8 @@ pub mod epub;
 pub mod odf;
 #[cfg(feature = "cbz")]
 pub mod cbz;
+#[cfg(feature = "image-files")]
+pub mod image_files;
 #[cfg(feature = "djvu")]
 pub mod djvu;
 #[cfg(feature = "fb2")]

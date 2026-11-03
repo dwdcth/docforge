@@ -37,6 +37,8 @@ pptx = ["dep:md-5", "dep:quick-xml", "dep:zip", "dep:log"]
 djvu = ["dep:djvu-rs", "ocr"]
 # FB2（document-parser fb2 loader 吸收：单 XML 电子书；fb2.zip 解包内层 .fb2）
 fb2 = ["dep:quick-xml", "dep:base64", "dep:zip"]
+# 图像直读（png/jpg 等单图即文档：字节透传 + ocr-images 图→文链）
+image-files = ["dep:image", "ocr"]
 # CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
 cbz = ["dep:zip", "dep:image"]
 # MOBI（Kindle 电子书：mobi-rs 读 MOBI7 正文 HTML，azw3/KF8 不支持；M5）
