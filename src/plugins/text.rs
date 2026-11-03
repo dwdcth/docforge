@@ -1,11 +1,16 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
-// docforge 改动：仅 crate 名引用替换。
+// docforge 改动：① feature `encoding` 下 decode 增加 GB18030/Big5 回退（M2）；
+// ② parse 集成中文章节切分（chapter.rs，标题产 level=1 item）；
+// ③ assemble 将 level 映射为 Heading 块；④ feature `lang-detect` 下
+// default_process_chain 追加语言检测；⑤ register_defaults 注册 chapter 无需
+// （纯函数模块）。算法骨架另吸收 document-parser（见 chapter.rs 头）。
 //! 纯文本族插件：txt / md / csv / html（零第三方依赖，语义对齐 Python 参考实现）。
 //!
 //! 这四类**不走 PDF**：没有布局与坐标，转 PDF 是纯粹的有损往返，直接按语法解。
 //!
 //! 分工：
-//! * `text.rs`（本文件）—— 编码健壮读取、txt 段落切分、注册入口；
+//! * `text.rs`（本文件）—— 编码健壮读取、txt 段落/章节切分、注册入口；
+//! * [`super::chapter`] —— TXT 中文章节切分（零依赖，B 骨架 + 中文词表）；
 //! * [`super::markdown`] —— md 块级语法（标题/列表/引用/代码/表格）；
 //! * [`super::csv`] —— RFC4180 解析为 `TableData`；
 //! * [`super::html`] —— 标准库级标签扫描（标题/段落/列表/代码/表格，跳过 script/style）。
@@ -13,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::error::{DocError, Result};
-use crate::model::{Block, BlockKind, Document, Page};
+use crate::model::{Block, BlockKind, BlockSource, Document, Page};
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawPage, RawTextItem};
 use crate::registry::Registry;
 
@@ -24,11 +29,8 @@ use super::html;
 #[cfg(feature = "md")]
 use super::markdown;
 
-/// 编码健壮读取：UTF-8（含 BOM）→ UTF-16（BOM）→ UTF-8 lossy。
-///
-/// 与 Python 参考实现（`utf-8-sig → gbk → latin-1`）的差异：Rust 核心不引入
-/// `encoding_rs`（保持零第三方依赖），GBK 等单/多字节中文编码会退化为替换字符。
-/// 中文内容请以 UTF-8 保存；需要 GBK 时由调用方先行转码。
+/// 编码健壮读取：UTF-8（含 BOM）→ UTF-16（BOM）→ UTF-8 strict →
+/// （feature `encoding`）GB18030 → Big5 → lossy。
 pub fn read_text(path: &str) -> Result<String> {
     let raw =
         std::fs::read(path).map_err(|e| DocError::corrupt(format!("cannot read {path}: {e}")))?;
@@ -48,8 +50,24 @@ pub fn decode(raw: Vec<u8>) -> String {
     }
     match String::from_utf8(raw) {
         Ok(s) => s,
-        // 非法字节逐段替换，保留可读部分（与 lossy 语义一致）
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        Err(e) => {
+            let bytes = e.as_bytes();
+            // 中文编码回退（GBK 家族优先，Big5 次之；各自要求全程无解码错误）
+            #[cfg(feature = "encoding")]
+            {
+                let (s_gb, _, err) = encoding_rs::GB18030.decode(bytes);
+                if !err {
+                    return s_gb.into_owned();
+                }
+                let (s_b5, _, err) = encoding_rs::BIG5.decode(bytes);
+                if !err {
+                    return s_b5.into_owned();
+                }
+            }
+            // 未开 encoding feature：GBK 等单/多字节中文编码退化为替换字符，
+            // 中文内容请以 UTF-8 保存（docparser 原注释语义保留）
+            String::from_utf8_lossy(bytes).into_owned()
+        }
     }
 }
 
@@ -104,13 +122,30 @@ impl ParseCapability for TextParseCapability {
     }
     fn parse(&self, path: &str) -> Result<RawDoc> {
         let content = read_text(path)?;
-        let items: Vec<RawTextItem> = split_paragraphs(&content)
-            .into_iter()
-            .map(|t| RawTextItem {
+        let mut items: Vec<RawTextItem> = Vec::new();
+        for (title, range) in super::chapter::split_chapters(&content) {
+            if let Some(t) = title {
+                // 章标题 → Heading level 1（assemble 映射为 Heading 块）
+                items.push(RawTextItem {
+                    text: t,
+                    level: Some(1),
+                    source: BlockSource::Native,
+                    ..Default::default()
+                });
+            }
+            let body: String = content
+                .lines()
+                .enumerate()
+                .filter(|(i, _)| range.contains(i))
+                .map(|(_, l)| l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            items.extend(split_paragraphs(&body).into_iter().map(|t| RawTextItem {
                 text: t,
+                source: BlockSource::Native,
                 ..Default::default()
-            })
-            .collect();
+            }));
+        }
         Ok(RawDoc {
             pages: vec![RawPage {
                 name: None,
@@ -136,27 +171,38 @@ impl FormatPlugin for TextPlugin {
         vec!["text.read.txt"]
     }
     fn default_process_chain(&self) -> Vec<&'static str> {
-        vec![]
+        #[cfg(feature = "lang-detect")]
+        {
+            vec!["lang-detect"]
+        }
+        #[cfg(not(feature = "lang-detect"))]
+        {
+            vec![]
+        }
     }
     fn assemble(&self, raw: &RawDoc) -> Document {
-        let items: Vec<&str> = raw
+        let items: Vec<&RawTextItem> = raw
             .pages
             .first()
-            .map(|p| p.items.iter().map(|i| i.text.as_str()).collect())
+            .map(|p| p.items.iter().collect())
             .unwrap_or_default();
         let blocks: Vec<Block> = items
             .iter()
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| Block {
-                kind: BlockKind::Paragraph,
-                content: (*t).to_string(),
+            .filter(|i| !i.text.trim().is_empty())
+            .map(|i| Block {
+                kind: if i.level.is_some() { BlockKind::Heading } else { BlockKind::Paragraph },
+                content: i.text.clone(),
+                level: i.level,
+                source: i.source,
+                confidence: i.confidence,
                 ..Default::default()
             })
             .collect();
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         Document {
             pages: vec![Page {
                 blocks,
-                text: items.join("\n\n"),
+                text: texts.join("\n\n"),
                 ..Default::default()
             }],
             ..Default::default()
@@ -261,7 +307,11 @@ pub fn register_defaults(reg: &mut Registry) {
     // 字幕（srt/vtt/ass/ssa）：无第三方依赖，跟随 txt 始终注册
     super::subtitle::register_defaults(reg);
 
-    // RTF：控制词状态机，随 feature `rtf`（默认开）
+    // 语言检测处理能力：随 feature `lang-detect`（M2）
+    #[cfg(feature = "lang-detect")]
+    super::lang_detect::register(reg);
+
+    // RTF：控制字状态机，随 feature `rtf`（默认开）
     #[cfg(feature = "rtf")]
     super::rtf::register_defaults(reg);
 }
@@ -316,5 +366,46 @@ mod tests {
         let doc = TextPlugin.assemble(&raw);
         assert_eq!(doc.pages[0].blocks.len(), 2);
         assert_eq!(doc.pages[0].text, "p1\n\np2");
+    }
+}
+
+#[cfg(test)]
+mod m2_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "encoding")]
+    fn gb18030_decoded_when_feature() {
+        // "你好，世界" 的 GBK 编码（非 UTF-8，无 BOM）
+        let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7];
+        assert_eq!(decode(gbk), "你好，世界");
+        // UTF-8 优先不受影响
+        assert_eq!(decode("常规".as_bytes().to_vec()), "常规");
+    }
+
+    #[test]
+    fn chapters_become_heading_blocks() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("m2-txt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("novel.txt");
+        std::fs::write(
+            &p,
+            "第一章 出发\n\n清晨他离开村庄。\n\n第二章 归来\n\n多年以后他回来了。",
+        )
+        .unwrap();
+
+        let raw = TextParseCapability { id: "text.read.txt", fmt: "txt" }
+            .parse(p.to_str().unwrap())
+            .unwrap();
+        let doc = TextPlugin.assemble(&raw);
+        let blocks = &doc.pages[0].blocks;
+        assert_eq!(blocks[0].kind, crate::model::BlockKind::Heading);
+        assert_eq!(blocks[0].level, Some(1));
+        assert_eq!(blocks[0].content, "第一章 出发");
+        assert_eq!(blocks[1].content, "清晨他离开村庄。");
+        assert_eq!(blocks[2].content, "第二章 归来");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

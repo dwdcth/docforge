@@ -83,6 +83,10 @@ impl DocumentEngine {
         if let Some(w) = raw.meta.get("warnings") {
             doc.meta.extra.insert("warnings".to_string(), w.clone());
         }
+        // 语言检测结论（lang-detect 处理能力写入）同样搬到 extra（docforge M2）
+        if let Some(lang) = raw.meta.get("language") {
+            doc.meta.extra.insert("language".to_string(), lang.clone());
+        }
         Ok(doc.finalize())
     }
 }

@@ -9,10 +9,13 @@
 //! 字幕（srt/vtt/ass/ssa）无第三方依赖，随 `txt` 始终编译。
 //! 只要「字节流 → IR」的最小内核时用 `default-features = false`。
 
+pub mod chapter;
 #[cfg(feature = "csv")]
 pub mod csv;
 #[cfg(feature = "html")]
 pub mod html;
+#[cfg(feature = "lang-detect")]
+pub mod lang_detect;
 #[cfg(feature = "md")]
 pub mod markdown;
 #[cfg(feature = "rtf")]
