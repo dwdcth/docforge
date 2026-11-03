@@ -44,6 +44,7 @@ pub mod model;
 pub mod ocr;
 pub mod plugin;
 pub mod plugins;
+pub mod writeback;
 pub mod policy;
 pub mod registry;
 pub mod router;

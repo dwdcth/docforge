@@ -14,9 +14,11 @@
 use crate::model::{Block, BlockKind, Document, Page, TableData};
 use crate::plugin::{FormatPlugin, RawDoc};
 
-const SKIP_TAGS: [&str; 6] = ["script", "style", "noscript", "svg", "head", "title"];
+/// 整段跳过的标签（writeback::epub 的回写扫描同口径引用）。
+pub(crate) const SKIP_TAGS: [&str; 6] = ["script", "style", "noscript", "svg", "head", "title"];
 
-fn heading_level(tag: &str) -> Option<u8> {
+/// `h1..h6` → 1..6（writeback::epub 同口径引用）。
+pub(crate) fn heading_level(tag: &str) -> Option<u8> {
     match tag {
         "h1" => Some(1),
         "h2" => Some(2),
@@ -61,7 +63,8 @@ fn numeric_entity(body: &str) -> Option<char> {
 }
 
 /// 解实体：`&amp;` 等命名实体与 `&#NN;` / `&#xHH;`；未知实体原样保留。
-fn decode_entities(s: &str) -> String {
+/// （writeback::epub 的回写扫描同口径引用。）
+pub(crate) fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
@@ -97,7 +100,8 @@ fn decode_entities(s: &str) -> String {
 }
 
 /// 引号感知的标签结束查找：属性值内的 `>` 不算标签边界（docforge 修补 ①）。
-fn find_tag_end(s: &str) -> Option<usize> {
+/// （writeback::epub 的回写扫描同口径引用。）
+pub(crate) fn find_tag_end(s: &str) -> Option<usize> {
     let mut quote: Option<u8> = None;
     for (i, &b) in s.as_bytes().iter().enumerate() {
         match quote {
@@ -136,7 +140,8 @@ fn extract_attr(raw: &str, name: &str) -> Option<String> {
     }
 }
 
-fn tag_name(raw: &str) -> String {
+/// 标签名（小写化；writeback::epub 同口径引用）。
+pub(crate) fn tag_name(raw: &str) -> String {
     raw.split(|c: char| c.is_whitespace() || c == '/')
         .next()
         .unwrap_or("")
@@ -304,7 +309,8 @@ impl Collector {
     }
 }
 
-fn strip_comments(text: &str) -> String {
+/// 去注释（writeback::epub 的无块回退同口径引用）。
+pub(crate) fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<!--") {

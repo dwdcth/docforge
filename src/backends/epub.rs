@@ -140,8 +140,8 @@ struct Opf {
     cover_id: Option<String>,
 }
 
-/// `container.xml` → OPF 包内路径。
-fn find_rootfile(xml: &str) -> Result<Option<String>> {
+/// `container.xml` → OPF 包内路径。（writeback::epub 同口径引用。）
+pub(crate) fn find_rootfile(xml: &str) -> Result<Option<String>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -419,8 +419,8 @@ fn ncx_titles(xml: &str) -> BTreeMap<String, String> {
 
 // ── 路径 / ZIP ──────────────────────────────────────────────────────
 
-/// manifest href（可含 `./` `../`）→ 包内 POSIX 路径。
-fn resolve(base: &str, href: &str) -> String {
+/// manifest href（可含 `./` `../`）→ 包内 POSIX 路径。（writeback::epub 同口径引用。）
+pub(crate) fn resolve(base: &str, href: &str) -> String {
     let href = href.split('#').next().unwrap_or("");
     let joined = if base.is_empty() {
         href.to_string()
@@ -553,7 +553,8 @@ fn cut_indices(blocks: &[Block], max_level: u8) -> Vec<(String, Vec<usize>)> {
 }
 
 /// 层级自适应切节：单节仍过大就试更深一层（h2 → h3 → h4）。
-fn sections(blocks: &[Block]) -> Vec<(String, Vec<usize>)> {
+/// （writeback::epub 的页 provenance 复刻同源引用，保证切节口径一致。）
+pub(crate) fn sections(blocks: &[Block]) -> Vec<(String, Vec<usize>)> {
     let mut best = Vec::new();
     for max_level in SECTION_LEVELS {
         best = cut_indices(blocks, max_level);
