@@ -6,7 +6,6 @@ description = "通用文档解析：统一块级 IR + 格式路由 + PDF 页级�
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dwdcth/docforge"
 homepage = "https://github.com/dwdcth/docforge"
-documentation = "https://docs.rs/docforge"
 keywords = ["document", "parser", "ocr", "ir", "pdf"]
 categories = ["parser-implementations", "text-processing"]
 # 发布面收敛：本地工具/溯源 tarball（NOTICES 有 URL）/过程文档/大 fixture
