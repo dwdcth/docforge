@@ -1,0 +1,22 @@
+[package]
+name = "docforge"
+version = "0.1.0"
+edition = "2021"
+description = "通用文档解析：统一块级 IR + 格式路由 + PDF 页级混合路由（文字层直提 / OCR），OCR 与翻译友好输出"
+license = "MIT OR Apache-2.0"
+keywords = ["document", "parser", "ocr", "ir", "pdf"]
+categories = ["parser-implementations", "text-processing"]
+
+[features]
+default = ["md", "csv", "html", "rtf"]
+md = []
+csv = []
+html = []
+rtf = []
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dev-dependencies]
+serde_json = "1"
