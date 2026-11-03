@@ -48,6 +48,12 @@ pub fn sniff(path: &str) -> Result<&'static str> {
             "OLE 容器但扩展名不支持: {ext}"
         )));
     }
+    // MOBI/PalmDOC：PalmDB 容器（BOOKMOBI magic 在 offset 60），按扩展名
+    // 直连、头部校验由后端判（加密/DRM 在后端报 encrypted 终止码）
+    if ext == "mobi" || ext == "prc" {
+        return Ok("mobi");
+    }
+
     // FB2：XML 文本无稳定 magic，按扩展名直连（根元素校验由后端判）
     if ext == "fb2" {
         return Ok("fb2");

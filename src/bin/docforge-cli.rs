@@ -71,6 +71,8 @@ fn main() {
     docforge::backends::cbz::register_defaults(&mut registry);
     #[cfg(feature = "fb2")]
     docforge::backends::fb2::register_defaults(&mut registry);
+    #[cfg(feature = "mobi")]
+    docforge::backends::mobi::register_defaults(&mut registry);
     #[cfg(feature = "djvu")]
     docforge::backends::djvu::register(
         &mut registry,

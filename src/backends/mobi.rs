@@ -271,8 +271,8 @@ mod tests {
         be16(f.encryption, &mut rec0); // encryption
         be16(0, &mut rec0); // unused
 
-        // MOBI 头字段体（mobih.rs L242-327 读取序；identifier 之后 216B，
-        // header_length 记 232 带 8B 尾垫 = 真实 kindlegen 口径）
+        // MOBI 头字段体（mobih.rs L242-327 读取序；identifier 之后 224B，
+        // header_length 记 232 = 8 前缀 + 224 字段体，真实 kindlegen 口径）
         let mut body = Vec::new();
         be32(2, &mut body); // mobi_type = MobiPocketBook
         be32(65001, &mut body); // text_encoding = UTF-8
@@ -280,10 +280,18 @@ mod tests {
         be32(6, &mut body); // gen_version
         be32(!0, &mut body); // ortho_index
         be32(!0, &mut body); // inflect_index
+        be32(!0, &mut body); // index_names
+        be32(!0, &mut body); // index_keys
         for _ in 0..6 {
             be32(!0, &mut body); // extra_indices ×6
         }
-        be32(2, &mut body); // first_non_book_index（正文止于记录 1 之后）
+        // first_non_book_index：按格式语义应填 2（正文止于记录 1 之后），但
+        // mobi-rs 的 RawRecords::range 存在双重差一（record.rs L88：end =
+        // (b-1).min(len-1)，任何 range 都覆盖不到末条记录）——2 条记录的书
+        // range(1..3) 会坍缩为 [1..1] 空集。真实书籍记录数远大于区间边界、
+        // 不受影响；构造件补 1 条尾部哨兵记录（num_records=3），使
+        // range(1..3) = [1..2] 恰好覆盖唯一正文记录
+        be32(3, &mut body);
         let name_off_at = body.len(); // name_offset 占位（记录 0 定长后回填）
         be32(0, &mut body);
         be32(f.name.len() as u32, &mut body); // name_length
@@ -322,12 +330,11 @@ mod tests {
         be32(!0, &mut body); // unused_8
         be32(0, &mut body); // extra_record_data_flags
         be32(!0, &mut body); // first_index_record
-        assert_eq!(body.len(), 216, "MOBI 头字段体应为 216B");
+        assert_eq!(body.len(), 224, "MOBI 头字段体应为 224B");
 
         rec0.extend_from_slice(b"MOBI");
-        be32(232, &mut rec0); // header_length（8 + 216 + 8 尾垫）
+        be32(232, &mut rec0); // header_length（8 前缀 + 224 字段体）
         rec0.extend_from_slice(&body);
-        rec0.extend_from_slice(&[0; 8]); // header_length 尾垫（mobi-rs 读进 unused_9）
 
         // EXTH（exth.rs L217-259）：12B 头 + N×(type u32 + len u32 + data)
         if f.exth {
@@ -377,16 +384,21 @@ mod tests {
         out.extend_from_slice(b"MOBI"); // creator
         be32(2, &mut out); // unique_id_seed
         be32(0, &mut out); // next_record_list_id
-        be16(2, &mut out); // num_records = 2
-        let rec0_off = out.len() as u32 + 2 * 8 + 2; // 78 + 16 + 2 = 96
+        be16(3, &mut out); // num_records = 3（记录 0 + 正文 + 尾部哨兵）
+        let rec0_off = out.len() as u32 + 3 * 8 + 2; // 78 + 24 + 2 = 104
+        let rec1_off = rec0_off + rec0.len() as u32;
+        let rec2_off = rec1_off + text.len() as u32; // 末条哨兵：offset = 文件尾，切片为空
         be32(rec0_off, &mut out);
-        be32(0, &mut out); // (offset, id) ×2
-        be32(rec0_off + rec0.len() as u32, &mut out);
+        be32(0, &mut out);
+        be32(rec1_off, &mut out);
         be32(1, &mut out);
+        be32(rec2_off, &mut out);
+        be32(2, &mut out);
         be16(0, &mut out); // gap（extra_bytes = 0）
         debug_assert_eq!(out.len() as u32, rec0_off);
         out.extend_from_slice(&rec0);
         out.extend_from_slice(&text);
+        // 哨兵记录体为 0 字节（offset 指向文件尾即空切片）
 
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
