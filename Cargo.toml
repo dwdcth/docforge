@@ -160,6 +160,11 @@ name = "docforge-cli"
 path = "src/bin/docforge-cli.rs"
 required-features = ["json"]
 
+[[test]]
+name = "cli_convert"
+path = "tests/cli_convert.rs"
+required-features = ["json"]
+
 [dev-dependencies]
 serde_json = "1"
 oxidize-pdf = "5"
