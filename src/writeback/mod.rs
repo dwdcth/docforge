@@ -19,27 +19,52 @@
 //! # 三种策略（[`crate::emit::BiStrategy`]）
 //!
 //! * `BilingualInline`（默认）：译文插在原块之后（docx 复制原段 `<w:pPr>`；
-//!   epub 一律插 `<p class="docforge-tr">`，heading 后也是 p——简化取舍）；
+//!   epub/html 一律插 `<p class="docforge-tr">`；odt 插 `<text:p>` 并沿用原段
+//!   `text:style-name`；fb2 在 p/subtitle/title 元素后插同级 `<p>`（poem 内
+//!   不合法则跳过）；txt 原段行后紧跟纯文本译文行）；
 //! * `TranslationOnly`：替换原块文本。简化口径：docx 首 `w:t` 换译文、
 //!   其余 `w:t` 清空（保留 run/书签结构，重解析文本等价于「其余 run 删」）；
-//!   epub 首文本节点换译文、其余文本节点清空；
+//!   epub/html 首文本节点换译文、其余文本节点清空；fb2 单元素换内文本
+//!   （title/stanza 首 span 换译、其余清空）；odt/fb2 元素内文本区整体替换；
+//!   txt 块行区间换译文单行；
 //! * `OriginalPlusAppendix`：正文不动，在末尾追加「译文」小节（docx 追加在
-//!   body 末尾 sectPr 之前；epub 追加在最后一个 spine 文档 `</body>` 前）。
+//!   body 末尾 sectPr 之前；epub 追加在最后一个 spine 文档 `</body>` 前；
+//!   html 追加在 `</body>` 前；fb2 追加主文 `</body>` 前的 `<section>`；
+//!   odt 追加在 `</office:text>` 前；txt 文尾追加 `【译文】` 分隔 + 译文段）。
 //!
-//! # 接线（合并方执行，本模块不自行接线）
+//! # 覆盖格式与门控
 //!
-//! `lib.rs` 加 `pub mod writeback;`；无新依赖、无新 feature——
-//! 复用既有 `docx` / `epub` feature 门控（见下）。
+//! docx / epub / html / fb2 / odt / txt 六种（md 走
+//! [`crate::emit::to_bilingual_markdown`] 纯文本重组，不经本模块）。txt 零依赖
+//! 恒开；html 随 feature `html`、fb2 随 `fb2`、odt 随 `odt`（各自复用提取侧
+//! feature 的解析管线，无新依赖）。单文件编码取舍：txt 支持 UTF-8 逐字节
+//! 保真 + 解码链命中件转存 UTF-8（lossy 兜底件拒绝）；html / fb2 仅 UTF-8
+//! （避免文件内编码声明失配）；zip 容器格式（docx/epub/odt）由共用
+//! `rewrite_zip` 字节透传非正文部件。
 
 #[cfg(feature = "docx")]
 pub mod docx;
 #[cfg(feature = "epub")]
 pub mod epub;
+#[cfg(feature = "fb2")]
+pub mod fb2;
+#[cfg(feature = "html")]
+pub mod html;
+#[cfg(feature = "odt")]
+pub mod odt;
+pub mod txt;
 
 #[cfg(feature = "docx")]
 pub use docx::writeback_docx;
 #[cfg(feature = "epub")]
 pub use epub::writeback_epub;
+#[cfg(feature = "fb2")]
+pub use fb2::writeback_fb2;
+#[cfg(feature = "html")]
+pub use html::writeback_html;
+#[cfg(feature = "odt")]
+pub use odt::writeback_odt;
+pub use txt::writeback_txt;
 
 /// XML / XHTML 文本节点的最小转义：`&` `<` `>`（属性场景不经过此函数——
 /// 本模块只写固定属性值）。译文与追加段统一走这里。
@@ -56,6 +81,38 @@ pub(crate) fn escape_xml_text(s: &str) -> String {
     out
 }
 
+/// 一处回写编辑（xml / xhtml 单文件改写共用；txt 走行级重组不经此）。
+pub(crate) enum Edit {
+    /// 在 `pos` 前插入。
+    Insert(usize, String),
+    /// 把 `[start, end)` 替换为文本。
+    Replace(usize, usize, String),
+}
+
+/// 按 (起, 止, 文本) / (位置, 文本) 从后往前应用编辑（先排序；区间互不重叠）。
+pub(crate) fn apply_edits(xml: &str, edits: Vec<Edit>) -> String {
+    let mut items: Vec<(usize, usize, String)> = edits
+        .into_iter()
+        .map(|e| match e {
+            Edit::Insert(p, s) => (p, p, s),
+            Edit::Replace(s, e, t) => (s, e, t),
+        })
+        .collect();
+    items.sort_by_key(|(s, _, _)| *s);
+    let mut out = String::with_capacity(xml.len());
+    let mut cursor = 0usize;
+    for (s, e, txt) in items {
+        if s < cursor {
+            continue; // 区间重叠（不应发生）：保守丢弃后到的
+        }
+        out.push_str(&xml[cursor..s]);
+        out.push_str(&txt);
+        cursor = e;
+    }
+    out.push_str(&xml[cursor..]);
+    out
+}
+
 /// id → 译文的查找表：重复 id 后者胜（HashMap 语义），未匹配 id 由调用方忽略。
 /// 空白译文视为「未提供」，同样忽略（避免插入空段 / 清空原文）。
 pub(crate) fn translation_map(translated: &[(String, String)]) -> std::collections::HashMap<&str, &str> {
@@ -69,7 +126,7 @@ pub(crate) fn translation_map(translated: &[(String, String)]) -> std::collectio
 // ZIP 透传重打包（docx / epub 共用）
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "docx", feature = "epub"))]
+#[cfg(any(feature = "docx", feature = "epub", feature = "odt"))]
 mod zip_util {
     use std::io::{Read, Write};
     use std::path::Path;
@@ -149,7 +206,7 @@ mod zip_util {
     }
 }
 
-#[cfg(any(feature = "docx", feature = "epub"))]
+#[cfg(any(feature = "docx", feature = "epub", feature = "odt"))]
 pub(crate) use zip_util::{open_zip, rewrite_zip};
 
 #[cfg(test)]
