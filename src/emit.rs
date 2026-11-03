@@ -1,10 +1,12 @@
 // 吸收自 docparser-core 0.2.1（MIT OR Apache-2.0，crates.io 存档），见 THIRD_PARTY_NOTICES.md。
 // docforge 改动：① Image 块渲染 [image] 占位；② feature `json` 下 to_json/
 // to_json_pretty；③ 新增 to_translation_units（翻译友好输出，docparse-plan §9）；
-// ④ 新增 to_rag_chunks（RAG 检索分块，docparse-plan §13 M4）。
+// ④ 新增 to_rag_chunks（RAG 检索分块，docparse-plan §13 M4）；
+// ⑤ 新增双语回写（BiStrategy + to_bilingual_markdown[_with]，翻译闭环①）。
 //! 输出目标：text / markdown / JSON（feature `json`）/ 翻译单元
 //!（`to_translation_units`，翻译管线的工作单元与回写锚点）/ RAG 检索块
-//!（`to_rag_chunks`，向量化/检索管线的工作单元）。
+//!（`to_rag_chunks`，向量化/检索管线的工作单元）/ 双语回写
+//!（`to_bilingual_markdown`，按锚点把译文写回 Markdown）。
 
 use crate::model::{BlockKind, BlockSource, Document};
 
@@ -171,12 +173,30 @@ pub fn is_translatable(kind: BlockKind) -> bool {
     matches!(kind, BlockKind::Heading | BlockKind::Paragraph | BlockKind::Quote | BlockKind::List)
 }
 
+/// [`to_translation_units`] 的默认最小字符数（提取与回写两侧共用同一口径）。
+const DEFAULT_TRANSLATION_MIN_CHARS: usize = 2;
+
+/// 提取/回写两侧共用的块锚点：`p{页名}-b{块序}`。单点定义，消除两处
+/// format! 的口径漂移——锚点对不上译文就写不回。
+fn translation_id(page_name: &str, b_idx: usize) -> String {
+    format!("p{page_name}-b{b_idx}")
+}
+
+/// 提取/回写两侧共用的候选判定：可翻译白名单 + 非空白 + 达到 min_chars。
+/// 直接复用 [`is_translatable`]；回写侧用同一谓词，保证「哪些块拥有锚点」
+/// 两侧完全一致（id 对得上）。
+fn translation_candidate(b: &crate::model::Block, min_chars: usize) -> bool {
+    is_translatable(b.kind)
+        && !b.content.trim().is_empty()
+        && b.content.chars().count() >= min_chars
+}
+
 /// 提取翻译单元：按文档序遍历块，白名单 + 最小字符数过滤。
 ///
 /// `min_chars` 过滤超短块（默认 2：滤掉单字符噪声，保留绝大多数实词句）。
 /// 章节上下文 = 该块之前最近的 Heading 块文本（跨页不追踪）。
 pub fn to_translation_units(doc: &Document) -> Vec<TranslationUnit> {
-    to_translation_units_with(doc, 2)
+    to_translation_units_with(doc, DEFAULT_TRANSLATION_MIN_CHARS)
 }
 
 /// [`to_translation_units`] 带自定义最小字符数。
@@ -192,14 +212,11 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
             if b.kind == BlockKind::Heading {
                 chapter = Some(b.content.clone());
             }
-            if !is_translatable(b.kind) || b.content.trim().is_empty() {
-                continue;
-            }
-            if b.content.chars().count() < min_chars {
+            if !translation_candidate(b, min_chars) {
                 continue;
             }
             out.push(TranslationUnit {
-                id: format!("p{page_name}-b{b_idx}"),
+                id: translation_id(&page_name, b_idx),
                 page: Some(page_name.clone()),
                 kind: b.kind,
                 text: b.content.clone(),
@@ -212,6 +229,160 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// 双语回写（翻译闭环 ①）：按 TranslationUnit.id 锚点把译文写回 Markdown
+// ---------------------------------------------------------------------------
+
+/// 双语回写策略（Markdown 形态；docx/epub 回写器共用同一套语义）。
+///
+/// 三种策略共用 [`to_translation_units`] 的锚点与过滤口径（页×块序、
+/// [`is_translatable`] 白名单、min_chars 2）：只有提取侧会发锚点的块才可能
+/// 被译文命中；无译文的块一律保留原文；未匹配的译文 id 忽略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BiStrategy {
+    /// 原/译同段交错（原文块后紧跟译文块）——阅读对照形态。
+    ///
+    /// 译文与原文之间不空行（`\n` 直连，Markdown 渲染为同段软换行）：对照
+    /// 紧凑是双语对照读物的主流形态。em 级弱化（斜体标译文）刻意不做——
+    /// Markdown 形态保持纯文本，译文不借用原文的强调语义。
+    #[default]
+    BilingualInline,
+    /// 仅译文（替换原文块文本）。
+    TranslationOnly,
+    /// 原文完整 + 文末追加全部译文附录（按 chapter 分组）。
+    OriginalPlusAppendix,
+}
+
+/// 译文块的 Markdown 形态：Heading 保持同级标题（层级沿用原块），其余一律
+/// 纯文本——译文即正文，不加列表/引用前缀（translator 翻的就是块 content
+/// 原文，回写按文本对文本）。首尾空白裁剪：翻译端常见的尾换行不破坏
+/// 「不空行」的对照形态。
+fn translation_md(b: &crate::model::Block, translation: &str) -> String {
+    match b.kind {
+        BlockKind::Heading => {
+            let lvl = (b.level.unwrap_or(1) as usize).clamp(1, 6);
+            format!("{} {}", "#".repeat(lvl), translation.trim())
+        }
+        _ => translation.trim().to_string(),
+    }
+}
+
+/// 双语 Markdown 回写：`translated` 的键对应 [`to_translation_units`] 的 id
+/// 锚点（`p{页}-b{块序}`）；无译文的块按策略保留原文。未匹配的译文 id 忽略。
+/// 默认 [`BiStrategy::BilingualInline`]；见 [`to_bilingual_markdown_with`]。
+pub fn to_bilingual_markdown(doc: &Document, translated: &[(String, String)]) -> String {
+    to_bilingual_markdown_with(doc, translated, BiStrategy::default())
+}
+
+/// [`to_bilingual_markdown`] 带策略。
+///
+/// 遍历与过滤口径与 [`to_translation_units`] 完全一致（页×块序；
+/// [`is_translatable`] 白名单 + 非空白 + min_chars 2）——提取/回写两侧共用
+/// 同一锚点函数与同一候选谓词，id 不会漂移。非翻译块（Code/Table/Image 等）
+/// 原样按块渲染保留。
+///
+/// 各策略形态：
+///
+/// - [`BiStrategy::BilingualInline`]：原文渲染后 `\n` 直连译文（不空行，
+///   同段对照）；Heading 译文保持同级标题；
+/// - [`BiStrategy::TranslationOnly`]：译文整体替换原块文本（Heading 保持
+///   层级，其余纯文本）；
+/// - [`BiStrategy::OriginalPlusAppendix`]：正文为 [`to_markdown`] 完整原文 +
+///   `\n\n---\n\n# 译文\n\n`，译文按 chapter 分组（`##` 组标题，保持章节
+///   首次出现序；chapter 为 None 归 `（无章节）`），组内按文档序以空行分段。
+///   附录内译文一律纯文本段落（标题层级归附录自身的分组结构）。全文无命中
+///   译文时不追加空附录（输出即 [`to_markdown`]）。
+///
+/// 与 [`to_markdown`] 的渲染差异：双语遍历不做相邻列表合并（锚点对齐优先，
+/// 列表项逐条独立）；List/Quote 的译文为纯文本，Markdown 渲染中作为前文
+/// 续行/正文出现。
+pub fn to_bilingual_markdown_with(
+    doc: &Document,
+    translated: &[(String, String)],
+    strategy: BiStrategy,
+) -> String {
+    let map: std::collections::HashMap<&str, &str> = translated
+        .iter()
+        .map(|(id, t)| (id.as_str(), t.as_str()))
+        .collect();
+
+    if strategy == BiStrategy::OriginalPlusAppendix {
+        return original_plus_appendix(doc, &map);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for (p_idx, page) in doc.pages.iter().enumerate() {
+        let page_name = page.name.clone().unwrap_or_else(|| p_idx.to_string());
+        for (b_idx, b) in page.blocks.iter().enumerate() {
+            let rendered = block_md(b);
+            if rendered.is_empty() {
+                continue;
+            }
+            let translation = if translation_candidate(b, DEFAULT_TRANSLATION_MIN_CHARS) {
+                map.get(translation_id(&page_name, b_idx).as_str()).copied()
+            } else {
+                None
+            };
+            match translation {
+                None => out.push(rendered),
+                Some(t) => match strategy {
+                    BiStrategy::BilingualInline => {
+                        out.push(format!("{rendered}\n{}", translation_md(b, t)));
+                    }
+                    BiStrategy::TranslationOnly => out.push(translation_md(b, t)),
+                    BiStrategy::OriginalPlusAppendix => unreachable!("已在分支前提前返回"),
+                },
+            }
+        }
+    }
+    out.join("\n\n")
+}
+
+/// [`BiStrategy::OriginalPlusAppendix`] 的输出形态：完整原文 + 按章分组附录。
+fn original_plus_appendix(doc: &Document, map: &std::collections::HashMap<&str, &str>) -> String {
+    let body = to_markdown(doc);
+    // (chapter, 该章译文们)：保持章节首次出现序（遍历即文档序）
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for (p_idx, page) in doc.pages.iter().enumerate() {
+        let page_name = page.name.clone().unwrap_or_else(|| p_idx.to_string());
+        // 章节追踪与提取侧同口径：每个 Heading 都更新（含被 min_chars 滤掉的
+        // 短标题，其自身章节即自身文本）；跨页不追踪（随页重置）
+        let mut chapter: Option<String> = None;
+        for (b_idx, b) in page.blocks.iter().enumerate() {
+            if b.kind == BlockKind::Heading {
+                chapter = Some(b.content.clone());
+            }
+            if !translation_candidate(b, DEFAULT_TRANSLATION_MIN_CHARS) {
+                continue;
+            }
+            let t = match map.get(translation_id(&page_name, b_idx).as_str()).copied() {
+                Some(t) => t,
+                None => continue,
+            };
+            match groups
+                .iter_mut()
+                .find(|(c, _)| c.as_deref() == chapter.as_deref())
+            {
+                Some((_, texts)) => texts.push(t.trim().to_string()),
+                None => groups.push((chapter.clone(), vec![t.trim().to_string()])),
+            }
+        }
+    }
+    if groups.is_empty() {
+        return body; // 无命中译文：不追加空附录
+    }
+    let mut appendix: Vec<String> = vec!["---".into(), "# 译文".into()];
+    for (chapter, texts) in groups {
+        appendix.push(format!(
+            "## {}\n\n{}",
+            chapter.as_deref().unwrap_or("（无章节）"),
+            texts.join("\n\n")
+        ));
+    }
+    format!("{body}\n\n{}", appendix.join("\n\n"))
+}
+
 
 // ---------------------------------------------------------------------------
 // RAG 分块输出（docparse-plan §13 M4）：语义边界优先的检索块
@@ -330,7 +501,7 @@ pub fn to_rag_chunks_with(doc: &Document, max_chars: usize) -> Vec<RagChunk> {
             if b.content.trim().is_empty() {
                 continue; // 空内容块（含未 OCR 的 Image）无文本可切
             }
-            let anchor = format!("p{page_name}-b{b_idx}");
+            let anchor = translation_id(&page_name, b_idx);
             if b.kind == BlockKind::Heading {
                 // 规则 ①②：章边界即块边界，Heading 随文本开新块
                 close(&mut pending, &mut chunks);
@@ -512,6 +683,151 @@ mod tests {
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].text, "正式句子。");
+    }
+
+    // -------------------------------------------------------------------------
+    // 双语回写
+    // -------------------------------------------------------------------------
+
+    /// 原/译同段交错：2 原块 1 译文 → 顺序 原1/译1（不空行直连）/原2。
+    #[test]
+    fn bilingual_inline_interleaves() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("第一段原文。"), para("第二段原文。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string())];
+        let md = to_bilingual_markdown(&doc, &translated);
+        // 译文紧贴原文（对照紧凑），块与块之间仍空行分隔
+        assert_eq!(md, "第一段原文。\n第一段译文。\n\n第二段原文。");
+    }
+
+    /// 仅译文：有译文的块文本整体替换，无译文的保留原文。
+    #[test]
+    fn translation_only_replaces() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("第一段原文。"), para("第二段原文。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string())];
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
+        assert_eq!(md, "第一段译文。\n\n第二段原文。");
+        assert!(!md.contains("第一段原文。"), "原文被译文替换，不再出现");
+    }
+
+    /// 原文完整 + 附录：正文与 to_markdown 一致，译文按 chapter 分组，
+    /// 无章节的归（无章节）。
+    #[test]
+    fn original_plus_appendix_groups_by_chapter() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![
+                    para("开篇无章节。"), // b0：首 Heading 之前 → chapter None
+                    heading("第一章 起"), // b1
+                    para("甲段原文。"),   // b2 → 第一章
+                    heading("第二章 承"), // b3
+                    para("乙段原文。"),   // b4 → 第二章
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated = vec![
+            ("p0-b0".to_string(), "开篇译文。".to_string()),
+            ("p0-b2".to_string(), "甲段译文。".to_string()),
+            ("p0-b4".to_string(), "乙段译文。".to_string()),
+        ];
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
+        let expected = format!(
+            "{}\n\n---\n\n# 译文\n\n## （无章节）\n\n开篇译文。\n\n## 第一章 起\n\n甲段译文。\n\n## 第二章 承\n\n乙段译文。",
+            to_markdown(&doc)
+        );
+        assert_eq!(md, expected);
+    }
+
+    /// 未匹配的译文 id 忽略：全部未命中时输出等于纯原文 Markdown。
+    #[test]
+    fn unmatched_translation_ids_ignored() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("第一段原文。"), para("第二段原文。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let translated = vec![
+            ("p9-b9".to_string(), "错页译文。".to_string()),
+            ("p0-b99".to_string(), "错块译文。".to_string()),
+        ];
+        assert_eq!(
+            to_bilingual_markdown(&doc, &translated),
+            to_markdown(&doc),
+            "没有 id 命中：BilingualInline 退化为纯原文"
+        );
+    }
+
+    /// id 与提取侧完全一致：to_translation_units 发出的每个 id 都能被回写
+    /// 命中——全部译文喂入后，BilingualInline 输出里每个单元都是
+    /// 「原文渲染 + 译文」直连成对（行数 = 单元×2 + 非单元块行数）。
+    #[test]
+    fn id_matches_extraction_side() {
+        let doc = Document {
+            pages: vec![
+                Page {
+                    name: Some("7".into()),
+                    blocks: vec![
+                        heading("标题甲"), // b0 单元
+                        para("正文一句。"), // b1 单元
+                        Block {
+                            kind: BlockKind::Code,
+                            content: "let x = 1;".into(),
+                            ..Default::default()
+                        }, // b2 非翻译块，原样渲染
+                        para("乙"),        // b3：1 字符 < min_chars，提取侧不发锚点
+                        list(false, "甲项"), // b4 单元
+                        Block {
+                            kind: BlockKind::Quote,
+                            content: "引文一句。".into(),
+                            ..Default::default()
+                        }, // b5 单元
+                    ],
+                    ..Default::default()
+                },
+                Page {
+                    // 无名页 → 页序 "1"（与提取侧同口径）
+                    blocks: vec![para("跨页一段。")],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            ["p7-b0", "p7-b1", "p7-b4", "p7-b5", "p1-b0"]
+        );
+        // 用提取侧发出的全部 id（译文取单元文本加前缀，逐单元可分辨）喂入回写
+        let translated: Vec<(String, String)> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .collect();
+        let md = to_bilingual_markdown(&doc, &translated); // BilingualInline
+        // 全命中：每个单元的原文渲染与译文直连成对出现——漏命中即退化为
+        // 原文单独成段，与期望串不符；Heading 译文保持同级标题
+        assert_eq!(
+            md,
+            "# 标题甲\n# 译-标题甲\n\n正文一句。\n译-正文一句。\n\n```\nlet x = 1;\n```\n\n乙\n\n- 甲项\n译-甲项\n\n> 引文一句。\n译-引文一句。\n\n跨页一段。\n译-跨页一段。"
+        );
+        // 「块数 = 原×2」口径（按非空内容行计）：每个命中单元贡献 2 行
+        //（原/译各 1），非单元块贡献原行数（Code 3 行 + 被 min_chars 滤掉的
+        // 短块乙 1 行）：14 = 5×2 + 4
+        assert_eq!(md.lines().filter(|l| !l.is_empty()).count(), 2 * units.len() + 4);
     }
 
     #[test]
