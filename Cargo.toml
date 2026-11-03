@@ -39,6 +39,8 @@ djvu = ["dep:djvu-rs", "ocr"]
 fb2 = ["dep:quick-xml", "dep:base64", "dep:zip"]
 # 图像直读（png/jpg 等单图即文档：字节透传 + ocr-images 图→文链）
 image-files = ["dep:image", "ocr"]
+# 压缩包容器（zip/rar/7z 内层文本多页合并；rar 走纯 Rust rars，7z 走 sevenz-rust2）
+archive = ["dep:zip", "dep:rars", "dep:sevenz-rust2"]
 # CBZ（漫画压缩包：字节透传，OCR 链消费位；M5）
 cbz = ["dep:zip", "dep:image"]
 # MOBI（Kindle 电子书：mobi-rs 读 MOBI7 正文 HTML，azw3/KF8 不支持；M5）
@@ -66,6 +68,17 @@ optional = true
 
 [dependencies.log]
 version = "0.4"
+optional = true
+
+[dependencies.rars]
+version = "0.12.3"
+default-features = false
+optional = true
+
+[dependencies.sevenz-rust2]
+version = "0.24"
+default-features = false
+features = ["util"]
 optional = true
 
 [dependencies.pulldown-cmark]

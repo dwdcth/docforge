@@ -65,6 +65,13 @@ pub fn sniff(path: &str) -> Result<&'static str> {
         });
     }
 
+    if ext == "rar" {
+        return Ok("rar");
+    }
+    if ext == "7z" {
+        return Ok("7z");
+    }
+
     // MOBI/PalmDOC：PalmDB 容器（BOOKMOBI magic 在 offset 60），按扩展名
     // 直连、头部校验由后端判（加密/DRM 在后端报 encrypted 终止码）
     if ext == "mobi" || ext == "prc" {
@@ -91,6 +98,11 @@ pub fn sniff(path: &str) -> Result<&'static str> {
         // fb2.zip：ZIP 容器内层单 .fb2（后端解包；内层校验由后端判）
         if ext == "zip" && path.to_ascii_lowercase().ends_with(".fb2.zip") {
             return Ok("fb2");
+        }
+        // 通用压缩包（.zip 扩展名）：内层文本多页合并；.fb2.zip/.cbz 已在
+        // 前面特判分流，此处通吃不受影响
+        if ext == "zip" {
+            return Ok("zip");
         }
         // ODF（ODT/ODS/ODP）同样是 ZIP 容器（内层 content.xml），按扩展名分流；
         // 真实类型由 docparser-odf 后端读 mimetype/content.xml 进一步校验
