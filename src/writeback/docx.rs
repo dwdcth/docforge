@@ -2,28 +2,33 @@
 //! DOCX 双语回写：解包原 ZIP → 重解析建立块序对齐 → 改写 `word/document.xml`
 //! → 其余部件字节透传，重打包到 `out`。
 //!
-//! # 对齐口径（与 `backends/office/docx.rs` 解析侧逐条对应）
+//! # 对齐口径（单元流 ↔ 可翻译位，由解析侧单遍发号保证）
 //!
-//! * 单元流 ↔ XML 位序列一一对应：[`crate::emit::to_translation_units`]
-//!   全量流（段落单元 + 表格格单元按文档序交错）配对本扫描产出的「可翻译
-//!   位」序列：
+//! * 位序列不再独立扫描（影子割接）：`DocxRawBackend::parse_with_spans`
+//!   在既有解析一遍内顺带发号产旁路槽位表 `DocxSlotSidecar`，可翻译位由
+//!   `slots_from_sidecar` 按 [`crate::model::SourceToken`] 信物从中解析——
+//!   「第 k 单元 ↔ 第 k 位」从两套枚举的人工镜像收敛为同一枚举的信物寻址，
+//!   结构上不可能漂移（发号规则见 `DocxSlotSidecar` 文档）：
 //!   - 段落位：body 直属（及 sdt 内）trim 非空 + 字符数 ≥ 2 的 `w:p`
-//!     （与单元流同口径）；自闭合 `<w:p/>` 无文本，不占位；
+//!     （与单元流同口径；< 2 字符的段落有槽位但无单元，自然不消费）；
+//!     自闭合 `<w:p/>` 无文本，不占位；
 //!   - 格位：`w:tbl` 内 trim 非空的 `w:tc`（格阈值恒 1 = trim 非空即收，
 //!     不受段落位 ≥2 字符约束）。网格口径与解析侧 `extract_table_rows`
-//!     逐条镜像：**一格一列**——解析侧对 `gridSpan`/`vMerge` 不做展开，
+//!     同一实现：**一格一列**——对 `gridSpan`/`vMerge` 不做展开，
 //!     `TableData.rows` 的行 = `w:tr` 文档序、列 = `w:tc` 在其 `w:tr` 内的
 //!     文档序，空格在网格占列但不发单元；格文本 = 格内直接子级 `w:p` 的
 //!     非空段（trim）join `\n`（嵌套表按解析侧口径展平同位并入）。行/列
-//!     坐标由提取侧锚点（`-r{行}c{列}`）承载，回写只按文档序配对，不做
+//!     坐标由提取侧锚点（`-r{行}c{列}`）承载，回写只按信物寻址配对，不做
 //!     坐标换算；
 //!   - `w:tbl` 子树内的 `w:p` 属于格（或嵌套表），不再是正文段落位——与
 //!     解析侧一致。
-//! * 文本提取语义与解析侧 `extract_para` 相同：只收 `w:t` 文本（含实体解码
-//!   / CDATA），`w:tab`→`\t`、`w:br`/`w:cr`→`\n`、`w:noBreakHyphen`→`-`；
-//!   文本框等嵌套 `w:p` 的 `w:t` 并入外层段落文本（解析侧同此行为）。
-//! * 双保险：每个位与重解析的对应单元做文本一致性比对（格位同款），不一致
-//!   跳过该位不写、单元照常消费保流对齐——宁漏勿错（防解析器演进后错位写）。
+//! * 文本提取语义与解析侧 `extract_para` 相同（同一实现，无镜像）：只收
+//!   `w:t` 文本（含实体解码 / CDATA），`w:tab`→`\t`、`w:br`/`w:cr`→`\n`、
+//!   `w:noBreakHyphen`→`-`；文本框等嵌套 `w:p` 的 `w:t` 并入外层段落文本。
+//! * 双保险（守卫保留）：每个位与对应单元做文本一致性比对（格位同款），
+//!   不一致跳过该位不写、单元照常消费保流对齐——宁漏勿错。位与单元同源后
+//!   守卫退化为不变量检查（触发即信物缺失落空位 / 发号↔展开漂移），①→④
+//!   边界的真正把关是下面的源校验。
 //! * 源校验（①→④ 边界）：[`crate::emit::TranslationPair`] 的 `source` 携带
 //!   提取侧源文本时，写入前与当前位文本比对，不一致跳过并记入
 //!   [`WritebackReport`]——①与④两次解析之间文件被改时位置锚点会指向别的
@@ -45,11 +50,11 @@
 //! * v1 简化（写入侧，文本守卫兜底）：含嵌套表的格不写（清空/追加会破坏
 //!   嵌套表文本或留 `,` 展平残留），格位照常占位；格内富文本 run 结构只保
 //!   留不清（同段落的 TranslationOnly 简化口径）。
-//! * `w:sdt`（内容控件，正文里多为 TOC）：取其子树内的 `w:p` 作候选位，
-//!   sdt 内表格仍整棵跳过。已知差异：解析侧 `extract_sdt_items` 的深度计数
-//!   在提取段落后不回落，sdt 之后的表格会被吞进 sdt 循环、其段落被当正文
-//!   段落提取（上游特性）；本扫描按良构深度跟踪——若文档真踩到此差异，
-//!   文本一致性守卫会让受影响位保守跳过而不是错位写。
+//! * `w:sdt`（内容控件，正文里多为 TOC）：子树内的 `w:p` 照常发号成段落位
+//!   （与解析侧 `extract_sdt_items` 同一枚举）。已知上游特性：该函数的深度
+//!   计数在提取段落后不回落，sdt 之后的表格会被吞进 sdt 循环、其段落被当
+//!   正文段落提取——位与单元同源后不存在旧独立扫描器的口径分叉，两侧一致
+//!   按解析侧枚举配对（与 Python 参考实现的枚举差异仍由源校验把关）。
 //!
 //! # 节交替（[`writeback_docx_alternating`]，rumi「一页原文一页译文」#12）
 //!
@@ -92,11 +97,12 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::backends::office::docx::DocxRawBackend;
-use crate::backends::office::{tags, OfficePlugin};
+use crate::backends::office::docx::{DocxRawBackend, DocxSlot, DocxSlotSidecar};
+use crate::backends::office::{tags, OfficePlugin, StructureMode};
 use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
-use crate::plugin::{FormatPlugin, ParseCapability};
+use crate::model::SourceToken;
+use crate::plugin::FormatPlugin;
 
 use super::{escape_xml_text, open_zip, pair_map, rewrite_zip, WritebackReport};
 
@@ -114,20 +120,25 @@ pub fn writeback_docx(
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
-    // 第一遍：docforge 解析（与提取侧 register_defaults 完全相同的默认装配：
-    // structure_mode=auto / include_regions=false / ocr_images=false）拿块序与 id。
-    // 单元流取全量：段落单元 + 表格格单元按文档序交错（格单元由 XML 扫描的
-    // w:tbl 格位配对，见模块头对齐口径）。
-    let raw = DocxRawBackend::default().parse(in_path)?;
+    // 第一遍：docforge 解析（与提取侧 register_defaults 相同的开关装配：
+    // include_regions=false / ocr_images=false；structure_mode 显式 Semantic——
+    // 回写消费的是 item 块流与旁路槽位表信物，快路径行块不携信物、无法逐位
+    // 寻址，零信号文档也必须走结构路径）。单元流取全量：段落单元 + 表格格
+    // 单元按文档序交错（格单元由信物拆分寻址格槽位，见模块头对齐口径）。
+    let (raw, sidecar) = DocxRawBackend::default()
+        .with_structure_mode(StructureMode::Semantic)
+        .parse_with_spans(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
     let map = pair_map(pairs);
 
-    // 第二遍：XML 扫描可翻译位（段落位 + 格位），与单元按序对齐。
+    // 第二遍：原 XML 字节照常另读（编辑拼装基底）；可翻译位由槽位表按单元
+    // 信物解析（旧独立扫描器 scan_slots 已割接删除，见 slots_from_sidecar）。
     let mut zip = open_zip(in_path)?;
     let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
-    let (slots, body_close) = scan_slots(&xml)?;
+    let slots = slots_from_sidecar(&units, &sidecar, &xml);
+    let body_close = docx_body_close(&xml);
 
     let mut report = WritebackReport::default();
     let new_xml = match strategy {
@@ -174,9 +185,11 @@ pub fn writeback_docx_alternating(
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
-    // A. 与 writeback_docx 同一套解析 + 扫描 + 编辑（锚点体系不变）；策略
+    // A. 与 writeback_docx 同一套解析 + 槽位寻址 + 编辑（锚点体系不变）；策略
     //    固定 TranslationOnly——译文段 = 该段全部命中单元的纯译文渲染。
-    let raw = DocxRawBackend::default().parse(in_path)?;
+    let (raw, sidecar) = DocxRawBackend::default()
+        .with_structure_mode(StructureMode::Semantic)
+        .parse_with_spans(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
     let map = pair_map(pairs);
@@ -184,7 +197,7 @@ pub fn writeback_docx_alternating(
     let mut zip = open_zip(in_path)?;
     let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
-    let (slots, _) = scan_slots(&xml)?;
+    let slots = slots_from_sidecar(&units, &sidecar, &xml);
     let mut report = WritebackReport::default();
     let edits = translation_only_edits(&xml, &slots, &units, &map, &mut report);
     if edits.is_empty() {
@@ -206,7 +219,7 @@ pub fn writeback_docx_alternating(
 }
 
 // ---------------------------------------------------------------------------
-// 可翻译位扫描（quick-xml 流式，带字节 span；段落位 + 表格格位）
+// 可翻译位（由旁路槽位表按单元信物解析，见 slots_from_sidecar）
 // ---------------------------------------------------------------------------
 
 /// 一个「可翻译段落位」：`<w:p>` 的字节 span + 与解析侧同口径的文本 + 原段 pPr。
@@ -223,14 +236,6 @@ struct ParaSlot {
     text_spans: Vec<(usize, usize)>,
 }
 
-impl ParaSlot {
-    /// 合格翻译位判定：与 `to_translation_units` 同口径（trim 非空 + ≥2 字符）。
-    fn is_candidate(&self) -> bool {
-        let t = self.text.trim();
-        !t.is_empty() && t.chars().count() >= 2
-    }
-}
-
 /// 一个「表格格位」：`<w:tc>` 的格文本与格内直接子级 `w:p` 段位。
 #[derive(Debug, Clone)]
 struct CellSlot {
@@ -241,14 +246,6 @@ struct CellSlot {
     paras: Vec<ParaSlot>,
     /// 格内含嵌套 `w:tbl`。v1 不写此类格（见模块头），格位照常占位保对齐。
     has_nested_table: bool,
-}
-
-impl CellSlot {
-    /// 格的合格判定：trim 非空即占位（格阈值恒 1，与提取侧单元格展开口径
-    /// 一致，不受段落位的 ≥2 字符约束）。
-    fn is_candidate(&self) -> bool {
-        !self.text.trim().is_empty()
-    }
 }
 
 /// 一个「可翻译位」：正文段落位或表格格位，按文档序与单元流一一配对。
@@ -273,146 +270,76 @@ fn bpos<R: std::io::BufRead>(reader: &Reader<R>) -> usize {
     reader.buffer_position() as usize
 }
 
-/// 扫描 body 直属子级，产出文档序的可翻译位（段落位 + 格位）与
-/// `</w:body>` 起始偏移。`w:tbl` 产格位（见 [`consume_table`]）；
-/// `w:sdt` 取子树内段落（sdt 内表格整棵跳过，见模块头已知差异）。
-fn scan_slots(xml: &str) -> Result<(Vec<Slot>, usize)> {
-    let mut reader = Reader::from_str(xml);
-    let mut buf = Vec::new();
-    // 定位 <w:body>（解析侧同款前置循环）
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().local_name().as_ref() == tags::W_BODY => break,
-            Ok(Event::Eof) => return Err(DocError::corrupt("no w:body found")),
-            Err(e) => return Err(DocError::corrupt(format!("XML parse error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-    buf.clear();
-
-    let mut slots: Vec<Slot> = Vec::new();
-    let body_close = loop {
-        let pos_before = bpos(&reader);
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name().local_name().as_ref() {
-                tags::W_P => {
-                    let slot = consume_para(&mut reader, xml)?;
-                    if slot.is_candidate() {
-                        slots.push(Slot::Para(slot));
-                    }
-                }
-                tags::W_TBL => consume_table(&mut reader, xml, &mut slots)?,
-                tags::W_SDT => consume_sdt(&mut reader, xml, &mut slots)?,
-                _ => {}
-            },
-            Ok(Event::End(ref e)) if e.name().local_name().as_ref() == tags::W_BODY => {
-                break pos_before
-            }
-            Ok(Event::Eof) => break xml.len(),
-            Err(e) => return Err(DocError::corrupt(format!("XML body scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    };
-    Ok((slots, body_close))
+/// 由单元流 + 解析侧旁路槽位表解析出可翻译位序列（影子割接：替代原独立
+/// 二次扫描器 `scan_slots`，信息结构与其逐字段等价）。按 `unit.source_token`
+/// 逐单元寻址槽位区间：段落类单元信物 = 所在块信物（单槽）；格单元信物 =
+/// 块信物按候选格拆分的单槽（发号序 = 单元展开序，见 emit 侧）。
+///
+/// 无信物（非 docx 产物 / 快路径行块）或信物越界 / 非单槽（防漂移防御）的
+/// 单元落「空位」：无 span、空文本——文本守卫必不相等，对应译文保守跳过
+/// （宁漏勿错；debug 下发号↔展开两侧的 debug_assert 会先一步报警）。
+/// 旧扫描的 `body_close` 副产品不在此（见 [`docx_body_close`]）。
+fn slots_from_sidecar(
+    units: &[crate::emit::TranslationUnit],
+    sidecar: &DocxSlotSidecar,
+    xml: &str,
+) -> Vec<Slot> {
+    units
+        .iter()
+        .map(|unit| {
+            unit.source_token
+                .and_then(|t| single_slot(sidecar, t))
+                .map(|d| materialize_slot(d, xml))
+                .unwrap_or_else(empty_para_slot)
+        })
+        .collect()
 }
 
-/// 消费一个 `<w:p>` 子树（调用时 reader 刚读完 `<w:p>` Start），返回段落位。
-/// 文本/占位语义与解析侧 `extract_para` 一致。
-fn consume_para<R: std::io::BufRead>(reader: &mut Reader<R>, xml: &str) -> Result<ParaSlot> {
-    let mut buf = Vec::new();
-    let mut text = String::new();
-    let mut text_spans: Vec<(usize, usize)> = Vec::new();
-    let mut ppr: Option<String> = None;
-    let mut ppr_start = 0usize;
-    let mut in_t = false;
-    let mut depth = 1usize;
+/// `</w:body>` 起始字节偏移（旧扫描的 body_close 副产品，OriginalPlusAppendix
+/// 插位用）。刻意不随解析侧槽位表携带：`extract_sdt_items` 的深度 quirk 会吞
+/// 掉 sdt 尾文档的收尾 End 事件，解析循环内的字节位不可靠；这里一次
+/// `rfind` 轻量定位，对 quirk 免疫且与旧扫描器取值逐字节同口径（良构文档
+/// 恰一处 `</w:body>`；无收尾时同取全文长）。
+fn docx_body_close(xml: &str) -> usize {
+    xml.rfind("</w:body>").unwrap_or(xml.len())
+}
 
-    loop {
-        let pos_before = bpos(reader);
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                match e.name().local_name().as_ref() {
-                    // pPr 在跑文本之前：整棵子树按普通元素消费，只留原文 span
-                    tags::W_PPR => {
-                        ppr_start = pos_before;
-                        depth += 1;
-                    }
-                    tags::W_T => {
-                        in_t = true;
-                        depth += 1;
-                    }
-                    tags::W_TAB => {
-                        depth += 1;
-                        text.push('\t');
-                    }
-                    tags::W_BR | tags::W_CR => {
-                        depth += 1;
-                        text.push('\n');
-                    }
-                    tags::W_NBH => {
-                        depth += 1;
-                        text.push('-');
-                    }
-                    _ => depth += 1,
-                }
-            }
-            Ok(Event::End(ref e)) => {
-                let name = e.name().local_name().as_ref().to_string();
-                if name == tags::W_T {
-                    in_t = false;
-                }
-                if name == tags::W_PPR {
-                    // 事件读完后的 position = `</w:pPr>` 之后 → 原 pPr 全文
-                    ppr = Some(xml[ppr_start..bpos(reader)].to_string());
-                }
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            Ok(Event::Empty(ref e)) => match e.name().local_name().as_ref() {
-                tags::W_TAB => text.push('\t'),
-                tags::W_BR | tags::W_CR => text.push('\n'),
-                tags::W_NBH => text.push('-'),
-                _ => {}
-            },
-            Ok(Event::Text(ref e)) => {
-                if in_t {
-                    let span_start = pos_before;
-                    let raw = e.xml10_content();
-                    if let Ok(t) = quick_xml::escape::unescape(&raw) {
-                        text.push_str(&t);
-                    }
-                    text_spans.push((span_start, bpos(reader)));
-                }
-            }
-            Ok(Event::GeneralRef(ref e)) => {
-                if in_t {
-                    let span_start = pos_before;
-                    crate::backends::office::push_general_ref(&mut text, e);
-                    text_spans.push((span_start, bpos(reader)));
-                }
-            }
-            Ok(Event::CData(ref e)) => {
-                if in_t {
-                    let span_start = pos_before;
-                    text.push_str(e.as_ref());
-                    text_spans.push((span_start, bpos(reader)));
-                }
-            }
-            Err(e) => return Err(DocError::corrupt(format!("XML para scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
+/// 单槽信物 → 槽位（越界 / 非单槽 = None；正常单元恒单槽信物）。
+fn single_slot(sidecar: &DocxSlotSidecar, token: SourceToken) -> Option<&DocxSlot> {
+    if token.slot_count != 1 {
+        return None;
     }
+    sidecar.slots.get(token.first_slot as usize)
+}
 
-    Ok(ParaSlot {
-        end: bpos(reader),
-        text,
-        ppr,
-        text_spans,
+/// 旁路槽位 → 回写位：pPr 由 span 从原 XML 取原文（越界防御取 None）。
+fn materialize_slot(slot: &DocxSlot, xml: &str) -> Slot {
+    match slot {
+        DocxSlot::Para(p) => Slot::Para(materialize_para(p, xml)),
+        DocxSlot::Cell(c) => Slot::Cell(CellSlot {
+            text: c.text.clone(),
+            paras: c.paras.iter().map(|p| materialize_para(p, xml)).collect(),
+            has_nested_table: c.has_nested_table,
+        }),
+    }
+}
+
+fn materialize_para(p: &crate::backends::office::docx::DocxParaSlot, xml: &str) -> ParaSlot {
+    ParaSlot {
+        end: p.end,
+        text: p.text.clone(),
+        ppr: p.ppr.and_then(|(s, e)| xml.get(s..e).map(str::to_string)),
+        text_spans: p.text_spans.clone(),
+    }
+}
+
+/// 无信物 / 越界单元的落空位：无 span、空文本——守卫必不相等（保守跳过）。
+fn empty_para_slot() -> Slot {
+    Slot::Para(ParaSlot {
+        end: 0,
+        text: String::new(),
+        ppr: None,
+        text_spans: Vec::new(),
     })
 }
 
@@ -436,237 +363,6 @@ fn consume_subtree<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<usize>
         }
         buf.clear();
     }
-}
-
-/// 消费 `<w:sdt>` 子树，把其中的正文 `w:p`（不含表格内段落）登记为候选位。
-fn consume_sdt<R: std::io::BufRead>(
-    reader: &mut Reader<R>,
-    xml: &str,
-    slots: &mut Vec<Slot>,
-) -> Result<()> {
-    let mut buf = Vec::new();
-    let mut depth = 1usize;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                match e.name().local_name().as_ref() {
-                    tags::W_P => {
-                        let slot = consume_para(reader, xml)?;
-                        if slot.is_candidate() {
-                            slots.push(Slot::Para(slot));
-                        }
-                        // consume_para 吃掉了配对 End，深度不增减（对齐解析侧）
-                        continue;
-                    }
-                    tags::W_TBL => {
-                        // sdt 内表格：整棵跳过（解析侧 quirk 使其段落被当正文
-                        // 段落提取，见模块头已知差异；文本一致性守卫兜底）
-                        consume_subtree(reader)?;
-                        continue;
-                    }
-                    _ => depth += 1,
-                }
-            }
-            Ok(Event::End(ref _e)) => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(());
-                }
-            }
-            Ok(Event::Eof) => return Ok(()),
-            Err(e) => return Err(DocError::corrupt(format!("XML sdt scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 表格格位扫描（与解析侧 extract_table_rows 网格口径逐条镜像）
-// ---------------------------------------------------------------------------
-
-/// 消费 body 直属 `<w:tbl>` 子树（调用时 reader 刚读完 `<w:tbl>` Start），
-/// 把 trim 非空的 `w:tc` 登记为格位（文档序）。
-///
-/// 网格口径与解析侧完全同款（**一格一列**）：解析侧对 `gridSpan`/`vMerge`
-/// 不做任何展开，`TableData.rows` 的行 = `w:tr` 文档序、列 = `w:tc` 在其
-/// `w:tr` 内的文档序，空格（无文本 `w:tc`）在网格占列但不发单元。因此格位
-/// 按 `w:tc` 文档序产出即与提取侧格单元（`-r{行}c{列}`，列 = 行内下标）
-/// 一一对齐，无需网格坐标换算。嵌套表整棵由 [`consume_cell`] 消费（其段落
-/// 不产位——解析侧把嵌套表展平进所在格）。
-fn consume_table<R: std::io::BufRead>(
-    reader: &mut Reader<R>,
-    xml: &str,
-    slots: &mut Vec<Slot>,
-) -> Result<()> {
-    let mut buf = Vec::new();
-    let mut depth = 1usize;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name().local_name().as_ref() {
-                // w:tc 只在本表的 w:tr 直下出现（嵌套表的子树由 consume_cell
-                // 整棵消费，不经过本循环）；consume_cell 吃掉配对 End，深度不增减
-                tags::W_TC => {
-                    let cell = consume_cell(reader, xml)?;
-                    if cell.is_candidate() {
-                        slots.push(Slot::Cell(cell));
-                    }
-                }
-                _ => depth += 1,
-            },
-            Ok(Event::End(ref _e)) => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(());
-                }
-            }
-            Ok(Event::Eof) => return Ok(()),
-            Err(e) => return Err(DocError::corrupt(format!("XML table scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-}
-
-/// 消费一个 `<w:tc>` 子树（调用时 reader 刚读完 `<w:tc>` Start），返回格位。
-/// 格文本与解析侧单格累积逐条同款：直接子级 `w:p` 的非空段（trim）按文档序
-/// join `\n`；嵌套 `w:tbl` 按解析侧口径展平、同位并入（并入判定用行数而非
-/// 展平串是否为空）；末尾整体 trim（解析侧 `w:tc` End 同此）。
-fn consume_cell<R: std::io::BufRead>(reader: &mut Reader<R>, xml: &str) -> Result<CellSlot> {
-    let mut buf = Vec::new();
-    let mut text = String::new();
-    let mut paras: Vec<ParaSlot> = Vec::new();
-    let mut has_nested_table = false;
-    let mut has_content = false;
-    let mut depth = 1usize;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name().local_name().as_ref() {
-                tags::W_P => {
-                    let para = consume_para(reader, xml)?;
-                    // 与解析侧一致：非空段才进格文本；段位照常收（写入用）
-                    let t = para.text.trim();
-                    if !t.is_empty() {
-                        if has_content {
-                            text.push('\n');
-                        }
-                        text.push_str(t);
-                        has_content = true;
-                    }
-                    paras.push(para);
-                    // consume_para 吃掉了配对 End，深度不增减
-                }
-                tags::W_TBL => {
-                    let (rows, flat) = consume_nested_table_text(reader, xml)?;
-                    has_nested_table = true;
-                    if rows > 0 {
-                        if has_content {
-                            text.push('\n');
-                        }
-                        text.push_str(&flat);
-                        has_content = true;
-                    }
-                    // 嵌套表整棵已消费，深度不增减
-                }
-                _ => depth += 1,
-            },
-            Ok(Event::End(ref _e)) => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(DocError::corrupt(format!("XML cell scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(CellSlot {
-        text: text.trim().to_string(),
-        paras,
-        has_nested_table,
-    })
-}
-
-/// 消费嵌套 `<w:tbl>` 子树（调用时 reader 刚读完 `<w:tbl>` Start），按解析侧
-/// `extract_table_rows` 的文本口径展平：格内非空段（trim）join `\n`、行内格
-/// join `,`、行间 join `\n`。返回 (行数, 展平文本)——行数镜像解析侧
-/// `!nested.is_empty()` 的并入判定（全空格行表也置 has_content，保证格文本
-/// /候选判定与解析侧逐字节一致）。
-fn consume_nested_table_text<R: std::io::BufRead>(
-    reader: &mut Reader<R>,
-    xml: &str,
-) -> Result<(usize, String)> {
-    let mut buf = Vec::new();
-    let mut depth = 1usize;
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut cell = String::new();
-    let mut cell_has_content = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name().local_name().as_ref() {
-                tags::W_P => {
-                    let para = consume_para(reader, xml)?;
-                    let t = para.text.trim();
-                    if !t.is_empty() {
-                        if cell_has_content {
-                            cell.push('\n');
-                        }
-                        cell.push_str(t);
-                        cell_has_content = true;
-                    }
-                }
-                tags::W_TBL => {
-                    // 更深嵌套：递归展平（内部消费了配对 End，深度不增减）
-                    let (nested_rows, nested_flat) = consume_nested_table_text(reader, xml)?;
-                    if nested_rows > 0 {
-                        if cell_has_content {
-                            cell.push('\n');
-                        }
-                        cell.push_str(&nested_flat);
-                        cell_has_content = true;
-                    }
-                }
-                _ => depth += 1,
-            },
-            Ok(Event::End(ref e)) => {
-                depth -= 1;
-                match e.name().local_name().as_ref() {
-                    tags::W_TBL if depth == 0 => {
-                        if !row.is_empty() {
-                            rows.push(std::mem::take(&mut row));
-                        }
-                        break;
-                    }
-                    tags::W_TR => {
-                        // 行结束：单元格已由 W_TC End 处理，只需保存行
-                        if !row.is_empty() {
-                            rows.push(std::mem::take(&mut row));
-                        }
-                    }
-                    tags::W_TC => {
-                        // 单元格结束：保存内容（空格也占列，与解析侧一致）
-                        row.push(cell.trim().to_string());
-                        cell.clear();
-                        cell_has_content = false;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(DocError::corrupt(format!("XML nested table scan error: {e}"))),
-            _ => {}
-        }
-        buf.clear();
-    }
-    let flat = rows
-        .iter()
-        .map(|r| r.join(","))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok((rows.len(), flat))
 }
 
 // ---------------------------------------------------------------------------
@@ -810,8 +506,8 @@ const SECTPR_CLOSE_TAG: &str = "</w:sectPr>";
 ///
 /// sectPr 不嵌套 sectPr，开标签后首个闭标签即配对者；`<w:sectPr` 子串定位
 /// 不会误命中属性值/文本——良构 XML 里 `<` 必转义为 `&lt;`。病态输入（无
-/// `>` 或无配对闭标签；unreachable：`scan_slots` 已 quick-xml 全文解析成功，
-/// ppr 必为良构片段）保守保留原字节。
+/// `>` 或无配对闭标签；unreachable：pPr 片段来自同一文件的全量 quick-xml
+/// 解析成功之后，必为良构片段）保守保留原字节。
 fn strip_sectpr(ppr: &str) -> String {
     let mut out = String::with_capacity(ppr.len());
     let mut rest = ppr;
@@ -1106,14 +802,14 @@ struct Segment {
 }
 
 /// 扫描 body 直属子级：返回 (body 内容起点, 顶层块序列, 尾部裸 sectPr 起点)。
-/// 与 [`scan_slots`] 平行的轻扫描——只记块字节 span 与节/分页标记（分段是
-/// 回写侧 XML 层的事，不依赖解析侧；解析侧不识别 sectPr/分页符）。顶层
-/// `w:sectPr`（裸节符，OOXML 规定为 body 最后一个子级）记尾、整棵消费、不
-/// 记块——其后字节全部走尾部透传。
+/// 与 [`slots_from_sidecar`] 平行的轻扫描——只记块字节 span 与节/分页标记
+/// （分段是回写侧 XML 层的事，不依赖解析侧；解析侧不识别 sectPr/分页符）。
+/// 顶层 `w:sectPr`（裸节符，OOXML 规定为 body 最后一个子级）记尾、整棵消费、
+/// 不记块——其后字节全部走尾部透传。
 fn scan_body_blocks(xml: &str) -> Result<(usize, Vec<BodyBlock>, Option<usize>)> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
-    // 定位 <w:body>（scan_slots 同款前置循环）
+    // 定位 <w:body>（位寻址侧同款前置循环）
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) if e.name().local_name().as_ref() == tags::W_BODY => break,
@@ -1394,7 +1090,10 @@ mod tests {
     }
 
     /// 与 writeback 同一套装配（= 提取侧 register_defaults 的行为）。
+    /// `parse` 是 ParseCapability trait 方法（解析主体在 parse_with_spans，
+    /// trait 实现委托丢弃 sidecar）——测试模块显式引入作用域。
     fn parse_doc(path: &Path) -> crate::model::Document {
+        use crate::plugin::ParseCapability as _;
         let raw = DocxRawBackend::default()
             .parse(path)
             .unwrap();
@@ -1840,21 +1539,25 @@ mod tests {
             ]
         );
 
-        // 两个格位都在流上且文本守卫通过（嵌套展平镜像与解析侧一致 → 不因
-        // 守卫漏配；配对是位置的，守卫只把关写不写）
+        // 两个格位都在流上且文本守卫通过（格文本与单元文本同源 → 不因守卫
+        // 漏配；配对是位置的，守卫只把关写不写）
         let translated: Vec<TranslationPair> = vec![
             ("p0-b0-r0c0".to_string(), "[外格]".to_string()).into(),
             ("p0-b0-r0c1".to_string(), "[普通格]".to_string()).into(),
         ];
         let xml = entry_str(&in_path, "word/document.xml");
-        let (slots, _) = scan_slots(&xml).unwrap();
+        let (_raw, sidecar) = DocxRawBackend::default()
+            .with_structure_mode(StructureMode::Semantic)
+            .parse_with_spans(&in_path)
+            .unwrap();
+        let slots = slots_from_sidecar(&units, &sidecar, &xml);
         let map = pair_map(&translated);
         let mut probe = WritebackReport::default();
         let matched = matched_translations(&slots, &units, &map, &mut probe);
         assert_eq!(
             matched.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [0, 1],
-            "两个格位都命中（流对齐 + 展平镜像精确）"
+            "两个格位都命中（信物寻址精确 + 文本同源）"
         );
         assert!(probe.skipped.is_empty(), "守卫通过：无跳过");
 
@@ -1999,6 +1702,7 @@ mod tests {
             chapter: None,
             header: false,
             running: false,
+            source_token: None,
         };
         let pairs: Vec<TranslationPair> = [
             ("p0-b0-r0c0".to_string(), "格译文".to_string()),
@@ -2591,7 +2295,7 @@ mod tests {
             r#"<w:pPr><w:pStyle w:val="H1"/></w:pPr>"#
         );
         assert_eq!(strip_sectpr(""), "");
-        // 病态（unreachable：scan_slots 已全文解析成功）：保守保留原字节
+        // 病态（unreachable：pPr 片段来自全文 quick-xml 解析成功之后）：保守保留原字节
         assert_eq!(
             strip_sectpr("<w:pPr><w:sectPr></w:pPr>"),
             "<w:pPr><w:sectPr></w:pPr>"
@@ -2622,11 +2326,14 @@ mod tests {
         assert!(preserve_space_tag_edit(xml, run_end, " EN ").is_none());
     }
 
-    /// 枚举等价（解析器↔扫描器漂移报警器）：对全部 docx fixture 显式断言
-    /// 「扫描器槽位文本序列 == to_translation_units 文本序列」——两侧都来自
-    /// ④的同一文件；roundtrip 金测只隐式覆盖该不变量，这里独立钉死。
+    /// 枚举等价（发号↔单元流漂移报警器，影子割接后永久保留）：对全部 docx
+    /// fixture 断言「按单元信物从旁路槽位表解析出的位文本序列 ==
+    /// to_translation_units 文本序列」。位与单元同源后此不变量应结构成立——
+    /// 信物漏发/错位/格拆分漂移会在这里响亮失败（落空位文本为空 ≠ 单元文本），
+    /// 而不是在回写时静默守卫跳过。另验 `docx_body_close` 轻量定位与旧扫描
+    /// 器 body_close 同口径（`</w:body>` 起始偏移）。
     #[test]
-    fn scanner_slot_texts_enumerate_same_as_translation_units() {
+    fn sidecar_slot_texts_enumerate_same_as_translation_units() {
         let fixtures: Vec<(&str, &str)> = vec![
             ("basic", DOCUMENT_XML),
             ("sectpr", SECTPR_XML),
@@ -2644,16 +2351,77 @@ mod tests {
         for (name, xml) in fixtures {
             let path = dir.join(format!("{name}.docx"));
             build_docx(&path, xml);
-            let (slots, _) = scan_slots(xml).unwrap();
-            let slot_texts: Vec<&str> = slots.iter().map(|s| s.text().trim()).collect();
-            let doc = parse_doc(&path);
+            let xml_str = entry_str(&path, "word/document.xml");
+            let (raw, sidecar) = DocxRawBackend::default()
+                .with_structure_mode(StructureMode::Semantic)
+                .parse_with_spans(&path)
+                .unwrap();
+            let doc = OfficePlugin::default().assemble(&raw);
             let units = to_translation_units(&doc);
+            let slots = slots_from_sidecar(&units, &sidecar, &xml_str);
+            assert_eq!(
+                slots.len(),
+                units.len(),
+                "fixture {name}: 每个单元都应按信物寻址到位"
+            );
+            let slot_texts: Vec<&str> = slots.iter().map(|s| s.text().trim()).collect();
             let unit_texts: Vec<&str> = units.iter().map(|u| u.text.trim()).collect();
             assert_eq!(
                 slot_texts, unit_texts,
-                "fixture {name}: 解析器↔扫描器枚举漂移（宁在此响亮失败，不错位写）"
+                "fixture {name}: 发号↔单元流漂移（宁在此响亮失败，不错位写）"
+            );
+            assert!(
+                xml_str[docx_body_close(&xml_str)..].starts_with("</w:body>"),
+                "fixture {name}: body_close 应落在 </w:body> 起符"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 信物透传形态（writeback 视角，与解析侧发号测试互补）：段落/标题块
+    /// 信物原样到块再到单元；表格块信物 = 候选格合并区间，格单元按序拆分
+    /// 单槽；空段丢弃不占号（后段续号）；翻译单元流与槽位序列逐位对齐。
+    #[test]
+    fn source_token_flows_through_blocks_and_units() {
+        let dir = case_dir("token-flow");
+        let in_path = dir.join("in.docx");
+        build_docx(&in_path, TABLE_DOC_XML);
+
+        let (raw, sidecar) = DocxRawBackend::default()
+            .with_structure_mode(StructureMode::Semantic)
+            .parse_with_spans(&in_path)
+            .unwrap();
+        let doc = OfficePlugin::default().assemble(&raw);
+        let page = &doc.pages[0];
+        // TABLE_DOC_XML：段(b0) + 表(b1，4 候选格) + 段(b2)
+        let para0 = page.blocks[0].source_token.expect("段落块应带信物");
+        let table_token = page.blocks[1].source_token.expect("表格块应带信物");
+        let para2 = page.blocks[2].source_token.expect("尾段块应带信物");
+        assert_eq!(para0, crate::model::SourceToken { first_slot: 0, slot_count: 1 });
+        assert_eq!(table_token, crate::model::SourceToken { first_slot: 1, slot_count: 4 });
+        assert_eq!(para2, crate::model::SourceToken { first_slot: 5, slot_count: 1 });
+
+        let units = to_translation_units(&doc);
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            ["p0-b0", "p0-b1-r0c0", "p0-b1-r0c1", "p0-b1-r1c0", "p0-b1-r1c1", "p0-b2"]
+        );
+        assert_eq!(units[0].source_token, Some(para0));
+        assert_eq!(units[5].source_token, Some(para2));
+        // 格单元逐个拆分单槽（候选格行主序）
+        let cell_tokens: Vec<_> = units[1..5].iter().map(|u| u.source_token).collect();
+        assert_eq!(
+            cell_tokens,
+            vec![
+                Some(crate::model::SourceToken { first_slot: 1, slot_count: 1 }),
+                Some(crate::model::SourceToken { first_slot: 2, slot_count: 1 }),
+                Some(crate::model::SourceToken { first_slot: 3, slot_count: 1 }),
+                Some(crate::model::SourceToken { first_slot: 4, slot_count: 1 }),
+            ]
+        );
+        // 槽位表自洽：信物区间全部落在表内
+        assert_eq!(sidecar.slots.len(), 6);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

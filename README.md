@@ -91,6 +91,7 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
 - PDF 双语输出：格内替换不可行（无重排），走**附录页模式**——
   `writeback::appendix` 出按原文页分组的结构化译文序列，PDF 页生成在
   消费者侧（rumi 的 oxidize-pdf）。
+- 性能队列：① 回写 benchmark 基线 + **A/B 实验**（改写条目 Stored vs Level1 vs 默认——注：我们已是 zlib-rs 后端而非咨询假设的 miniz_oxide，收益以实测为准；内存 Cursor vs 文件 I/O；解析/扫描分项）→ ② 流式 apply_edits（拼接产物不驻留第二份 String）+ 回写 I/O 包（按 A/B 结果采纳压缩等级/内存 Cursor<50MB/大 BufWriter；reflink 尾追加挂远期——CoW 文件系统依赖）→ ③ 超大件 O(段落) 内存重构门槛 = 解压后 document.xml > 200MB 或 WASM/移动端目标。
 - crates.io 发布：依赖面已收敛（oar-ocr 移出发布面），待维护者邮箱验证。
 
 ## 许可

@@ -2,7 +2,8 @@
 // docforge 改动：① RawTextItem 新增 source/confidence；② RawPage 新增 coord_units
 // （M1：pdf 页级路由把 OCR 语义透传到 IR，docforge-spec-m1.md §4）；
 // ③ FormatPlugin 新增 enrich_meta 组装后置钩子（格式特有元数据 → DocMeta.extra）；
-// ④ RawTextItem 新增 quad（OCR 旋转保真四点框直通，rumi 集成增强）。
+// ④ RawTextItem 新增 quad（OCR 旋转保真四点框直通，rumi 集成增强）；
+// ⑤ RawTextItem 新增 source_token（docx 旁路槽位表信物，assemble 透传）。
 //! 能力抽象（与 Python `capability.py` 对齐）：
 //! 解析能力（格式绑定）→ RawDoc；处理能力（全局共享，就地增强）。
 
@@ -12,7 +13,7 @@ use std::path::Path;
 use std::collections::BTreeMap;
 
 use crate::error::Result;
-use crate::model::{BlockSource, CoordUnits, MetaValue, Rect, TableData};
+use crate::model::{BlockSource, CoordUnits, MetaValue, Rect, SourceToken, TableData};
 
 /// 解析产出的原始文本项：text + 可选 bbox。
 #[derive(Debug, Clone, Default)]
@@ -52,6 +53,10 @@ pub struct RawTextItem {
     /// 块级元信息（xlsx `merges` / `truncated` 等）：`assemble` 原样搬到 `Block.meta`，
     /// 与 Python 在 page.meta 上挂的同类信息对齐。
     pub meta: BTreeMap<String, MetaValue>,
+    /// 不透明源信物（docx 旁路槽位表区间，见 [`SourceToken`]）：段落项 = 单槽、
+    /// 表格项 = 其候选格的连续槽位区间、图片项恒 None。`assemble` 原样透传至
+    /// `Block.source_token`；非 docx 格式恒 None。
+    pub source_token: Option<SourceToken>,
 }
 
 /// 解析产出的原始图片（可携带 OCR 结果）。

@@ -314,6 +314,8 @@ fn assemble(raw: &RawDoc, options: &OfficeOptions) -> crate::model::Document {
                     blocks.push(crate::model::Block {
                         kind: crate::model::BlockKind::Image,
                         content: im.ocr_text.clone().unwrap_or_default(),
+                        // 图片项不发号（恒 None），透传保持口径统一
+                        source_token: it.source_token,
                         ..Default::default()
                     });
                     continue;
@@ -326,6 +328,9 @@ fn assemble(raw: &RawDoc, options: &OfficeOptions) -> crate::model::Document {
                         content: t.rows.first().map(|r| r.join(" | ")).unwrap_or_default(),
                         table: Some(t.clone()),
                         meta: it.meta.clone(),
+                        // 信物 = 该表格项候选格的连续槽位区间（emit 展开格单元
+                        // 时按候选格拆分，见 `emit::to_translation_units_with`）
+                        source_token: it.source_token,
                         ..Default::default()
                     });
                     if !it.text.is_empty() {
@@ -365,6 +370,8 @@ fn assemble(raw: &RawDoc, options: &OfficeOptions) -> crate::model::Document {
                     }
                 };
                 block.meta = it.meta.clone();
+                // 信物透传（1:1 块原样赋给 Block；丢弃的空白 item 信物自然消失）
+                block.source_token = it.source_token;
                 parts.push(it.text.clone());
                 blocks.push(block);
             }

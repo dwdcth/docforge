@@ -1,12 +1,14 @@
 # BENCHMARK：解析吞吐与峰值内存
 
 可引用的一组数字：fixture 程序合成（确定性、无随机、跑时生成、结束清理），
-release 实测。回答三类格式决策问题：
+release 实测。回答四类格式决策问题：
 
 1. **格式吞吐量级**——各格式喂给 docforge 的解析速度，供格式选择 / 容量规划参考；
 2. **流式值不值**——引擎级 `parse_streaming` 与全量 `parse` 在文本件上的耗时对比
    （流式的内存收益场景在 pdf 千页件，见下"未测"）；
-3. **单 case 真实峰值内存**——进程内存预算（`--single` 模式）。
+3. **单 case 真实峰值内存**——进程内存预算（`--single` 模式）；
+4. **回写写侧基线**——翻译闭环回写（`writeback_*`）单程吞吐与增量成本，服务
+   "流式 apply_edits" 改造的前后对照（表见下，数字待统一门禁采集）。
 
 数字均在下述机器实测；复现命令见文末，任何机器可重跑校验。
 
@@ -24,6 +26,24 @@ release 实测。回答三类格式决策问题：
   docx 每 16 段插一个 `Heading2` 样式段——auto 结构探针命中、走 semantic 组装
   出块（与真实文档同路径）；epub 一章一页，spine 序 = 页序。
 - **计时**：每 case 预热 1 轮 + 计时 3 轮取中位；吞吐 = 输入字节 / 中位耗时。
+- **回写族（wb-\*）口径**：回写单程吞吐。setup（不计入计时）`parse` →
+  `to_translation_units` → 每单元确定性假译文 `(id, "译:{原文}")` 二元组
+  （`(id, 译)` 形态 = `source: None` 信任锚点）；计时只含 `writeback_*` 一次
+  调用——回写器按对齐契约**内部重解析原文件**（与提取侧同解析器同默认选项），
+  该成本计入，与真实翻译管线一致。策略统一 `BilingualInline`（译文紧跟原块）。
+- **回写 fixture**：wb-txt 复用 5MB 文本件；wb-docx / wb-epub / wb-xlsx 在对应
+  解析 fixture 的正文之上各加一个 1MB 确定性伪二进制条目（`word/media/image1.bin`
+  / `OEBPS/media/image1.bin` / `xl/media/blob1.bin`）——锻炼 raw_copy 直拷路径
+  （回写族已落地：未触碰条目不解压不重压）。wb-xlsx 为最小合法包（workbook +
+  workbook rels + inlineStr 单 sheet ≈ 2MB，无 sst / styles——两侧解析对缺失
+  条目均优雅回退）；格全为字符格且非空（格位 ↔ 格单元 1:1 对位、无类型守卫
+  跳过）。吞吐按**输入容器总字节**计（含伪二进制条目，与解析表同口径）。
+- **回写结果校验**：每轮断言 `WritebackReport.written == 送译单元数` 且
+  `skipped` 为空（确定性 fixture 下每个假译文都应写入）；`written == 0` 直接
+  判错拒报——防静默零写入的假吞吐。进度行打印 written。
+- **回写增量对照**：`wb-docx-noread` = 同 fixture 只 parse 的计时行；`wb-docx`
+  中位耗时 − 该行 ≈ 回写增量成本（扫描 + 改写 + 重打包 + 落盘；重解析与 parse
+  同价）。
 - **峰值内存**：`/proc/self/status` 的 `VmHWM`——进程生命期高点、**不可重置**。
   多 case 同进程跑只能报全程累计高点（默认模式只在表尾注明）；逐 case 真实峰值
   用 `--single` 模式（单进程单 case，外层循环逐 case 调用）。读数含
@@ -51,8 +71,8 @@ release 实测。回答三类格式决策问题：
   模型，扫描件深度流式场景无法如实测出——不编数字，留待具备 OCR 环境的机器按
   同一方法学补测 `docforge::backends::pdf::parse_streaming`（页产即吐、峰值 =
   单页是设计口径，无实测数字背书前不应引用）。
-- xlsx/pptx/odt/odf/odp/chm/cbz/fb2/mobi/djvu/压缩包：bench 未覆盖，需真实
-  fixture 才有意义，后续按需补。
+- pptx/odt/odf/odp/chm/cbz/fb2/mobi/djvu/压缩包：bench 未覆盖，需真实
+  fixture 才有意义，后续按需补（xlsx 已进回写族 `wb-xlsx`；解析表尚无 xlsx 行）。
 
 ## 数字：默认 feature 面（txt/md/csv/html，含流式对比）
 
@@ -114,6 +134,49 @@ md-stream         5,243,816      17.9 ms   279.8 MB/s  32.3 MB
 全量的峰值内存差：txt 24.6 vs 23.9、md 32.3 vs 31.5 MB——流式不高于全量，且
 同 fixture 多次跨进程跑 VmHWM 稳定在 ±0.7MB 内。）
 
+## 数字：回写吞吐（wb-*，feature 面 docx+epub+xlsx）
+
+回写吞吐表（默认模式；`written` = 实际写入单元数 = 送译单元数，bench 逐轮断言）：
+
+```
+docforge 回写吞吐基准（回写单程：setup 的译文对构造不计入计时，writeback_* 内部重解析计入；wb-*-noread = 同 fixture 只-parse 对照行）
+
+case               输入字节       中位耗时         吞吐  written  VmHWM
+---------------- -------------- ------------ ------------  --------  ----------
+wb-txt             5,243,105      28.7 ms   174.0 MB/s     8555      -
+wb-docx            3,146,393      20.3 ms   148.2 MB/s     6326      -
+wb-docx-noread     3,146,393       5.6 ms   536.2 MB/s        -      -
+wb-epub            3,168,833      17.8 ms   170.1 MB/s       32      -
+wb-xlsx            3,147,129      24.6 ms   121.8 MB/s     5680      -
+```
+
+（默认模式同进程跑，VmHWM 列只报累计口径、表尾注明——与解析表同规矩。）
+
+逐 case 真实峰值（--single；wb case 的 VmHWM 另含 setup 整批译文对的驻留——
+翻译管线回写前的真实形态）：
+
+```
+case               输入字节       中位耗时         吞吐  written  VmHWM
+---------------- -------------- ------------ ------------  --------  ----------
+wb-txt             5,243,105      48.4 ms   103.3 MB/s     8555   85.6 MB
+wb-docx            3,146,393      45.8 ms    65.6 MB/s     6326   38.2 MB
+wb-docx-noread     3,146,393       6.2 ms   483.1 MB/s        -   16.4 MB
+wb-epub            3,168,833      18.0 ms   167.7 MB/s       32   25.2 MB
+wb-xlsx            3,147,129      29.0 ms   103.5 MB/s     5680   37.3 MB
+```
+
+读数口径（回填时按此解读）：
+
+- **VmHWM 组成**（wb case）：fixture 流式生成的少量分配 + setup（IR + 全单元 +
+  全译文对 ≈ 2× 正文文本驻留）+ 回写单程（重解析中间态 + **拼接产物整份 String
+  驻留**）。"流式 apply_edits" 改造要消掉的是最后一项——改造后同 fixture 复测
+  本表，差值即改造的内存收益；吞吐列同时观察不回退。
+- **增量对照**：`wb-docx` 中位耗时 − `wb-docx-noread` 中位耗时 ≈ 回写增量成本
+  （扫描 + 改写 + 重打包 + 落盘）。
+- **raw_copy 生效判据**：容器格（wb-docx/wb-epub/wb-xlsx）fixture 含 1MB 伪
+  二进制条目——直拷生效时回写耗时应与**正文改写量**同量级而非与容器大小同
+  量级；若接近全容器重压缩的耗时，说明直拷路径未吃到。
+
 ## 复现
 
 ```bash
@@ -126,6 +189,14 @@ cargo bench --bench throughput --features epub,docx,html
 # 3) 逐 case 真实峰值内存（VmHWM 进程生命期不可重置，必须单进程单 case）：
 for c in $(cargo bench --bench throughput -- --list); do
   cargo bench --bench throughput -- --single "$c"
+done
+
+# 4) 回写族吞吐表（wb-*）：容器 case 需 feature；含 wb-docx-noread 对照行
+cargo bench --bench throughput --features docx,epub,xlsx
+
+# 5) 回写族逐 case 真实峰值（含 wb case：峰值另含整批译文对的 setup 驻留）
+for c in $(cargo bench --bench throughput --features docx,epub,xlsx -- --list); do
+  cargo bench --bench throughput --features docx,epub,xlsx -- --single "$c"
 done
 ```
 
@@ -150,3 +221,9 @@ done
   （2MB 输入 → 41.4MB 峰值，约 20 倍：全表结构化驻留）；大 CSV 场景预算按输入
   的 20 倍留。默认模式的表尾 VmHWM 是多 case 累计高点，**不可**当作任何单 case
   的峰值引用。
+- **回写吞吐表（wb-\*，数字待采集）**：回写单程含内部重解析，吞吐天然低于解析
+  表同格式行，差值 = 翻译闭环写侧的增量（`wb-docx` − `wb-docx-noread` 即增量）。
+  基线用途：回写族现状 = 拼接产物（改写后的正文 XML/整份文本）整份 String 驻留
+  后一次性落盘；"流式 apply_edits" 改造目标是边改边写、不攒整份产物——改造前后
+  各采一次回写表（吞吐列看是否回退、`--single` VmHWM 列看驻留下降），差值即
+  改造收益。读数判据见上"数字：回写吞吐"节的读数口径。

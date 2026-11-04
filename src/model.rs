@@ -2,7 +2,9 @@
 // docforge 改动：① Block 新增 confidence/source；② Page 新增 coord_units；
 // ③ 新增 BlockSource/CoordUnits 类型；④ 新增 6 个对应单测；
 // ⑤ Document 新增 blocks() 跨页扁平迭代（+ 对应单测）；
-// ⑥ Block 新增 quad（OCR 旋转保真四点框，rumi 集成增强）+ 对应单测。其余逐字保留。
+// ⑥ Block 新增 quad（OCR 旋转保真四点框，rumi 集成增强）+ 对应单测；
+// ⑦ 新增 SourceToken（格式后端旁路槽位表的不透明信物）+ Block.source_token
+//    （serde None 不出键，wire 兼容）+ 对应单测。其余逐字保留。
 //! 统一 IR（含 serde 便于 JSON/CLI 往返；块/元信息语义与 docparser 的
 //! Python 参考实现一致，docforge 在其上扩展 OCR 语义字段）。
 
@@ -119,6 +121,31 @@ impl From<Vec<String>> for MetaValue {
     }
 }
 
+/// 不透明源信物：指向某格式后端「旁路物理槽位表」的区间
+/// `[first_slot, first_slot + slot_count)`。
+///
+/// 通用 IR 不理解其含义；格式后端解析时发号，assemble 原样透传
+/// （丢弃 = 过滤、merge = 合并），回写器经格式专属入口解析回字节区间。
+/// 非 docx 格式恒 `None`。serde None 不出键（quad 先例）：旧 JSON wire 兼容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceToken {
+    pub first_slot: u32,
+    pub slot_count: u16,
+}
+
+impl SourceToken {
+    /// 合并相邻信物（多个位合入同一块时用）：`next` 必须紧接 `self` 的区间。
+    /// 连续性仅 debug 断言（发号器天然连续）；release 下由调用方保证。
+    pub(crate) fn merge(&mut self, next: SourceToken) {
+        debug_assert_eq!(
+            self.first_slot + u32::from(self.slot_count),
+            next.first_slot,
+            "merge 要求信物区间连续"
+        );
+        self.slot_count = self.slot_count.saturating_add(next.slot_count);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     #[serde(rename = "kind")]
@@ -152,6 +179,10 @@ pub struct Block {
     /// 块来源。serde 缺省 Native：docparser 旧 JSON（无此字段）可无损读入。
     #[serde(default)]
     pub source: BlockSource,
+    /// 不透明源信物（格式后端旁路槽位表区间，见 [`SourceToken`]）。
+    /// serde None 不出键：docparser 旧 JSON wire 兼容（quad 先例）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_token: Option<SourceToken>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -455,6 +486,26 @@ mod tests {
         let back: Block = serde_json::from_str(&json).unwrap();
         assert_eq!(back, block);
         assert_eq!(back.quad.as_ref().unwrap()[2], [19.0, 15.0]);
+    }
+
+    /// `Block.source_token`：None 不出键（docparser 旧 JSON wire 兼容）；
+    /// Some 完整往返（区间两字段按结构还原）。
+    #[test]
+    fn block_source_token_omitted_and_roundtrip() {
+        let plain = serde_json::to_string(&Block::default()).unwrap();
+        assert!(!plain.contains("source_token"), "{plain}");
+        // 旧 JSON（无 source_token 键）读入默认 None
+        let old: Block = serde_json::from_str(r#"{"kind":"paragraph"}"#).unwrap();
+        assert_eq!(old.source_token, None);
+
+        let block = Block {
+            source_token: Some(SourceToken { first_slot: 7, slot_count: 3 }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains(r#""source_token":{"first_slot":7,"slot_count":3}"#), "{json}");
+        let back: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, block);
     }
 
     /// `CoordUnits` 的 wire 形态：内部标签 type + snake_case 变体名。

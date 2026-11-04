@@ -4,13 +4,15 @@
 // ④ 新增 to_rag_chunks（RAG 检索分块，docparse-plan §13 M4）；
 // ⑤ 新增双语回写（BiStrategy + to_bilingual_markdown[_with]，翻译闭环①）；
 // ⑥ 表格进翻译流：Table 块按单元格展开（`-r{行}c{列}` 锚点 + header 表头
-//    标志），双语回写按译后网格渲染。
+//    标志），双语回写按译后网格渲染；
+// ⑦ TranslationUnit 新增 source_token（块信物透传：段落单元原样复制、格单元
+//    按候选格拆分单槽——docx 回写旁路槽位表寻址用，非 docx 恒 None）。
 //! 输出目标：text / markdown / JSON（feature `json`）/ 翻译单元
 //!（`to_translation_units`，翻译管线的工作单元与回写锚点）/ RAG 检索块
 //!（`to_rag_chunks`，向量化/检索管线的工作单元）/ 双语回写
 //!（`to_bilingual_markdown`，按锚点把译文写回 Markdown）。
 
-use crate::model::{BlockKind, BlockSource, Document};
+use crate::model::{BlockKind, BlockSource, Document, SourceToken};
 
 /// 纯文本：逐页 text，页间空行分隔。
 pub fn to_text(doc: &Document) -> String {
@@ -187,6 +189,11 @@ pub struct TranslationUnit {
     /// 消费者可跳过送译或按文本键合并翻一次；**单元照发**（锚点契约不动）。
     /// 表格格单元继承所在块的标志（表格自身跨页重复罕见，继承无害）。
     pub running: bool,
+    /// 不透明源信物（[`SourceToken`]，从所在块复制/拆分）：格式后端旁路槽位
+    /// 表区间，回写器据此把单元寻址回字节位（docx 专属；非 docx 恒 None）。
+    /// 段落类单元 = 所在块信物（单槽）；表格格单元 = 块信物按**候选格**（非空）
+    /// 拆分的单槽区间——发号序与单元展开序同为行主序文档序，天然对齐。
+    pub source_token: Option<SourceToken>,
 }
 
 impl TranslationUnit {
@@ -366,12 +373,27 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                 let Some(t) = b.table.as_ref() else {
                     continue;
                 };
+                // 格单元的信物拆分计数：第 j 个候选格（非空）领块信物的第 j 槽
+                //（发号侧格槽位同为行主序文档序、只发非空格，两侧天然对齐；
+                // debug_assert 钉死计数一致，防发号↔展开漂移）
+                let mut cell_j: usize = 0;
                 for (r, row) in t.rows.iter().enumerate() {
                     for (c, cell) in row.iter().enumerate() {
                         let text = cell.trim();
                         if text.is_empty() {
                             continue; // 空格不发单元（合并格/留白格常态）
                         }
+                        let cell_token = b.source_token.map(|t| {
+                            debug_assert!(
+                                (cell_j as u32) < u32::from(t.slot_count),
+                                "格单元数超出来源信物槽位区间（发号↔展开漂移）"
+                            );
+                            SourceToken {
+                                first_slot: t.first_slot + cell_j as u32,
+                                slot_count: 1,
+                            }
+                        });
+                        cell_j += 1;
                         out.push(TranslationUnit {
                             id: translation_cell_id(&page_name, b_idx, r, c),
                             page: Some(page_name.clone()),
@@ -383,6 +405,7 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                             chapter: chapter.clone(),
                             header: r < t.header_rows,
                             running: block_running(b),
+                            source_token: cell_token,
                         });
                     }
                 }
@@ -402,6 +425,7 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                 chapter: chapter.clone(),
                 header: false,
                 running: block_running(b),
+                source_token: b.source_token,
             });
         }
     }
@@ -1698,5 +1722,28 @@ mod tests {
         let s = to_json(&doc);
         let back: Document = serde_json::from_str(&s).unwrap();
         assert_eq!(back, doc);
+    }
+
+    /// 非 docx 格式的信物恒 None（txt 端到端）：信物只由 docx 后端在解析时
+    /// 发号，txt 解析/组装/单元流全链路不带——回写器按 None 落空位保守跳过。
+    #[test]
+    fn non_docx_formats_carry_no_source_token() {
+        use crate::plugin::{FormatPlugin as _, ParseCapability as _};
+
+        let dir = std::env::temp_dir().join("docforge_emit_txt_token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.txt");
+        std::fs::write(&path, "第一段正文。\n\n第二段正文。\n").unwrap();
+
+        let raw = crate::plugins::text::TextParseCapability::default()
+            .parse(&path)
+            .unwrap();
+        let doc = crate::plugins::text::TextPlugin.assemble(&raw);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(doc.pages[0].blocks.iter().all(|b| b.source_token.is_none()));
+        let units = to_translation_units(&doc);
+        assert!(!units.is_empty());
+        assert!(units.iter().all(|u| u.source_token.is_none()));
     }
 }

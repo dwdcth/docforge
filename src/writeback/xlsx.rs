@@ -1556,6 +1556,7 @@ mod tests {
             chapter: None,
             header: false,
             running: false,
+            source_token: None,
         };
         let pairs: Vec<crate::emit::TranslationPair> = [("pS1-b0-r0c0", "格译文")]
             .iter()
