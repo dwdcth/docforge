@@ -879,7 +879,9 @@ impl FormatPlugin for PdfPlugin {
     }
 
     fn default_process_chain(&self) -> Vec<&'static str> {
-        vec![]
+        // 跨页重复块事实标记（页眉/页脚类 running 元素）：有几何的多页格式，
+        // 痛点正是真实 PDF 的重复页眉被翻 N 遍；标记经 assemble 透传进 IR
+        vec!["running-detect"]
     }
 
     fn assemble(&self, raw: &RawDoc) -> Document {
@@ -898,6 +900,9 @@ impl FormatPlugin for PdfPlugin {
                         quad: i.quad,
                         confidence: i.confidence,
                         source: i.source,
+                        // item 级元信息透传（office 系同口径）：running-detect
+                        // 的 running/region 标记由此进 IR（曾漏，见回归测试）
+                        meta: i.meta.clone(),
                         ..Default::default()
                     })
                     .collect();
@@ -1073,7 +1078,7 @@ pub(crate) mod sample {
 
     /// 构建注册了覆盖样例全部字符的 CJK 字体的 Document。
     /// 逐候选尝试：注册 → 查缺字形 → 缺字/失败换下一个。ttc 集合先抽第 0 面。
-    fn doc_with_cjk_font() -> Option<(Document, String)> {
+    pub(crate) fn doc_with_cjk_font() -> Option<(Document, String)> {
         let all_text: String = SAMPLE_PAGES
             .iter()
             .flat_map(|p| p.iter())
@@ -1273,6 +1278,120 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         assert_eq!(doc.pages[0].blocks[0].content, "第一行");
         assert_eq!(doc.pages[0].blocks[0].source, crate::model::BlockSource::TextLayer);
         assert_eq!(doc.pages[0].text, "第一行");
+    }
+
+    /// 回归：assemble 必须把 item.meta 透传为 Block.meta（office 系透传，
+    /// pdf 曾漏——running-detect 的 running/region 标记进 IR 全靠它）。
+    #[test]
+    fn assemble_passes_item_meta_to_block() {
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("running".to_string(), crate::model::MetaValue::Bool(true));
+        meta.insert("region".to_string(), crate::model::MetaValue::Str("header".into()));
+        let raw = RawDoc {
+            pages: vec![RawPage {
+                name: Some("1".into()),
+                items: vec![RawTextItem {
+                    text: "页眉文本".into(),
+                    bbox: Some(Rect { x0: 60.0, y0: 780.0, x1: 400.0, y1: 800.0 }),
+                    source: BlockSource::TextLayer,
+                    meta,
+                    ..Default::default()
+                }],
+                coord_units: Some(CoordUnits::Pt),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let doc = PdfPlugin.assemble(&raw);
+        let b = &doc.pages[0].blocks[0];
+        assert_eq!(b.meta.get("running"), Some(&crate::model::MetaValue::Bool(true)));
+        assert_eq!(
+            b.meta.get("region"),
+            Some(&crate::model::MetaValue::Str("header".into()))
+        );
+    }
+
+    /// 端到端（oxidize-pdf 构造 5 页文字层件）：每页同位页眉 + 页脚
+    /// 「第 N 页」（数字归一命中）+ 各页唯一正文，走 engine 全管线
+    ///（parse 链 → 处理链 running-detect → assemble 透传 → 翻译单元），
+    /// 断言页眉/页脚块与单元的 running 标志、正文不受影响。
+    #[test]
+    fn running_detect_end_to_end_via_engine() {
+        const BODIES: [&str; 5] = [
+            "深秋的校园格外安静，银杏叶铺满了整条林荫道。",
+            "图书馆的阅览室里，学生们埋头写着各自的报告。",
+            "会议室的灯一直亮到深夜，方案改到第七稿才定。",
+            "他推开门，把打印好的文件放在桌上就走了。",
+            "晨雾漫过山谷时，早班的列车正驶出站台。",
+        ];
+        let dir = probe_dir("running");
+        let pdf = dir.join("running.pdf");
+        let Some((mut oxd, _)) = sample::doc_with_cjk_font() else {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        };
+        for (i, body) in BODIES.iter().enumerate() {
+            let mut page = oxidize_pdf::Page::a4();
+            let ctx = page.text();
+            // 页眉（视觉页顶；Pt 空间 y 向上 → 大 y 值）/ 正文（各页唯一）/
+            // 页脚（视觉页底，页码变体）
+            for (y, line) in [
+                (790.0, "docforge running 样例文档".to_string()),
+                (700.0, (*body).to_string()),
+                (50.0, format!("第 {} 页", i + 1)),
+            ] {
+                let _ = ctx
+                    .set_font(oxidize_pdf::text::Font::Custom("CJK".into()), 12.0)
+                    .at(60.0, y)
+                    .write(&line);
+            }
+            oxd.add_page(page);
+        }
+        oxd.save(&pdf).expect("样例 PDF 写出失败");
+
+        // engine 全管线：文本族注册（含 running-detect）+ pdf 后端
+        let mut reg = crate::registry::Registry::new();
+        crate::plugins::text::register_defaults(&mut reg);
+        register(&mut reg, PdfOptions::default());
+        let doc = crate::DocumentEngine::new(reg).parse(&pdf).expect("engine 解析失败");
+        assert_eq!(doc.pages.len(), 5);
+
+        let mut header_texts: Vec<&str> = Vec::new();
+        for (p_idx, page) in doc.pages.iter().enumerate() {
+            assert_eq!(page.blocks.len(), 3, "第 {} 页应为 3 行", p_idx + 1);
+            // 文字层页无页尺寸（pdf-inspector 不暴露页框）→ raw 坐标键口径：
+            // 页眉/页脚标 running、无位置带；正文不标。行序 = 提取序（自上而下）。
+            let b = &page.blocks;
+            assert_eq!(b[0].content, "docforge running 样例文档", "第 {} 页页眉", p_idx + 1);
+            assert_eq!(
+                b[0].meta.get("running"),
+                Some(&crate::model::MetaValue::Bool(true)),
+                "第 {} 页页眉标 running",
+                p_idx + 1
+            );
+            assert!(!b[0].meta.contains_key("region"), "文字层页无页高：不带位置带");
+            assert_eq!(b[1].content, BODIES[p_idx], "第 {} 页正文", p_idx + 1);
+            assert!(!b[1].meta.contains_key("running"), "正文块不标");
+            assert_eq!(b[2].content, format!("第 {} 页", p_idx + 1), "第 {} 页页脚", p_idx + 1);
+            assert_eq!(
+                b[2].meta.get("running"),
+                Some(&crate::model::MetaValue::Bool(true)),
+                "第 {} 页页脚标 running（数字归一命中）",
+                p_idx + 1
+            );
+            assert!(!b[2].meta.contains_key("region"));
+            header_texts.push(b[0].content.as_str());
+        }
+        assert!(
+            header_texts.windows(2).all(|w| w[0] == w[1]),
+            "五页页眉文本一致（同键分组的前提）"
+        );
+
+        // 单元层：每页页眉/页脚单元 running=true（共 10），正文单元 false
+        let units = crate::emit::to_translation_units(&doc);
+        assert_eq!(units.len(), 15, "3 行 × 5 页全进翻译流");
+        assert_eq!(units.iter().filter(|u| u.running).count(), 10, "页眉+页脚单元标 running");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 归一化编辑距离相似度。

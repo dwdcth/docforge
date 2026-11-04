@@ -182,6 +182,11 @@ pub struct TranslationUnit {
     /// 表头单元格（Table 块展开且行号 < `TableData.header_rows`）；非表格单元
     /// 恒 false。消费者可按此跳过表头翻译。
     pub header: bool,
+    /// 跨页重复的页眉/页脚类内容（`Block.meta["running"]` 的事实复制，检测
+    /// 见 `plugins::running_detect`）：同文本以近同位置出现在 ≥3 个不同页上。
+    /// 消费者可跳过送译或按文本键合并翻一次；**单元照发**（锚点契约不动）。
+    /// 表格格单元继承所在块的标志（表格自身跨页重复罕见，继承无害）。
+    pub running: bool,
 }
 
 impl TranslationUnit {
@@ -256,6 +261,16 @@ pub fn is_translatable(kind: BlockKind) -> bool {
 
 /// [`to_translation_units`] 的默认最小字符数（提取与回写两侧共用同一口径）。
 const DEFAULT_TRANSLATION_MIN_CHARS: usize = 2;
+
+/// 块的跨页重复事实：`Block.meta["running"] = Bool(true)`（检测见
+/// `plugins::running_detect`）。只认显式 `Bool(true)`，其余取值（含缺键）
+/// 一律 false。
+fn block_running(b: &crate::model::Block) -> bool {
+    matches!(
+        b.meta.get("running"),
+        Some(crate::model::MetaValue::Bool(true))
+    )
+}
 
 /// 提取/回写两侧共用的块锚点：`p{页名}-b{块序}`。单点定义，消除两处
 /// format! 的口径漂移——锚点对不上译文就写不回。
@@ -333,6 +348,7 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                             lang: b.lang.clone(),
                             chapter: chapter.clone(),
                             header: r < t.header_rows,
+                            running: block_running(b),
                         });
                     }
                 }
@@ -351,6 +367,7 @@ pub fn to_translation_units_with(doc: &Document, min_chars: usize) -> Vec<Transl
                 lang: b.lang.clone(),
                 chapter: chapter.clone(),
                 header: false,
+                running: block_running(b),
             });
         }
     }
@@ -528,8 +545,10 @@ fn original_plus_appendix(doc: &Document, map: &std::collections::HashMap<&str, 
             }
             // 表格单元格单元（kind = Table）不在 translation_candidate 白名单
             // 内，结构性地不进附录（附录是段落流，格译文无处安放；表格正文
-            // 由 body = to_markdown 原样渲染）
-            if !translation_candidate(b, DEFAULT_TRANSLATION_MIN_CHARS) {
+            // 由 body = to_markdown 原样渲染）；running（跨页重复页眉/页脚类）
+            // 同样不进——与 writeback::appendix::to_appendix_pages 的默认口径
+            // 一致（页眉译 N 遍灌满附录正是 running 检测的痛点场景）
+            if !translation_candidate(b, DEFAULT_TRANSLATION_MIN_CHARS) || block_running(b) {
                 continue;
             }
             let t = match map.get(translation_id(&page_name, b_idx).as_str()).copied() {
@@ -912,6 +931,46 @@ mod tests {
         assert!(!units[1].has_translatable_text(), "「220V」由消费者过滤送译");
     }
 
+    /// running（跨页重复页眉/页脚类）块：单元照发（`running = true` 供消费
+    /// 者过滤），但 Markdown 附录与 writeback::appendix 同口径默认不收——
+    /// 页眉译 N 遍灌满附录正是 running 检测的痛点场景。
+    #[test]
+    fn running_blocks_emit_units_but_skip_markdown_appendix() {
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("running".to_string(), true.into());
+        let running = Block {
+            kind: BlockKind::Paragraph,
+            content: "技术白皮书 V3".into(),
+            meta,
+            ..Default::default()
+        };
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![running, para("正文一段。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // 单元照发：running 单元仍在流里（锚点契约不动），带事实标志
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 2);
+        assert!(units[0].running, "页眉类块带 running 标志");
+        assert!(!units[1].running);
+
+        // 附录只收正文：页眉译文不进（与 to_appendix_pages 同口径）
+        let translated = vec![
+            ("p0-b0".to_string(), "Technical Whitepaper V3".to_string()),
+            ("p0-b1".to_string(), "Body paragraph.".to_string()),
+        ];
+        let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
+        assert!(md.contains("# 译文"), "有命中译文，附录存在");
+        assert!(
+            !md.contains("Technical Whitepaper V3"),
+            "running 单元的译文不进附录"
+        );
+        assert!(md.contains("Body paragraph."), "正文单元照收");
+    }
+
     // -------------------------------------------------------------------------
     // 表格进翻译流（提案 §3）：Table 块按单元格展开
     // -------------------------------------------------------------------------
@@ -1011,6 +1070,61 @@ mod tests {
             ..Default::default()
         };
         assert!(to_translation_units(&doc).is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // 跨页重复（running）单元：`Block.meta["running"]` 的事实复制
+    //（检测侧见 plugins::running_detect；此处只验 emit 层的复制与继承）
+    // -------------------------------------------------------------------------
+
+    /// 段落单元承所在块的 running 标志；未标记文档零变化（running 恒 false）。
+    #[test]
+    fn units_carry_running_flag() {
+        let mut marked = para("季度运营报告");
+        marked
+            .meta
+            .insert("running".into(), crate::model::MetaValue::Bool(true));
+        marked
+            .meta
+            .insert("region".into(), "header".into());
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![marked, para("正文一段。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 2);
+        assert!(units[0].running, "标记块的单元 running=true");
+        assert!(!units[1].running, "未标记块的单元 running=false");
+        // region 是检测侧细标，单元层不复制（running 单元文本键可自行归并）
+        assert_eq!(units[0].text, "季度运营报告");
+
+        // 零变化回归：不带任何 meta 的普通文档 running 恒 false
+        let plain = to_translation_units(&Document {
+            pages: vec![Page { blocks: vec![para("正文一段。")], ..Default::default() }],
+            ..Default::default()
+        });
+        assert!(plain.iter().all(|u| !u.running));
+    }
+
+    /// 格单元继承所在块的 running 标志（表格自身跨页重复罕见，继承无害）。
+    #[test]
+    fn table_cell_units_inherit_running() {
+        let mut marked_table = table(&[&["表头甲", "表头乙"], &["格一", "格二"]], 1);
+        marked_table
+            .meta
+            .insert("running".into(), crate::model::MetaValue::Bool(true));
+        let doc = Document {
+            pages: vec![Page { blocks: vec![marked_table], ..Default::default() }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 4);
+        assert!(units.iter().all(|u| u.running), "全部格单元继承块级 running");
+        // 既有标志不串位：header 语义独立并存
+        assert!(units.iter().take(2).all(|u| u.header) && units.iter().skip(2).all(|u| !u.header));
     }
 
     /// 仅译文：表格全命中格替换为译文，网格结构（行数/列数/分隔行）不变。

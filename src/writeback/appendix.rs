@@ -62,6 +62,12 @@ pub struct AppendixPage {
 ///
 /// * 页组按首次命中序排列（即文档序），同页单元合入同组、组内保持文档序；
 /// * 未命中 / 空白译文的单元不收；无命中的页不产空组——空结果 = 无一命中；
+/// * `running = true` 的单元（跨页重复的页眉/页脚类内容，检测见
+///   `plugins::running_detect`）默认不进附录：同一页眉的译文以每页一条
+///   重复灌满附录正是本模块要防的形态。附录是 docforge 自产工件，默认
+///   口径由库定（本模块是 running 唯一的默认行为变化点；meta 惰性、单元
+///   照发不变）。消费者确要收录时，可在调用前按自身口径过滤 units——
+///   例如只保留每个文本键的首次出现，把「翻一次」的页眉放进附录；
 /// * `original` 取单元原文（零失真）；`translation` 裁剪首尾空白后收下。
 pub fn to_appendix_pages(
     units: &[TranslationUnit],
@@ -73,6 +79,9 @@ pub fn to_appendix_pages(
     let mut index: std::collections::HashMap<Option<&str>, usize> =
         std::collections::HashMap::new();
     for unit in units {
+        if unit.running {
+            continue; // 跨页重复（页眉/页脚类）：默认不进附录（口径见上）
+        }
         let Some(tr) = map.get(unit.id.as_str()).copied() else {
             continue; // 未命中：不收
         };
@@ -321,5 +330,51 @@ mod tests {
             to_appendix_markdown(&pages),
             "# 译文附录\n\n## （无页名）\n\n> 原\n> 文\n译"
         );
+    }
+
+    /// running 单元（跨页重复的页眉/页脚类，`plugins::running_detect` 检测）
+    /// 默认不进附录：即使译文命中也被跳过；未标记单元照常收录（零变化）。
+    /// 单元经 `to_translation_units` 从带标记的 Document 取得（不手写字面量，
+    /// 与本套件约定一致）。
+    #[test]
+    fn running_units_skipped_from_appendix() {
+        use crate::emit::to_translation_units;
+        use crate::model::{Block, BlockKind, Document, MetaValue, Page};
+        let mut header = Block {
+            kind: BlockKind::Paragraph,
+            content: "季度运营报告".into(),
+            ..Default::default()
+        };
+        header.meta.insert("running".into(), MetaValue::Bool(true));
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![
+                    header,
+                    Block {
+                        kind: BlockKind::Paragraph,
+                        content: "正文一段。".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let units = to_translation_units(&doc);
+        assert_eq!(units.len(), 2);
+        assert!(units[0].running, "标记块的单元 running=true（emit 层复制）");
+
+        let translated: Vec<(String, String)> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .collect();
+        let pages = to_appendix_pages(&units, &translated);
+        assert_eq!(pages.len(), 1, "running 单元被跳过：只余正文单元的页组");
+        assert_eq!(pages[0].entries.len(), 1);
+        assert_eq!(pages[0].entries[0].unit_id, "p0-b1");
+        assert_eq!(pages[0].entries[0].original, "正文一段。");
+        assert_eq!(pages[0].entries[0].translation, "译-正文一段。");
+        let md = to_appendix_markdown(&pages);
+        assert!(md.contains("译-正文一段。") && !md.contains("译-季度运营报告"));
     }
 }

@@ -20,6 +20,7 @@ pub mod lang_detect;
 pub mod markdown;
 #[cfg(feature = "rtf")]
 pub mod rtf;
+pub mod running_detect;
 pub mod subtitle;
 pub mod text;
 

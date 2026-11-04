@@ -20,6 +20,7 @@ pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译
 | 翻译闭环轮 | 双语回写器七形态（md/docx/epub/txt/html/fb2/odt，定位改写保原格式）、流式消费两层（engine PageSink + pdf 深度流式）、engine/pdf 双级进度钩子 | ✅ |
 | 痛点收口轮 | **表格进翻译流**（单元格级单元 + docx/html/epub/odt 格内回写替换）、极简 docx 产行块、块级语言检测（`lang_detect_per_block`）、流式回写会话（`WritebackSession`）、PDF 附录载荷、公开 benchmark（[BENCHMARK.md](BENCHMARK.md)）、非 UTF-8 路径全链路（`AsRef<Path>` + CLI `args_os`） | ✅ |
 | rumi 接入轮 | **xlsx 回写器**（格单元 inlineStr 改写 + 译文 sheet 附录，翻译闭环第八格式）、**EPUB 部件交替**（`writeback_epub_alternating`：spine 每部件后插纯译文部件，真·一页原文一页译文）、防幻觉事实谓词（`has_translatable_text`：纯数字/单位/版本号单元不送引擎，策略归消费者）、docx 表格译段小字号（9pt） | ✅ |
+| PDF 翻译优化 | **docx 节交替**（`writeback_docx_alternating`：分节符/分页符切段，PageAlt 在 Word 的近似，节属性逐字节保真）、**跨页重复块标记**（`running-detect` 处理链：同文本每页同位置 → `meta["running"]` + header/footer 区域，`TranslationUnit.running` 携带、附录默认跳过——页眉页脚不再翻 N 遍灌满附录） | ✅ |
 
 环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
 ghostscript shim；详见 docs/开发记录.md）。

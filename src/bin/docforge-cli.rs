@@ -19,7 +19,7 @@
 //!       md      Markdown（表格渲染为 Markdown 表）
 //!       json    完整 IR（缩进美化）
 //!       text    纯文本
-//!       units   翻译单元 JSONL（id/page/kind/text/source/confidence/lang/chapter）
+//!       units   翻译单元 JSONL（id/page/kind/text/source/confidence/lang/chapter/header/running）
 //!       chunks  RAG 检索块 JSONL（id/page/chapter/text/block_ids）
 //!   --ocr auto|on|off    PDF OCR 模式（默认 auto；需 pdf feature）
 //!   --out <文件>         输出到文件（仅单输入；默认 stdout）
@@ -295,6 +295,7 @@ fn render(format: &str, doc: &docforge::Document) -> Option<String> {
                         "lang": u.lang,
                         "chapter": u.chapter,
                         "header": u.header,
+                        "running": u.running,
                     })
                     .to_string()
                 })

@@ -1400,6 +1400,7 @@ mod tests {
             lang: None,
             chapter: None,
             header: false,
+            running: false,
         };
         let entries = [("pS1-b0-r0c0".to_string(), "格译文".to_string())];
         let map = translation_map(&entries);

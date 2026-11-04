@@ -312,7 +312,9 @@ impl FormatPlugin for DjvuPlugin {
     }
 
     fn default_process_chain(&self) -> Vec<&'static str> {
-        vec![]
+        // 跨页重复块事实标记（页眉/页脚类 running 元素）：有几何的多页格式，
+        // 与 pdf 后端同痛点同接线；标记经 assemble 透传进 IR
+        vec!["running-detect"]
     }
 
     fn assemble(&self, raw: &RawDoc) -> Document {
@@ -331,6 +333,9 @@ impl FormatPlugin for DjvuPlugin {
                         quad: i.quad,
                         confidence: i.confidence,
                         source: i.source,
+                        // item 级元信息透传（office / pdf 系同口径）：running-detect
+                        // 的 running/region 标记由此进 IR（与 pdf 同漏同补）
+                        meta: i.meta.clone(),
                         ..Default::default()
                     })
                     .collect();
@@ -486,11 +491,40 @@ mod tests {
         path
     }
 
+    /// 回归：assemble 必须把 item.meta 透传为 Block.meta（office / pdf 系
+    /// 同口径，djvu 曾同样漏——running-detect 的标记进 IR 全靠它）。
+    #[test]
+    fn assemble_passes_item_meta_to_block() {
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("running".to_string(), crate::model::MetaValue::Bool(true));
+        meta.insert("region".to_string(), crate::model::MetaValue::Str("header".into()));
+        let raw = RawDoc {
+            pages: vec![RawPage {
+                name: Some("1".into()),
+                items: vec![RawTextItem {
+                    text: "页眉文本".into(),
+                    bbox: Some(Rect { x0: 60.0, y0: 40.0, x1: 400.0, y1: 80.0 }),
+                    source: BlockSource::TextLayer,
+                    meta,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let doc = DjvuPlugin.assemble(&raw);
+        let b = &doc.pages[0].blocks[0];
+        assert_eq!(b.meta.get("running"), Some(&crate::model::MetaValue::Bool(true)));
+        assert_eq!(
+            b.meta.get("region"),
+            Some(&crate::model::MetaValue::Str("header".into()))
+        );
+    }
+
     /// 渲染尺寸校验 + 固定单行输出的 mock 引擎（不依赖模型缓存）。
     struct MockEngine {
         expect_size: (u32, u32),
     }
-
     impl OcrEngine for MockEngine {
         fn name(&self) -> &str {
             "mock"

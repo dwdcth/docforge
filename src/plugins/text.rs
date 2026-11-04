@@ -328,6 +328,10 @@ pub fn register_defaults(reg: &mut Registry) {
     #[cfg(feature = "lang-detect")]
     super::lang_detect::register(reg);
 
+    // 跨页重复块事实标记（页眉/页脚类 running 元素）：零新依赖恒开；
+    // 只标事实（item.meta），消费语义归 emit/appendix/消费者——见模块头
+    super::running_detect::register(reg);
+
     // RTF：控制字状态机，随 feature `rtf`（默认开）
     #[cfg(feature = "rtf")]
     super::rtf::register_defaults(reg);
