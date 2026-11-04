@@ -45,7 +45,7 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{apply_edits, Edit, escape_xml_text, pair_map};
+use super::{apply_edits, Edit, escape_xml_text, pair_map, write_bytes_atomic};
 
 /// section 递归上限（与提取侧 [`crate::backends::fb2`] 同值：只防病态嵌套）。
 const MAX_SECTION_DEPTH: u8 = 32;
@@ -184,14 +184,14 @@ pub fn writeback_fb2(
         }
     }
 
-    // D. 改写并写回（无命中 = 原文原样）
+    // D. 改写并写回（无命中 = 原文原样）——原子落盘：同目录临时件 +
+    // rename，崩溃 / ENOSPC 不在目标路径留半残文件
     let out_xml = if edits.is_empty() {
         xml
     } else {
         apply_edits(&xml, edits)
     };
-    std::fs::write(out, out_xml.into_bytes())
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    write_bytes_atomic(out, &out_xml.into_bytes())?;
     Ok(report)
 }
 

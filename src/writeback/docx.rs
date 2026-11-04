@@ -74,6 +74,17 @@
 //! 文段前插独立分页段 `PAGE_BREAK_P`（`w:br w:type="page"` 硬分页）；尾节
 //! 译文随下一节属性——裸 sectPr 即本节原属性，保真等价；段首自带分页段落
 //! 的细分段，译文段拷贝自带段首分页，同样不另插（否则空白页）。
+//!
+//! # 回写保真小项
+//!
+//! * BilingualInline 追加段的节符防御：原段是节尾段（pPr 内含 `w:sectPr`）
+//!   时，追加段只克隆 pPr 的非节符部分（`apply_inline` / `strip_sectpr`）
+//!   ——复制节符 = 译文段自带换页边界，双语段之间多出一页空白（与上文金
+//!   测否决案同根因）。
+//! * TranslationOnly 原地替换的 `xml:space` 条件补（`translation_only_edits`
+//!   / `preserve_space_tag_edit`）：译文原文首/尾带空白且原 `w:t` 标签未带
+//!   `xml:space` 时补 `preserve`——合成段落恒带 preserve（防 Word 吞空格），
+//!   原地替换路径原来没有，两条写入路径口径对齐。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -175,7 +186,7 @@ pub fn writeback_docx_alternating(
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
     let (slots, _) = scan_slots(&xml)?;
     let mut report = WritebackReport::default();
-    let edits = translation_only_edits(&slots, &units, &map, &mut report);
+    let edits = translation_only_edits(&xml, &slots, &units, &map, &mut report);
     if edits.is_empty() {
         // 全书无命中：原包透传（document.xml 也不动，与 epub 交替同口径）
         return rewrite_zip(in_path, out, &[]).map(|_| report);
@@ -716,6 +727,12 @@ fn matched_translations(
 /// 格位则追在格内最后一个 `w:p` 之后（复制格内首段的 pPr；译段 run 用全新
 /// 最小 rPr——仅 `w:sz`/`w:szCs` = 18 半点 = 9pt 的固定小字号，不复制原
 /// run 的 rPr，见模块头；含嵌套表的格 v1 不写，见模块头）。
+///
+/// 段落位 pPr 的唯一改写：剔除节符（[`strip_sectpr`]）。原段是节尾段（pPr
+/// 内含 `w:sectPr`，即其节的最后一块）时，verbatim 克隆会把节符复制进译文
+/// 段；节符即换页边界（默认 nextPage），双语段之间会多出一页空白（节交替
+/// 回写金测否决过的同款缺陷，见模块头「节保真」）。格位分支不剥：节符不落
+/// 表格内（`BodyBlock.has_sectpr` 同款口径）。
 fn apply_inline(
     xml: &str,
     slots: &[Slot],
@@ -731,7 +748,10 @@ fn apply_inline(
     for (k, tr) in matched {
         match &slots[k] {
             Slot::Para(p) => {
-                let ppr = p.ppr.clone().unwrap_or_default();
+                // pPr verbatim 克隆，唯一例外：剔除节符——原段是节尾段时复
+                // 制节符 = 译文段自带换页边界，双语段间多一页空白（见
+                // strip_sectpr 与函数文档）。格位分支不剥：节符不落表格内。
+                let ppr = strip_sectpr(p.ppr.as_deref().unwrap_or_default());
                 edits.push((
                     p.end,
                     format!(
@@ -776,6 +796,47 @@ fn apply_inline(
     splice(xml, edits)
 }
 
+/// pPr 内节符的字面量形态（[`strip_sectpr`] 剥离用；与 [`W_SECTPR`] 本地
+/// 名常量平行——这里要开/闭标签字节形态，单独成常量）。
+const SECTPR_OPEN_TAG: &str = "<w:sectPr";
+const SECTPR_CLOSE_TAG: &str = "</w:sectPr>";
+
+/// 剔除 pPr 字符串中的节符（[`apply_inline`] 段落位克隆 pPr 的唯一改写）：
+/// `<w:sectPr ...>` 到配对 `</w:sectPr>` 的闭区间、自闭合 `<w:sectPr .../>`
+/// 都整段剔除，其余字节原样。动机：原段是节尾段（pPr 内含 sectPr = 其节
+/// 最后一块）时，克隆节符会让追加的译文段自带换页边界（默认 nextPage）→
+/// 双语段之间多出一页空白——节交替回写（`assemble_alternating`）金测分析
+/// 否决过的同款缺陷，见模块头「节保真」。
+///
+/// sectPr 不嵌套 sectPr，开标签后首个闭标签即配对者；`<w:sectPr` 子串定位
+/// 不会误命中属性值/文本——良构 XML 里 `<` 必转义为 `&lt;`。病态输入（无
+/// `>` 或无配对闭标签；unreachable：`scan_slots` 已 quick-xml 全文解析成功，
+/// ppr 必为良构片段）保守保留原字节。
+fn strip_sectpr(ppr: &str) -> String {
+    let mut out = String::with_capacity(ppr.len());
+    let mut rest = ppr;
+    while let Some(open) = rest.find(SECTPR_OPEN_TAG) {
+        // 开标签终点 = 首个 `>`；自闭合 `/>` 到此为止，闭区间吃配对闭标签
+        let Some(gt_rel) = rest[open..].find('>') else { break };
+        let gt = open + gt_rel;
+        let (skip_to, stripped) = if rest[..gt + 1].ends_with("/>") {
+            (gt + 1, true)
+        } else {
+            match rest[gt + 1..].find(SECTPR_CLOSE_TAG) {
+                Some(rel) => (gt + 1 + rel + SECTPR_CLOSE_TAG.len(), true),
+                None => (0, false), // 无配对闭标签：保守保留原字节
+            }
+        };
+        if !stripped {
+            break;
+        }
+        out.push_str(&rest[..open]);
+        rest = &rest[skip_to..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// TranslationOnly：首 `w:t` 文本换译文，其余 `w:t` 文本清空。格位口径：
 /// 首个 `w:t` 取译文之外，格内全部直接段落的 `w:t` 一并清空（重解析格文本
 /// = 译文，与提取侧格内多段落 join 口径一致）；含嵌套表的格 v1 不写——
@@ -789,7 +850,7 @@ fn apply_translation_only(
     map: &HashMap<&str, (&str, Option<&str>)>,
     report: &mut WritebackReport,
 ) -> String {
-    splice_spans(xml, translation_only_edits(slots, units, map, report))
+    splice_spans(xml, translation_only_edits(xml, slots, units, map, report))
 }
 
 /// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位首 `w:t` 换译
@@ -798,7 +859,16 @@ fn apply_translation_only(
 /// 准）。[`writeback_docx`] 与 [`writeback_docx_alternating`] 共用：后者按
 /// 分段区间平移取用同一编辑流，不另写渲染。报告：实际产出编辑的单元计
 /// written，结构跳过记因。
+///
+/// 首 `w:t` 写入文本 = 配对期 trim 后的译文；当译文**原文**（map 原始值，
+/// trim 之前）首/尾带空白、且其开始标签未带 `xml:space` 属性时，额外产出
+/// 一个「改写开始标签补 ` xml:space="preserve"`」的编辑（判据与防御见
+/// [`preserve_space_tag_edit`]）——与合成段落的 preserve 口径对齐，防
+/// Word 吞空格；标签编辑与文本替换编辑区间相接不重叠，同批一次
+/// [`splice_spans`] 应用（节交替平移后同样成立：两个编辑同落一个 `w:t`，
+/// 永远被同一分段整体收录或整体丢弃）。
 fn translation_only_edits(
+    xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
     map: &HashMap<&str, (&str, Option<&str>)>,
@@ -807,6 +877,8 @@ fn translation_only_edits(
     let matched = matched_translations(slots, units, map, report);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (k, tr) in matched {
+        // 译文原文（map 原始值，配对期 trim 之前）——xml:space 条件补的判据
+        let raw_tr = map.get(units[k].id.as_str()).map(|(raw, _)| *raw);
         match &slots[k] {
             Slot::Para(p) => {
                 let spans = &p.text_spans;
@@ -818,6 +890,7 @@ fn translation_only_edits(
                 let mut it = spans.iter();
                 let first = it.next().unwrap();
                 edits.push((first.0, first.1, escape_xml_text(&tr)));
+                edits.extend(raw_tr.and_then(|raw| preserve_space_tag_edit(xml, first.0, raw)));
                 for span in it {
                     edits.push((span.0, span.1, String::new()));
                 }
@@ -835,6 +908,7 @@ fn translation_only_edits(
                     continue;
                 };
                 edits.push((first.0, first.1, escape_xml_text(&tr)));
+                edits.extend(raw_tr.and_then(|raw| preserve_space_tag_edit(xml, first.0, raw)));
                 for span in it {
                     edits.push((span.0, span.1, String::new()));
                 }
@@ -843,6 +917,66 @@ fn translation_only_edits(
         }
     }
     edits
+}
+
+/// `xml:space` 条件补（TranslationOnly 首 `w:t` 原地替换，保真小项）：译文
+/// 原文首/尾带空白、且该 `w:t` 开始标签未带 `xml:space` 属性时，返回「改写
+/// 开始标签补 ` xml:space="preserve"`」的编辑——与合成段落的 preserve 口径
+/// 对齐（合成段恒带 preserve；原地路径原来没有，Word 会吞译文边缘空格，
+/// 造成排版粘连）。写入文本仍是配对期 trim 后的译文，preserve 同时护住译
+/// 文内部的连续空格；两条件不同时满足则不动标签（最小侵入，输出字节零变
+/// 化）。返回编辑区间 = 开始标签 `[起符, 文本起点)`，与文本替换编辑
+/// `[文本起点, ..)` 相接不重叠。
+///
+/// 锚定与防御：文本 span 左界即开标签 `>` 之后，向前窗口（256 字节）内最近
+/// `<` 必是它的开标签起符——仍校验元素**本地名**为 `t`（默认命名空间 `<t>`、
+/// 换前缀 `<word:t>` 放行；防 schema 外 junk 元素错锚，如 `<w:t><w:junk>x`
+/// 的 junk 标签，此时保守不加属性）；自闭合 `/>`（有文本 span 时按 schema
+/// 不存在，纯防御）与已带 `xml:space`（任意引号/取值形态，子串判定）一律
+/// 不动。
+fn preserve_space_tag_edit(
+    xml: &str,
+    text_start: usize,
+    raw_tr: &str,
+) -> Option<(usize, usize, String)> {
+    // (a) 译文原文首/尾有空白（trim 后不等）
+    if raw_tr.trim() == raw_tr {
+        return None;
+    }
+    // 开始标签区间 + 名称校验（防错锚）
+    let (tag_open, _) = w_t_start_tag_span(xml, text_start)?;
+    let tag = &xml[tag_open..text_start];
+    let inner = &tag[1..]; // 去掉 `<`
+    let qname_end = inner
+        .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
+        .unwrap_or(inner.len());
+    if inner[..qname_end].rsplit(':').next() != Some("t") {
+        return None;
+    }
+    // (b) 已带属性（任意引号形态，子串命中）/ 自闭合：不动标签
+    if tag.contains("xml:space") || tag.ends_with("/>") {
+        return None;
+    }
+    // 属性插在收 `>` 之前（顺带收掉既有尾部空白，属性间留一个空格）
+    let mut rewritten = String::with_capacity(tag.len() + 22);
+    rewritten.push_str(tag[..tag.len() - 1].trim_end());
+    rewritten.push_str(" xml:space=\"preserve\">");
+    Some((tag_open, text_start, rewritten))
+}
+
+/// `w:t` 文本 span 的开始标签区间：span 左界（开标签 `>` 之后）向前找最近
+/// 的 `<`（开标签起符——标签内部不含 `<`；`text_start` 本身是 quick-xml
+/// 事件边界，必为字符边界）。窗口 256 字节（`w:t` 开标签只有 xml:space 量
+/// 级的属性；窗口起点回退到字符边界再切片）；窗口内无 `<`（病态输入）返回
+/// None——保守不加标签编辑。
+fn w_t_start_tag_span(xml: &str, text_start: usize) -> Option<(usize, usize)> {
+    const TAG_WINDOW: usize = 256;
+    let mut lo = text_start.saturating_sub(TAG_WINDOW);
+    while lo > 0 && !xml.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let rel = xml[lo..text_start].rfind('<')?;
+    Some((lo + rel, text_start))
 }
 
 /// OriginalPlusAppendix：正文不动，body 末尾追加「译文」标题段 + 译文段序列。
@@ -1224,6 +1358,15 @@ mod tests {
         r#"</w:body></w:document>"#
     );
 
+    /// 节尾段文档：唯一段落 pPr 内含 sectPr（该段是其节的最后一块）、body
+    /// 无裸节符（BilingualInline 译文段 pPr 剥离节符的考点）。
+    const SECTPR_PARA_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>节尾段落。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
 
     fn case_dir(case: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1387,6 +1530,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// TranslationOnly 的 xml:space 条件补（保真小项①）：译文原文（map 原始
+    /// 值）首/尾带空白 → 首 `w:t` 开始标签补 `xml:space="preserve"`（写入文
+    /// 本仍为配对期 trim 后的译文，与合成段落口径一致）；译文无边缘空白 →
+    /// 标签字节原样（最小侵入：全文档无任何新增 preserve）；段落位与格位
+    /// 首 `w:t` 同款；重解析文本正确、结构零扰动。
+    #[test]
+    fn translation_only_preserve_added_only_for_edge_whitespace() {
+        let dir = case_dir("tonly-space");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, DOCUMENT_XML);
+        write(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "  Chapter 1  "),    // 边缘空白 → 补 preserve
+                ("p0-b1", "Plain body"),       // 无边缘空白 → 标签不动
+                ("p0-b3-r0c0", " Cell Head "), // 格位首 w:t 同款
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        // 带边缘空白的译文：开始标签补 preserve（写入文本 = trim 后译文）
+        assert!(out_xml.contains(r#"<w:t xml:space="preserve">Chapter 1</w:t>"#));
+        assert!(out_xml.contains(r#"<w:t xml:space="preserve">Cell Head</w:t>"#));
+        // 无边缘空白的译文：标签字节原样；全文档 preserve 恰两处（最小侵入）
+        assert!(out_xml.contains("<w:t>Plain body</w:t>"));
+        assert_eq!(out_xml.matches("xml:space").count(), 2);
+
+        // 重解析：写入文本正确（trim 后译文），块数与原文一致（无插入）
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0].content, "Chapter 1");
+        assert_eq!(got[1].content, "Plain body");
+        let table = got[3].table.as_ref().unwrap();
+        assert_eq!(
+            table.rows,
+            vec![vec!["Cell Head".to_string(), "表头乙".to_string()]]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 全部 id 未匹配：输出与原文解析结果逐块一致（透传）。
     #[test]
     fn unmatched_ids_leave_document_untouched() {
@@ -1431,6 +1618,49 @@ mod tests {
         let last_tr = out_xml.rfind("This is the first paragraph for testing.").unwrap();
         assert!(last_tr < sect, "附录插在 sectPr 之前");
         assert!(out_xml[sect..].contains("</w:body>"), "sectPr 仍收尾");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BilingualInline 的节符剥离（保真小项②）：原段是节尾段（pPr 内含
+    /// sectPr）时，追加的译文段复制 pPr 但**不含**节符——节符即换页边界，
+    /// 复制会让双语段之间多出一页空白（节交替金测否决过的同款缺陷，见模块
+    /// 头）。原段字节原样（节符保留在原段）、全文档 sectPr 恰一处、重解析
+    /// 正常。
+    #[test]
+    fn inline_append_strips_sectpr_from_copied_ppr() {
+        let dir = case_dir("inline-sectpr");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, SECTPR_PARA_XML);
+        assert_eq!(unit_ids(&in_path), ["p0-b0"]);
+
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Sect end para.")],
+            BiStrategy::BilingualInline,
+        );
+
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        // 原段字节原样：节符保留在原段 pPr 内
+        assert!(out_xml.contains(
+            r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>节尾段落。</w:t></w:r></w:p>"#
+        ));
+        // 译文段：pPr 克隆但节符已剔除（剩空 pPr）
+        assert!(out_xml.contains(
+            r#"<w:p><w:pPr></w:pPr><w:r><w:t xml:space="preserve">Sect end para.</w:t></w:r></w:p>"#
+        ));
+        // 全文档 sectPr 恰一处（= 原段节符；译文段无拷贝）
+        assert_eq!(out_xml.matches("<w:sectPr").count(), 1, "译文段不得复制节符");
+
+        // 重解析：原段 + 译段，文本正确（节符段/空 pPr 段不产额外块）
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            ["节尾段落。", "Sect end para."]
+        );
+        assert!(got.iter().all(|b| b.kind == Paragraph));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2331,6 +2561,65 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// strip_sectpr 形态覆盖（保真小项②的纯函数面）：闭区间 / 自闭合 /
+    /// 带属性自闭合 / 前后内容保留 / 无节符字节原样 / 病态（无配对闭标签）
+    /// 保守保留。
+    #[test]
+    fn strip_sectpr_covers_all_forms() {
+        assert_eq!(
+            strip_sectpr(r#"<w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr>"#),
+            "<w:pPr></w:pPr>"
+        );
+        // 自闭合与带属性自闭合（防御分支；常见形态是闭区间）
+        assert_eq!(strip_sectpr("<w:pPr><w:sectPr/></w:pPr>"), "<w:pPr></w:pPr>");
+        assert_eq!(
+            strip_sectpr(r#"<w:pPr><w:sectPr w:rsidR="00A1B2C3"/></w:pPr>"#),
+            "<w:pPr></w:pPr>"
+        );
+        // 节符前后的 pPr 子元素逐字节保留
+        assert_eq!(
+            strip_sectpr(
+                r#"<w:pPr><w:pStyle w:val="H1"/><w:sectPr><w:pgSz/></w:sectPr><w:spacing/></w:pPr>"#
+            ),
+            r#"<w:pPr><w:pStyle w:val="H1"/><w:spacing/></w:pPr>"#
+        );
+        // 无节符 / 空串：字节原样
+        assert_eq!(
+            strip_sectpr(r#"<w:pPr><w:pStyle w:val="H1"/></w:pPr>"#),
+            r#"<w:pPr><w:pStyle w:val="H1"/></w:pPr>"#
+        );
+        assert_eq!(strip_sectpr(""), "");
+        // 病态（unreachable：scan_slots 已全文解析成功）：保守保留原字节
+        assert_eq!(
+            strip_sectpr("<w:pPr><w:sectPr></w:pPr>"),
+            "<w:pPr><w:sectPr></w:pPr>"
+        );
+    }
+
+    /// preserve_space_tag_edit 判据与区间（保真小项①的纯函数面）：原文边缘
+    /// 空白 × 标签无属性 → 改写编辑（区间 = 开始标签，止于文本起点）；无边
+    /// 缘空白 / 标签已带属性（任意形态）/ 错锚（span 前最近 `<` 非 t 元素）
+    /// → None。
+    #[test]
+    fn preserve_space_tag_edit_gate_and_interval() {
+        let xml = r#"<w:p><w:r><w:t>甲</w:t><w:t xml:space="preserve"> 乙 </w:t></w:r></w:p>"#;
+        // 首个 w:t：文本起点 = `<w:t>` 之后；带边缘空白 → 补属性，
+        // 编辑区间恰为开始标签 `[<, 文本起点)`
+        let first_t = xml.find(">甲").unwrap() + 1;
+        let (s, e, tag) = preserve_space_tag_edit(xml, first_t, " EN ").unwrap();
+        assert_eq!(&xml[s..e], "<w:t>");
+        assert_eq!(tag, "<w:t xml:space=\"preserve\">");
+        assert_eq!(e, first_t, "标签编辑止于文本起点：与文本替换编辑区间相接不重叠");
+        // 无边缘空白 → None（最小侵入）
+        assert!(preserve_space_tag_edit(xml, first_t, "EN").is_none());
+        // 标签已带 xml:space（第二个 w:t，任意形态子串命中）→ None
+        let second_t = xml.find("> 乙 ").unwrap() + 1;
+        assert!(preserve_space_tag_edit(xml, second_t, " EN ").is_none());
+        // 错锚防御：span 左界之前最近 `<` 是 `<w:r>`（非 t 元素）→ None
+        let run_end = xml.find("<w:r>").unwrap() + "<w:r>".len();
+        assert!(preserve_space_tag_edit(xml, run_end, " EN ").is_none());
     }
 
     /// 枚举等价（解析器↔扫描器漂移报警器）：对全部 docx fixture 显式断言

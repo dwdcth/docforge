@@ -863,19 +863,24 @@ fn insert_at(xml: &str, pos: usize, piece: &str) -> String {
 type ZipParts = Vec<(String, Vec<u8>)>;
 
 /// 逐条目透传原包字节，`replaced` 中的条目换成新字节，末尾追加 `added` 新条目，
-/// 重打包到 `out`。
+/// 重打包到 `out`。未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]——
+/// 原压缩流直拷（不解压不重压，CRC / 时间戳原样），只有命中条目写新字节；
+/// 输出经同目录临时文件落盘后 rename（原子替换，见 [`super::temp_sibling`]），
+/// 中途失败 / ENOSPC 不在目标路径留半残文件。
 fn rewrite_zip_with_added(
     in_path: &Path,
     out_path: &Path,
     replaced: &[(String, Vec<u8>)],
     added: &[(String, Vec<u8>)],
 ) -> Result<()> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     let mut zip = open_zip(in_path)?;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    // 预读条目名即可（目录条目照旧丢弃）：替换条目用 replaced 新字节、
+    // 未触碰条目稍后 raw copy 直拷，均无需旧数据
+    let mut entries: Vec<(usize, String)> = Vec::new();
     for i in 0..zip.len() {
-        let mut f = zip
+        let f = zip
             .by_index(i)
             .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {i} 失败: {e}")))?;
         if f.is_dir() {
@@ -885,41 +890,60 @@ fn rewrite_zip_with_added(
             .name()
             .map_err(|e| DocError::corrupt(format!("ZIP 条目 {i} 名字损坏: {e}")))?
             .into_owned();
-        let mut data = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
-        entries.push((name, data));
+        entries.push((i, name));
     }
     // 追加条目不得与既有条目撞名（sheetN 由既有序号 +1 推得，理论上不可能）
     for (name, _) in added {
-        if entries.iter().any(|(n, _)| n == name) {
+        if entries.iter().any(|(_, n)| n == name) {
             return Err(DocError::corrupt(format!("追加条目 {name} 与既有部件撞名")));
         }
     }
 
-    let out_file = std::fs::File::create(out_path).map_err(|e| {
-        DocError::corrupt(format!("cannot create {}: {e}", out_path.display()))
+    let tmp = super::temp_sibling(out_path);
+    let out_file = std::fs::File::create(&tmp).map_err(|e| {
+        DocError::corrupt(format!("cannot create {}: {e}", tmp.display()))
     })?;
     let mut zw = zip::ZipWriter::new(out_file);
-    let opts = zip::write::SimpleFileOptions::default();
-    for (name, mut data) in entries {
-        if let Some((_, new_data)) = replaced.iter().find(|(n, _)| *n == name) {
-            data = new_data.clone();
+    // 写入段收进闭包：任一条目写失败直接返回 Err，外层统一删临时件
+    //（闭包内 by_index 可变借用 zip，需 FnMut 可变绑定）
+    let mut write = |zw: &mut zip::ZipWriter<std::fs::File>| -> Result<()> {
+        let opts = zip::write::SimpleFileOptions::default();
+        for (idx, name) in &entries {
+            if let Some((_, new_data)) = replaced.iter().find(|(n, _)| n == name) {
+                zw.start_file(name.as_str(), opts)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                zw.write_all(new_data)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            } else {
+                // 未触碰条目：压缩流直拷（不解压不重压）
+                let f = zip
+                    .by_index(*idx)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {idx} 失败: {e}")))?;
+                zw.raw_copy_file(f)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            }
         }
-        zw.start_file(name.as_str(), opts)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-        zw.write_all(&data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        for (name, data) in added {
+            zw.start_file(name.as_str(), opts)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            zw.write_all(data)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        }
+        Ok(())
+    };
+    match write(&mut zw) {
+        Ok(()) => match zw.finish() {
+            Ok(_) => super::commit_temp(&tmp, out_path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(DocError::corrupt(format!("ZIP 收尾失败: {e}")))
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    for (name, data) in added {
-        zw.start_file(name.as_str(), opts)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-        zw.write_all(data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-    }
-    zw.finish()
-        .map_err(|e| DocError::corrupt(format!("ZIP 收尾失败: {e}")))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,6 +1470,72 @@ mod tests {
         let out_path = dir.join("out.xlsx");
         write(&in_path, &out_path, &[("p0-b42", "nope")], BiStrategy::BilingualInline);
         assert_eq!(table_rows(&out_path, 0), table_rows(&in_path, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// raw copy 直拷：未触碰二进制部件（伪图片字节，Stored）内容与压缩态
+    /// 原样直拷（旧实现全部条目重新 deflate 会把 Stored 变 Deflated），
+    /// 触碰 sheet 正常改写、输出可重解析；目录无临时件残留。
+    #[test]
+    fn raw_copy_keeps_binary_parts_verbatim() {
+        let dir = case_dir("rawcopy");
+        let in_path = dir.join("in.xlsx");
+        let sheet1 = worksheet(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>甲</t></is></c></row>"#,
+            "",
+        );
+        let image: Vec<u8> = (0..65536usize).map(|i| (i % 249) as u8).collect();
+        {
+            let f = std::fs::File::create(&in_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("[Content_Types].xml", CT_XML.as_bytes()),
+                ("xl/workbook.xml", WB_XML.as_bytes()),
+                ("xl/_rels/workbook.xml.rels", WB_RELS.as_bytes()),
+                ("xl/worksheets/sheet1.xml", sheet1.as_bytes()),
+            ] {
+                zw.start_file(name, opts).unwrap();
+                zw.write_all(body).unwrap();
+            }
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("xl/media/image1.png", stored).unwrap();
+            zw.write_all(&image).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let out_path = dir.join("out.xlsx");
+        write(&in_path, &out_path, &[("pS1-b0-r0c0", "[甲]")], BiStrategy::TranslationOnly);
+
+        // 输出可重解析且译文已写入
+        assert_eq!(table_rows(&out_path, 0), vec![vec!["[甲]".to_string()]]);
+
+        // 未触碰二进制部件：内容字节一致 + 压缩态原样（raw copy 直拷）
+        assert_eq!(
+            entry_bytes(&in_path, "xl/media/image1.png"),
+            entry_bytes(&out_path, "xl/media/image1.png")
+        );
+        {
+            let mut zout = open_zip(&out_path).unwrap();
+            assert_eq!(
+                zout.by_name("xl/media/image1.png").unwrap().compression(),
+                zip::CompressionMethod::Stored,
+                "未触碰部件压缩态直拷"
+            );
+            let zin = open_zip(&in_path).unwrap();
+            assert_eq!(zout.len(), zin.len(), "条目数不变");
+        }
+
+        // 原子落盘收尾：目录无临时件残留
+        let residue: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "{residue:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

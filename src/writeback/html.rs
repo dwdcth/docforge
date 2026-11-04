@@ -63,7 +63,7 @@ use crate::plugins::html::{decode_entities, find_tag_end, heading_level, strip_c
 use crate::plugins::html::HtmlPlugin;
 use crate::plugins::text::WholeTextParseCapability;
 
-use super::{apply_edits, Edit, escape_xml_text, pair_map};
+use super::{apply_edits, Edit, escape_xml_text, pair_map, write_bytes_atomic};
 
 /// 译文样式类（BilingualInline 插入段与表格格内分隔符统一挂它，便于下游
 /// 识别；epub 同值）。
@@ -246,7 +246,8 @@ pub fn writeback_html(
         edits.push(Edit::Insert(pos, appendix));
     }
 
-    // E. 改写并写回（无命中 = 原文原样；BOM 补回）
+    // E. 改写并写回（无命中 = 原文原样；BOM 补回）——原子落盘：同目录
+    // 临时件 + rename，崩溃 / ENOSPC 不在目标路径留半残文件
     let out_text = if edits.is_empty() {
         text
     } else {
@@ -257,8 +258,7 @@ pub fn writeback_html(
         out_bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     }
     out_bytes.extend_from_slice(out_text.as_bytes());
-    std::fs::write(out, out_bytes)
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    write_bytes_atomic(out, &out_bytes)?;
     Ok(report)
 }
 

@@ -810,15 +810,22 @@ fn opf_insert_points(opf_xml: &str, parts: &[SpinePart]) -> Result<OpfInsertPoin
 /// 只换不加（包外名字静默丢弃），译文部件是新条目，故在本文件内镜像一份
 /// 加 `added` 参数——mimetype 首条目 + Stored、既有条目原序透传等约定与
 /// zip_util::rewrite_zip 一致；added 追加在末尾（EPUB 不约束条目物理序）。
+/// 未被替换命中的条目走 raw_copy_file 压缩流直拷（不解压不重压）；输出经
+/// 同目录临时文件落盘后 rename（原子替换，见 [`super::temp_sibling`]）。
 fn rewrite_zip_added(
     in_path: &Path,
     out_path: &Path,
     replaced: &[(String, Vec<u8>)],
     added: &[(String, Vec<u8>)],
 ) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+
     let mut zip = open_zip(in_path)?;
 
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    // 预读条目名（目录条目照旧丢弃）；mimetype 的字节顺手读出（20 字节级，
+    // 强制 Stored 重写），其余条目不预读数据——未命中替换的稍后 raw copy
+    let mut entries: Vec<(usize, String)> = Vec::new();
+    let mut mimetype_data: Option<Vec<u8>> = None;
     for i in 0..zip.len() {
         let mut f = zip
             .by_index(i)
@@ -830,56 +837,76 @@ fn rewrite_zip_added(
             .name()
             .map_err(|e| DocError::corrupt(format!("ZIP 条目 {i} 名字损坏: {e}")))?
             .into_owned();
-        let mut data = Vec::with_capacity(f.size() as usize);
-        std::io::Read::read_to_end(&mut f, &mut data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
-        entries.push((name, data));
+        if name == "mimetype" {
+            let mut data = Vec::with_capacity(f.size() as usize);
+            f.read_to_end(&mut data)
+                .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
+            mimetype_data = Some(data);
+        }
+        entries.push((i, name));
     }
 
-    let apply = |name: &str, data: &mut Vec<u8>| {
-        for (rn, rdata) in replaced {
-            if rn.as_str() == name {
-                *data = rdata.clone();
-            }
-        }
-    };
-
-    let out_file = std::fs::File::create(out_path).map_err(|e| {
-        DocError::corrupt(format!("cannot create {}: {e}", out_path.display()))
+    let tmp = super::temp_sibling(out_path);
+    let out_file = std::fs::File::create(&tmp).map_err(|e| {
+        DocError::corrupt(format!("cannot create {}: {e}", tmp.display()))
     })?;
     let mut zw = zip::ZipWriter::new(out_file);
-    let mut wrote_mimetype = false;
-    // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
-    if let Some((_, data)) = entries.iter().find(|(n, _)| n == "mimetype") {
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        zw.start_file("mimetype", opts)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-        std::io::Write::write_all(&mut zw, data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-        wrote_mimetype = true;
-    }
-    for (name, mut data) in entries {
-        if wrote_mimetype && name == "mimetype" {
-            continue;
+    // 写入段收进闭包：任一条目写失败直接返回 Err，外层统一删临时件
+    //（闭包内 by_index 可变借用 zip，需 FnMut 可变绑定）
+    let mut write = |zw: &mut zip::ZipWriter<std::fs::File>| -> Result<()> {
+        let mut wrote_mimetype = false;
+        // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
+        if let Some(data) = &mimetype_data {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("mimetype", opts)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+            zw.write_all(data)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+            wrote_mimetype = true;
         }
-        apply(&name, &mut data);
-        let opts = zip::write::SimpleFileOptions::default();
-        zw.start_file(name.as_str(), opts)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-        std::io::Write::write_all(&mut zw, &data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        for (idx, name) in &entries {
+            if wrote_mimetype && name == "mimetype" {
+                continue;
+            }
+            if let Some((_, data)) = replaced.iter().rev().find(|(n, _)| n == name) {
+                // 命中替换：新字节照旧走 start_file（重压缩）
+                let opts = zip::write::SimpleFileOptions::default();
+                zw.start_file(name.as_str(), opts)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                zw.write_all(data)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            } else {
+                // 未触碰条目：压缩流直拷（不解压不重压）
+                let f = zip
+                    .by_index(*idx)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {idx} 失败: {e}")))?;
+                zw.raw_copy_file(f)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            }
+        }
+        for (name, data) in added {
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file(name.as_str(), opts)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            zw.write_all(data)
+                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+        }
+        Ok(())
+    };
+    match write(&mut zw) {
+        Ok(()) => match zw.finish() {
+            Ok(_) => super::commit_temp(&tmp, out_path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(DocError::corrupt(format!("ZIP 收尾失败: {e}")))
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    for (name, data) in added {
-        let opts = zip::write::SimpleFileOptions::default();
-        zw.start_file(name.as_str(), opts)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-        std::io::Write::write_all(&mut zw, data)
-            .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-    }
-    zw.finish()
-        .map_err(|e| DocError::corrupt(format!("ZIP 收尾失败: {e}")))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1146,29 @@ mod tests {
         zw.finish().unwrap();
     }
 
+    /// 向既有 zip 末尾追加一个二进制条目（raw copy 测试注入伪图片部件用；
+    /// 既有条目原样搬入新包后 rename 回原路径）。
+    fn append_zip_entry(path: &Path, name: &str, data: &[u8]) {
+        let mut zin = open_zip(path).unwrap();
+        let tmp = path.with_extension("append.tmp");
+        let f = std::fs::File::create(&tmp).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        for i in 0..zin.len() {
+            let mut e = zin.by_index(i).unwrap();
+            let n = e.name().unwrap().to_string();
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            zw.start_file(n.as_str(), opts).unwrap();
+            zw.write_all(&buf).unwrap();
+        }
+        zw.start_file(name, zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)).unwrap();
+        zw.write_all(data).unwrap();
+        zw.finish().unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
     /// 金测（核心验收）：BilingualInline 往返 —— 坍缩页插在最后非空块后、
     /// 切节页逐块原/译交错、表格不受扰、未匹配 id 忽略、mimetype 仍居首。
     #[test]
@@ -1249,6 +1299,66 @@ mod tests {
             BiStrategy::BilingualInline,
         );
         assert_eq!(parse_doc(&out_path), parse_doc(&in_path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// raw copy 直拷：未触碰二进制条目（伪图片字节，Stored）内容与压缩态
+    /// 原样透传（旧实现全部条目重新 deflate 会把 Stored 变 Deflated），触碰
+    /// 条目已改写，mimetype 仍居首且强制 Stored；目录无临时件残留。
+    #[test]
+    fn raw_copy_keeps_binary_entries_verbatim() {
+        let dir = case_dir("rawcopy");
+        let in_path = build_epub(&dir, CH1, CH2);
+        let image: Vec<u8> = (0..65536usize).map(|i| (i % 253) as u8).collect();
+        append_zip_entry(&in_path, "OEBPS/pic.bin", &image);
+
+        let out_path = dir.join("out.epub");
+        write(
+            &in_path,
+            &out_path,
+            &[("p第一章-b0", "Chapter 1")],
+            BiStrategy::BilingualInline,
+        );
+
+        // 输出可重解析且译文写入（CH1 是单节坍缩形态：译文 append 后重解析
+        // 仍坍缩成一段，断言按页文本包含而非独立块）
+        let doc = parse_doc(&out_path);
+        assert!(
+            doc.pages[0].text.contains("Chapter 1"),
+            "触碰条目已改写：{:?}",
+            doc.pages[0].text
+        );
+
+        // 未触碰二进制条目：内容字节一致 + 压缩态原样（raw copy 直拷）
+        let mut zin = open_zip(&in_path).unwrap();
+        let mut zout = open_zip(&out_path).unwrap();
+        assert_eq!(zout.len(), zin.len(), "条目数不变");
+        let mut a = Vec::new();
+        zin.by_name("OEBPS/pic.bin").unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        zout.by_name("OEBPS/pic.bin").unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            zout.by_name("OEBPS/pic.bin").unwrap().compression(),
+            zip::CompressionMethod::Stored,
+            "未触碰条目压缩态直拷"
+        );
+        // mimetype 仍居首且强制 Stored
+        assert_eq!(zout.by_index(0).unwrap().name().unwrap(), "mimetype");
+        assert_eq!(
+            zout.by_index(0).unwrap().compression(),
+            zip::CompressionMethod::Stored
+        );
+
+        // 原子落盘收尾：目录无临时件残留
+        let residue: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "{residue:?}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

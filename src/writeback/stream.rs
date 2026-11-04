@@ -345,8 +345,8 @@ impl WritebackSession {
             .parse(&self.in_path)?;
         let doc = MarkdownPlugin.assemble(&raw);
         let md = crate::emit::to_bilingual_markdown_with(&doc, pairs, self.strategy);
-        std::fs::write(&self.out_path, md)
-            .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", self.out_path.display())))?;
+        // 原子落盘：同目录临时件 + rename（崩溃 / ENOSPC 不留半残文件）
+        super::write_bytes_atomic(&self.out_path, md.as_bytes())?;
         let written = pairs
             .iter()
             .filter(|p| !p.translation.trim().is_empty())

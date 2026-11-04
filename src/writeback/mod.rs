@@ -163,6 +163,57 @@ impl WritebackReport {
 }
 
 // ---------------------------------------------------------------------------
+// 原子落盘（同目录 temp + rename）：崩溃 / 磁盘满（ENOSPC）不在目标路径留
+// 半残文件。同目录临时兄弟文件保证 rename 的原子性（不跨分区——跨文件系统
+// 的 rename 会退化为拷贝并可能中途失败）。
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+
+/// 输出文件的临时兄弟文件名（同目录保证 rename 原子性不跨分区）：
+/// `.{file_name}.tmp-{pid}-{nanos}`（隐藏件；pid + 纳秒双保险防同进程多会话
+/// / 快速重建撞名，与 stream.rs 的 spill 命名同款策略）。
+pub(crate) fn temp_sibling(out: &Path) -> PathBuf {
+    let name = out
+        .file_name()
+        .map_or_else(|| "out".to_string(), |n| n.to_string_lossy().into_owned());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    out.with_file_name(format!(".{name}.tmp-{}-{nanos}", std::process::id()))
+}
+
+/// rename 临时文件到目标（原子落盘的收尾一步）；失败删除临时文件（不留
+/// 垃圾）并上抛 `corrupt`。
+pub(crate) fn commit_temp(tmp: &Path, out: &Path) -> crate::error::Result<()> {
+    if let Err(e) = std::fs::rename(tmp, out) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(crate::error::DocError::corrupt(format!(
+            "cannot create {}: {e}",
+            out.display()
+        )));
+    }
+    Ok(())
+}
+
+/// 字节写出的原子化（txt / html / fb2 / md 单文件写出共用）：先写同目录
+/// 临时兄弟文件，成功后 [`commit_temp`] rename 到位。写出中途失败（崩溃 /
+/// ENOSPC）删除临时件——目标路径要么是完整的旧/新内容，要么不存在，
+/// 永远不留半残文件。
+pub(crate) fn write_bytes_atomic(out: &Path, bytes: &[u8]) -> crate::error::Result<()> {
+    let tmp = temp_sibling(out);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(crate::error::DocError::corrupt(format!(
+            "cannot create {}: {e}",
+            out.display()
+        )));
+    }
+    commit_temp(&tmp, out)
+}
+
+// ---------------------------------------------------------------------------
 // ZIP 透传重打包（docx / epub 共用）
 // ---------------------------------------------------------------------------
 
@@ -180,7 +231,17 @@ mod zip_util {
     }
 
     /// 逐条目透传原包字节，`replaced` 中的条目换成新字节，重打包到 `out`。
-    /// EPUB 的 `mimetype` 约定（首条目 + Stored）在此统一维护。
+    ///
+    /// 未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]——原压缩流
+    /// 直拷（不解压不重压，CRC / 时间戳 / 权限 / 扩展字段原样），100MB 图多
+    /// 的容器回写从秒级降到毫秒级；命中条目照旧写新字节。EPUB 的 `mimetype`
+    /// 约定（首条目 + Stored）在此统一维护：mimetype 只有 20 字节级、不走
+    /// raw copy（raw copy 保留原压缩态，缺损包会带着非 Stored 的 mimetype
+    /// 进输出，违反 OCF 约定），照旧解出字节强制 Stored。
+    ///
+    /// 输出经 [`super::temp_sibling`] 的同目录临时文件落盘，`finish` 成功后
+    /// [`super::commit_temp`] rename 到位——中途失败 / ENOSPC 不在目标路径
+    /// 留半残 zip。重复的替换名按「后者胜」收敛（与旧 `apply` 语义一致）。
     pub(crate) fn rewrite_zip(
         in_path: &Path,
         out_path: &Path,
@@ -188,7 +249,11 @@ mod zip_util {
     ) -> Result<()> {
         let mut zip = open_zip(in_path)?;
 
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        // 预读条目名（目录条目照旧丢弃——输出不携带目录条目）；mimetype
+        // 的字节顺手读出（20 字节级，强制 Stored 重写），其余条目不预读
+        // 数据——未命中替换的条目稍后 raw copy 压缩流直拷。
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        let mut mimetype_data: Option<Vec<u8>> = None;
         for i in 0..zip.len() {
             let mut f = zip
                 .by_index(i)
@@ -200,49 +265,71 @@ mod zip_util {
                 .name()
                 .map_err(|e| DocError::corrupt(format!("ZIP 条目 {i} 名字损坏: {e}")))?
                 .into_owned();
-            let mut data = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
-            entries.push((name, data));
+            if name == "mimetype" {
+                let mut data = Vec::with_capacity(f.size() as usize);
+                f.read_to_end(&mut data)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
+                mimetype_data = Some(data);
+            }
+            entries.push((i, name));
         }
 
-        let apply = |name: &str, data: &mut Vec<u8>| {
-            for (rn, rdata) in replaced {
-                if rn.as_str() == name {
-                    *data = rdata.clone();
-                }
-            }
-        };
-
-        let out_file = std::fs::File::create(out_path).map_err(|e| {
-            DocError::corrupt(format!("cannot create {}: {e}", out_path.display()))
+        let tmp = super::temp_sibling(out_path);
+        let out_file = std::fs::File::create(&tmp).map_err(|e| {
+            DocError::corrupt(format!("cannot create {}: {e}", tmp.display()))
         })?;
         let mut zw = zip::ZipWriter::new(out_file);
-        let mut wrote_mimetype = false;
-        // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
-        if let Some((_, data)) = entries.iter().find(|(n, _)| n == "mimetype") {
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zw.start_file("mimetype", opts)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-            zw.write_all(data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-            wrote_mimetype = true;
-        }
-        for (name, mut data) in entries {
-            if wrote_mimetype && name == "mimetype" {
-                continue;
+        // 写入段收进闭包：任一条目写失败直接返回 Err，外层统一删临时件
+        //（闭包内 by_index 可变借用 zip，需 FnMut 可变绑定）
+        let mut write = |zw: &mut zip::ZipWriter<std::fs::File>| -> Result<()> {
+            let mut wrote_mimetype = false;
+            // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
+            if let Some(data) = &mimetype_data {
+                let opts = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("mimetype", opts)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+                zw.write_all(data)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
+                wrote_mimetype = true;
             }
-            apply(&name, &mut data);
-            let opts = zip::write::SimpleFileOptions::default();
-            zw.start_file(name.as_str(), opts)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-            zw.write_all(&data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            for (idx, name) in &entries {
+                if wrote_mimetype && name == "mimetype" {
+                    continue;
+                }
+                if let Some((_, data)) =
+                    replaced.iter().rev().find(|(n, _)| n == name)
+                {
+                    // 命中替换：新字节照旧走 start_file（重压缩）
+                    let opts = zip::write::SimpleFileOptions::default();
+                    zw.start_file(name.as_str(), opts)
+                        .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                    zw.write_all(data)
+                        .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                } else {
+                    // 未触碰条目：压缩流直拷（不解压不重压）
+                    let f = zip
+                        .by_index(*idx)
+                        .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {idx} 失败: {e}")))?;
+                    zw.raw_copy_file(f)
+                        .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                }
+            }
+            Ok(())
+        };
+        match write(&mut zw) {
+            Ok(()) => match zw.finish() {
+                Ok(_) => super::commit_temp(&tmp, out_path),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(DocError::corrupt(format!("ZIP 收尾失败: {e}")))
+                }
+            },
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
         }
-        zw.finish()
-            .map_err(|e| DocError::corrupt(format!("ZIP 收尾失败: {e}")))?;
-        Ok(())
     }
 }
 
@@ -258,5 +345,184 @@ pub(crate) mod tests_util {
     fn escape_xml_text_covers_amp_lt_gt() {
         assert_eq!(escape_xml_text("a & b <c> \"d\""), "a &amp; b &lt;c&gt; \"d\"");
         assert_eq!(escape_xml_text("中文《引号》"), "中文《引号》");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试：原子落盘 helper + raw copy 直拷
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::{commit_temp, temp_sibling, writeback_txt};
+    use std::path::{Path, PathBuf};
+
+    fn case_dir(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "docforge_writeback_atomic_{}_{}",
+            std::process::id(),
+            case
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 目录里含 `.tmp-` 的残留文件名（端到端断言用）。
+    fn tmp_residue(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect()
+    }
+
+    /// 临时兄弟文件：同目录、隐藏件、带 pid 标记、两次调用不撞名。
+    #[test]
+    fn temp_sibling_is_hidden_sibling_in_same_dir() {
+        let p = temp_sibling(Path::new("/tmp/somewhere/out.epub"));
+        assert_eq!(p.parent(), Some(Path::new("/tmp/somewhere")), "同目录（rename 原子性）");
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".out.epub.tmp-"), "隐藏件：{name}");
+        assert!(name.contains(&format!("tmp-{}-", std::process::id())), "带 pid：{name}");
+        // 隔开纳秒时间戳（防粗粒度时钟下两次调用同名）
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let p2 = temp_sibling(Path::new("/tmp/somewhere/out.epub"));
+        assert_ne!(p, p2, "两次调用不撞名");
+    }
+
+    /// commit_temp 成功路径：tmp 内容落位 out、tmp 消失。
+    #[test]
+    fn commit_temp_renames_and_removes_tmp() {
+        let dir = case_dir("ok");
+        let tmp = dir.join(".out.txt.tmp-x");
+        std::fs::write(&tmp, b"hello").unwrap();
+        let out = dir.join("out.txt");
+        commit_temp(&tmp, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+        assert!(!tmp.exists(), "临时文件已消失");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// commit_temp 失败路径（目标目录不存在）：Err 且 tmp 被清理（不留垃圾）。
+    #[test]
+    fn commit_temp_failure_removes_tmp() {
+        let dir = case_dir("fail");
+        let tmp = dir.join(".out.txt.tmp-x");
+        std::fs::write(&tmp, b"hello").unwrap();
+        let out = dir.join("no-such-dir/out.txt");
+        let err = commit_temp(&tmp, &out).unwrap_err();
+        assert_eq!(err.code.as_str(), "corrupt");
+        assert!(!tmp.exists(), "失败路径清理临时文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：回写成功后 out 目录无 `.tmp-` 残留文件（txt 全流程）。
+    #[test]
+    fn writeback_leaves_no_tmp_residue() {
+        let dir = case_dir("e2e");
+        let in_path = dir.join("in.txt");
+        std::fs::write(&in_path, "第一章 起\n\n正文一段句子。\n").unwrap();
+        let out_path = dir.join("out.txt");
+        writeback_txt(
+            &in_path,
+            &[("p0-b0".to_string(), "The beginning.".to_string()).into()],
+            crate::emit::BiStrategy::BilingualInline,
+            &out_path,
+        )
+        .unwrap();
+        assert!(out_path.exists());
+        assert!(std::fs::read_to_string(&out_path).unwrap().contains("The beginning."));
+        assert!(tmp_residue(&dir).is_empty(), "无临时件残留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// raw copy 直拷（共用 [`super::zip_util::rewrite_zip`]，docx / epub / odt
+/// 自动受益）：未触碰条目压缩态与内容原样直拷。
+#[cfg(all(test, any(feature = "docx", feature = "epub", feature = "odt")))]
+mod zip_raw_copy_tests {
+    use super::{open_zip, rewrite_zip};
+    use std::io::{Read as _, Write as _};
+    use std::path::{Path, PathBuf};
+
+    fn case_dir(case: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "docforge_writeback_ziputil_{}_{}",
+            std::process::id(),
+            case
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry_bytes(path: &Path, name: &str) -> Vec<u8> {
+        let mut z = open_zip(path).unwrap();
+        let mut buf = Vec::new();
+        z.by_name(name).unwrap().read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    /// 未触碰条目（伪图片字节，Stored）内容与压缩态原样直拷、触碰条目换
+    /// 新字节、mimetype 仍居首且强制 Stored；条目序不变；输出目录无临时件
+    /// 残留。旧实现把全部条目重新 deflate——Stored 条目会变 Deflated，本测
+    /// 的压缩态断言即 raw copy 的新现实。
+    #[test]
+    fn raw_copy_keeps_untouched_entries_verbatim() {
+        let dir = case_dir("rawcopy");
+        let in_path = dir.join("in.zip");
+        let image: Vec<u8> = (0..65536usize).map(|i| (i % 251) as u8).collect();
+        {
+            let f = std::fs::File::create(&in_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("mimetype", stored).unwrap();
+            zw.write_all(b"application/epub+zip").unwrap();
+            zw.start_file("OEBPS/pic.bin", stored).unwrap();
+            zw.write_all(&image).unwrap();
+            zw.start_file("OEBPS/text.xml", zip::write::SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"<p>body text</p>").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let out_path = dir.join("out.zip");
+        rewrite_zip(
+            &in_path,
+            &out_path,
+            &[("OEBPS/text.xml".to_string(), b"<p>replaced</p>".to_vec())],
+        )
+        .unwrap();
+
+        let zin = open_zip(&in_path).unwrap();
+        let mut zout = open_zip(&out_path).unwrap();
+        assert_eq!(zout.len(), zin.len(), "条目数不变");
+        assert_eq!(zout.by_index(0).unwrap().name().unwrap(), "mimetype", "mimetype 仍居首");
+        assert_eq!(
+            zout.by_index(0).unwrap().compression(),
+            zip::CompressionMethod::Stored,
+            "mimetype 强制 Stored（不走 raw copy，保 OCF 约定）"
+        );
+
+        // 未触碰条目：内容字节一致 + 压缩态原样（raw copy 直拷）
+        assert_eq!(entry_bytes(&in_path, "OEBPS/pic.bin"), entry_bytes(&out_path, "OEBPS/pic.bin"));
+        assert_eq!(
+            zout.by_name("OEBPS/pic.bin").unwrap().compression(),
+            zip::CompressionMethod::Stored,
+            "未触碰条目压缩态直拷（旧实现会重新 deflate 成 Deflated）"
+        );
+        // 触碰条目已改
+        assert_eq!(entry_bytes(&out_path, "OEBPS/text.xml"), b"<p>replaced</p>");
+
+        // 原子落盘收尾：目录无临时件残留
+        let residue: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "{residue:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

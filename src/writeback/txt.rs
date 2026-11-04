@@ -54,7 +54,7 @@ use crate::plugins::chapter::{split_chapters_with, ChapterRules, Subheading};
 use crate::plugins::text::{TextParseCapability, TextPlugin};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::pair_map;
+use super::{pair_map, write_bytes_atomic};
 
 /// 附录分隔标记（OriginalPlusAppendix 文尾行）。
 const APPENDIX_MARK: &str = "【译文】";
@@ -158,14 +158,14 @@ pub fn writeback_txt(
         _ => rebuild(&text, &spans, &slots, &matched, strategy),
     };
 
-    // F. 写出（UTF-8；BOM 补回）
+    // F. 写出（UTF-8；BOM 补回）——原子落盘：同目录临时件 + rename，
+    // 崩溃 / ENOSPC 不在目标路径留半残文件
     let mut out_bytes = Vec::with_capacity(out_text.len() + 3);
     if bom {
         out_bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     }
     out_bytes.extend_from_slice(out_text.as_bytes());
-    std::fs::write(out, out_bytes)
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    write_bytes_atomic(out, &out_bytes)?;
     Ok(report)
 }
 
