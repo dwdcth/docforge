@@ -70,7 +70,7 @@ pub mod appendix;
 pub mod stream;
 
 #[cfg(feature = "docx")]
-pub use docx::writeback_docx;
+pub use docx::{writeback_docx, writeback_docx_alternating};
 #[cfg(feature = "epub")]
 pub use epub::{writeback_epub, writeback_epub_alternating};
 #[cfg(feature = "fb2")]

@@ -43,6 +43,30 @@
 //!   在提取段落后不回落，sdt 之后的表格会被吞进 sdt 循环、其段落被当正文
 //!   段落提取（上游特性）；本扫描按良构深度跟踪——若文档真踩到此差异，
 //!   文本一致性守卫会让受影响位保守跳过而不是错位写。
+//!
+//! # 节交替（[`writeback_docx_alternating`]，rumi「一页原文一页译文」#12）
+//!
+//! Word 无真页，最近的页边界是分节符（段落 pPr 内 `w:sectPr` 标该节结束；
+//! body 末尾裸 `w:sectPr` 标最后一节）与分页符（run 内 `<w:br w:type="page"/>`）。
+//! 按这些边界把 body 内容切段（解析侧不识别节/分页——分段纯是回写侧 XML 层
+//! 的事），每**有命中编辑**的原文段后插「该段的纯译文段」，即
+//! `writeback_epub_alternating`（epub 部件交替，epub 侧同形态）在
+//! docx 的对应物：命中 = 有实际落盘编辑（守卫/结构跳过不算），无命中段不插
+//! 译文段（避免原样页翻两遍）。译文段 = 该段 XML 子串平移套用同一套
+//! TranslationOnly 逐位置编辑（段落/格位口径不变，未命中单元原样保留——译文
+//! 段是完整合法的正文拷贝，含表格等结构块），不另写渲染；原文段字节不动
+//! （只插入）。
+//!
+//! 节保真 / 分页语义载体（两案金测后定稿，见 `assemble_alternating`）：
+//! 分节切的段**不追加任何载体段**——译文段是原段字节拷贝、段内自带同一节
+//! 符段落，译文节属性逐字节保真（同页向/页眉页脚，headerReference 的 rId
+//! 多节共享合法），前后换页均由拷贝节符自带（默认 nextPage 起新页）。设计
+//! 稿的「译文段末追加 sectPr 拷贝段」经金测分析否决：译文段内已有拷贝节符，
+//! 再追加一节符段会产生只含一个空段的「空节」，渲染为译文与下一段原文之间
+//! 的空白页。尾节（body 裸 sectPr）/退化段/分页符细分段中段首无分页者，译
+//! 文段前插独立分页段 `PAGE_BREAK_P`（`w:br w:type="page"` 硬分页）；尾节
+//! 译文随下一节属性——裸 sectPr 即本节原属性，保真等价；段首自带分页段落
+//! 的细分段，译文段拷贝自带段首分页，同样不另插（否则空白页）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -91,6 +115,61 @@ pub fn writeback_docx(
         BiStrategy::OriginalPlusAppendix => apply_appendix(&xml, &slots, &units, &map, body_close),
     };
 
+    rewrite_zip(
+        in_path,
+        out,
+        &[("word/document.xml".to_string(), new_xml.into_bytes())],
+    )
+}
+
+/// docx 节交替：按分节符（无节则按分页符）把正文切段，每有命中的原文段后
+/// 插入「该段的纯译文段」（新起一页）——PageAlt 在 Word 的最佳近似（rumi
+/// 接入方需求 #12；形态对照 epub 侧 `writeback_epub_alternating`，见模块头
+/// 「节交替」）。`translated` 的 id 与 [`writeback_docx`] 同口径（同一单元
+/// 流，含表格格单元，无新锚点体系）；全书无命中时输出 = 原包透传；失败返回
+/// `corrupt`。
+///
+/// # 切段规则（body 内容字节区间；优先级从高到低）
+///
+/// 1. 分节边界：pPr 内含 `w:sectPr` 的段落是该节最后一块（切段含它）；
+///    body 末尾裸 `w:sectPr` 之前是最后一节（译文插在裸节符之前，原节符仍
+///    居末）；
+/// 2. 全文仅一节时按分页符细分：段内含 `<w:br w:type="page"/>` 的段落开启
+///    新段（整段归入新段——段中分页的粗粒度近似）；
+/// 3. 两者皆无 → 单段整体（原文整体 + 分页 + 译文整体，合法退化）。
+///
+/// 译文段的节保真与分页载体见模块头（分节段靠拷贝节符自带，尾节/退化段前
+/// 插独立分页段，均经金测验证重开解析合法）。
+pub fn writeback_docx_alternating(
+    in_path: impl AsRef<Path>,
+    translated: &[(String, String)],
+    out: impl AsRef<Path>,
+) -> Result<()> {
+    let in_path = in_path.as_ref();
+    let out = out.as_ref();
+
+    // A. 与 writeback_docx 同一套解析 + 扫描 + 编辑（锚点体系不变）；策略
+    //    固定 TranslationOnly——译文段 = 该段全部命中单元的纯译文渲染。
+    let raw = DocxRawBackend::default().parse(in_path)?;
+    let doc = OfficePlugin::default().assemble(&raw);
+    let units = crate::emit::to_translation_units(&doc);
+    let map = translation_map(translated);
+
+    let mut zip = open_zip(in_path)?;
+    let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
+        .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
+    let (slots, _) = scan_slots(&xml)?;
+    let edits = translation_only_edits(&slots, &units, &map);
+    if edits.is_empty() {
+        // 全书无命中：原包透传（document.xml 也不动，与 epub 交替同口径）
+        return rewrite_zip(in_path, out, &[]);
+    }
+
+    // B. 分段（回写侧 XML 层的 body 顶层扫描）+ 逐段拼装：原文段字节不动，
+    //    有命中编辑的段后插译文段。
+    let (content_start, blocks, tail_sectpr) = scan_body_blocks(&xml)?;
+    let segs = segments_from_blocks(content_start, &blocks, tail_sectpr);
+    let new_xml = assemble_alternating(&xml, &segs, &edits);
     rewrite_zip(
         in_path,
         out,
@@ -310,7 +389,8 @@ fn consume_para<R: std::io::BufRead>(reader: &mut Reader<R>, xml: &str) -> Resul
 }
 
 /// 消费整个子树直到与开元素配对的 End 事件（表格等非候选元素的整棵跳过）。
-fn consume_subtree<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<()> {
+/// 返回子树终点字节偏移（配对闭标签之后；节交替回写的块 span 用）。
+fn consume_subtree<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<usize> {
     let mut buf = Vec::new();
     let mut depth = 1usize;
     loop {
@@ -319,10 +399,10 @@ fn consume_subtree<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<()> {
             Ok(Event::End(ref _e)) => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(());
+                    return Ok(bpos(reader));
                 }
             }
-            Ok(Event::Eof) => return Ok(()),
+            Ok(Event::Eof) => return Ok(bpos(reader)),
             Err(e) => return Err(DocError::corrupt(format!("XML subtree scan error: {e}"))),
             _ => {}
         }
@@ -661,6 +741,19 @@ fn apply_translation_only(
     units: &[crate::emit::TranslationUnit],
     map: &HashMap<&str, &str>,
 ) -> String {
+    splice_spans(xml, translation_only_edits(slots, units, map))
+}
+
+/// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位首 `w:t` 换译
+/// 文、其余清空；格位口径见 [`apply_translation_only`] 文档（含嵌套表的格
+/// / 无文本节点的位保守跳过——跳过即无编辑，节交替的「命中」判定以此为
+/// 准）。[`writeback_docx`] 与 [`writeback_docx_alternating`] 共用：后者按
+/// 分段区间平移取用同一编辑流，不另写渲染。
+fn translation_only_edits(
+    slots: &[Slot],
+    units: &[crate::emit::TranslationUnit],
+    map: &HashMap<&str, &str>,
+) -> Vec<(usize, usize, String)> {
     let matched = matched_translations(slots, units, map);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (k, tr) in matched {
@@ -693,7 +786,7 @@ fn apply_translation_only(
             }
         }
     }
-    splice_spans(xml, edits)
+    edits
 }
 
 /// OriginalPlusAppendix：正文不动，body 末尾追加「译文」标题段 + 译文段序列。
@@ -769,6 +862,215 @@ fn splice_spans(xml: &str, mut edits: Vec<(usize, usize, String)>) -> String {
         cursor = e;
     }
     out.push_str(&xml[cursor..]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 节交替回写（分段扫描 + 逐段拼装；PageAlt 在 docx 的最佳近似）
+// ---------------------------------------------------------------------------
+
+/// docx 本地名补充（`backends::office::tags` 无 sectPr；本文件分段扫描唯一
+/// 使用处）。
+const W_SECTPR: &str = "sectPr";
+
+/// 译文段前的独立分页段（`w:br w:type="page"` 硬分页）：尾节/退化段的「译
+/// 文新起一页」语义载体（见模块头「节保真」两案取舍）。
+const PAGE_BREAK_P: &str = "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>";
+
+/// 一个 body 直属块（顶层元素）的字节 span 与节/分页标记（分段扫描用）。
+struct BodyBlock {
+    /// 块起点（开标签 `<`）。
+    start: usize,
+    /// 块终点（配对闭标签之后）。
+    end: usize,
+    /// 段落 pPr 内含 `w:sectPr`（该段是其节的最后一块；节符只落在段落 pPr
+    /// 里，嵌套表内不存在 sectPr——表格块恒 false）。
+    has_sectpr: bool,
+    /// 段内含分页 run（`<w:br` + `w:type="page"` 双条件：纯 `<w:br/>` 软换
+    /// 行不误报；Word/常见写入器的 br 属性序固定，字节探测不做属性解析）。
+    page_break: bool,
+}
+
+/// 一个正文分段（[start, end) 字节区间 + 分页语义载体标记）。
+struct Segment {
+    /// 分段起点（body 内容起点或上一分段的终点——段间隙字节随下一段走）。
+    start: usize,
+    /// 分段终点：分节段 = 节符段落之后；尾段 = 裸 sectPr 起点（无则最后
+    /// 一块之后 / body 内容起点）。
+    end: usize,
+    /// 段以带 sectPr 的段落收口（分节切的段）：译文段是原段字节拷贝，段内
+    /// 自带同一节符——译文节属性逐字节保真（同页向/页眉页脚），前后换页均
+    /// 由拷贝节符自带（默认 nextPage），无需任何载体段（见模块头）。
+    closed_by_sectpr: bool,
+    /// 段以分页段落开启（分页符细分的非首段）：译文段拷贝自带段首分页，
+    /// 无需再插分页段（否则译文段首双重分页留空白页）。
+    opens_with_page_break: bool,
+}
+
+/// 扫描 body 直属子级：返回 (body 内容起点, 顶层块序列, 尾部裸 sectPr 起点)。
+/// 与 [`scan_slots`] 平行的轻扫描——只记块字节 span 与节/分页标记（分段是
+/// 回写侧 XML 层的事，不依赖解析侧；解析侧不识别 sectPr/分页符）。顶层
+/// `w:sectPr`（裸节符，OOXML 规定为 body 最后一个子级）记尾、整棵消费、不
+/// 记块——其后字节全部走尾部透传。
+fn scan_body_blocks(xml: &str) -> Result<(usize, Vec<BodyBlock>, Option<usize>)> {
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    // 定位 <w:body>（scan_slots 同款前置循环）
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.name().local_name().as_ref() == tags::W_BODY => break,
+            Ok(Event::Eof) => return Err(DocError::corrupt("no w:body found")),
+            Err(e) => return Err(DocError::corrupt(format!("XML parse error: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    buf.clear();
+
+    let content_start = bpos(&reader);
+    let mut blocks = Vec::new();
+    let mut tail = None;
+    loop {
+        let pos_before = bpos(&reader);
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                if e.name().local_name().as_ref() == W_SECTPR {
+                    tail = Some(pos_before);
+                    consume_subtree(&mut reader)?;
+                    buf.clear();
+                    continue;
+                }
+                let end = consume_subtree(&mut reader)?;
+                let span = &xml[pos_before..end];
+                let is_para = e.name().local_name().as_ref() == tags::W_P;
+                blocks.push(BodyBlock {
+                    start: pos_before,
+                    end,
+                    has_sectpr: is_para && span.contains("<w:sectPr"),
+                    page_break: is_para
+                        && span.contains("<w:br")
+                        && span.contains("w:type=\"page\""),
+                });
+            }
+            Ok(Event::Empty(ref e)) if e.name().local_name().as_ref() == W_SECTPR => {
+                // 自闭合裸节符（无节属性内容的最简形态）
+                tail = Some(pos_before);
+            }
+            Ok(Event::End(ref e)) if e.name().local_name().as_ref() == tags::W_BODY => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(DocError::corrupt(format!("XML body scan error: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok((content_start, blocks, tail))
+}
+
+/// 由顶层块序列装配分段（见 [`writeback_docx_alternating`] 的切段规则）：
+/// 优先分节边界（sectPr 段落收段、切段含它），全文仅一节时按分页符细分
+/// （含分页符的段落开启新段），两者皆无则整体一段（合法退化）。尾部再补
+/// 一个尾段（裸 sectPr 之前的剩余字节；全空文档为零宽段——无编辑无插入，
+/// 天然无操作）。裸 sectPr 之后的字节（违规格式）不进任何分段，走尾部透传。
+fn segments_from_blocks(
+    content_start: usize,
+    blocks: &[BodyBlock],
+    tail: Option<usize>,
+) -> Vec<Segment> {
+    let tail_end = tail.unwrap_or_else(|| {
+        blocks
+            .last()
+            .map(|b| b.end)
+            .unwrap_or(content_start)
+    });
+    let mut segs = Vec::new();
+
+    // 1) 分节切段：连续块到带 sectPr 的段落（含它）为一段
+    let mut start = content_start;
+    let mut cut = false;
+    for b in blocks {
+        if b.has_sectpr {
+            segs.push(Segment {
+                start,
+                end: b.end,
+                closed_by_sectpr: true,
+                opens_with_page_break: false,
+            });
+            start = b.end;
+            cut = true;
+        }
+    }
+    if !cut {
+        // 2) 全文一节 → 分页符细分：含分页符的段落开启新段（整段归入新段）
+        start = content_start;
+        for b in blocks {
+            if b.page_break {
+                segs.push(Segment {
+                    start,
+                    end: b.start,
+                    closed_by_sectpr: false,
+                    opens_with_page_break: false,
+                });
+                start = b.start;
+            }
+        }
+        // 尾段：起点 = 最后一个分页段（若有）→ 段首自带分页；无分页段则 =
+        // 退化整段（段首无分页，译文段前插分页段）
+        let tail_opens = start != content_start;
+        segs.push(Segment {
+            start,
+            end: tail_end,
+            closed_by_sectpr: false,
+            opens_with_page_break: tail_opens,
+        });
+    } else {
+        // 3) 分节形态的尾段：段首无分页（前段节符负责它自己的换页），译文
+        //    段前插分页段；终点 = 裸 sectPr 起点（原节符仍居末）
+        segs.push(Segment {
+            start,
+            end: tail_end,
+            closed_by_sectpr: false,
+            opens_with_page_break: false,
+        });
+    }
+    segs
+}
+
+/// 逐段拼装：原文段字节原样复制（只插入不修改），有命中编辑的段后插译文
+/// 段 = 该段 XML 子串平移套用同一套 TranslationOnly 编辑（未命中单元原样
+/// 保留，译文段是完整合法的正文拷贝）；无命中段不插（避免原样页翻两遍）。
+/// 编辑只落在单个块内、结构性不跨段；越界编辑保守丢弃。分页语义载体见模
+/// 块头与 [`Segment`] 字段文档。
+fn assemble_alternating(xml: &str, segs: &[Segment], edits: &[(usize, usize, String)]) -> String {
+    let mut out = String::with_capacity(xml.len() * 2);
+    let mut cursor = 0usize;
+    for seg in segs {
+        out.push_str(&xml[cursor..seg.start]); // 段间隙（body 开标签后的零散节点等）
+        out.push_str(&xml[seg.start..seg.end]); // 原文段：字节不动
+        cursor = seg.end;
+        // 本段的编辑平移到段内坐标
+        let own: Vec<(usize, usize, String)> = edits
+            .iter()
+            .filter(|(s, e, _)| *s >= seg.start && *e <= seg.end)
+            .map(|(s, e, t)| (s - seg.start, e - seg.start, t.clone()))
+            .collect();
+        if own.is_empty() {
+            continue; // 无命中段不插译文段
+        }
+        let tr = splice_spans(&xml[seg.start..seg.end], own);
+        if seg.closed_by_sectpr || seg.opens_with_page_break {
+            // 译文段是原段字节拷贝：段内自带的节符段落 / 段首分页段落提供
+            // 换页与节属性保真，无需载体段（见模块头「节保真」两案取舍）
+            out.push_str(&tr);
+        } else {
+            // 尾节/退化段：无自带分页可拷，译文段前插独立分页段新起一页；
+            // 译文随下一节属性——body 裸 sectPr 的属性即本节原属性，保真等
+            // 价（译文之后追加节符拷贝段会得到「原译同节连排 + 末尾空节」
+            // 两个缺陷，见模块头）
+            out.push_str(PAGE_BREAK_P);
+            out.push_str(&tr);
+        }
+    }
+    out.push_str(&xml[cursor..]); // 尾部透传（裸 sectPr + body/document 收尾）
     out
 }
 
@@ -1410,5 +1712,331 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, "格译文"), (1, "段译文")]
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // 节交替回写（writeback_docx_alternating）
+    // -------------------------------------------------------------------------
+
+    /// 两节文档：节1 横向（landscape，pPr 内 sectPr 的段落收节）、节2 纵向
+    /// （body 裸 sectPr 收尾）。
+    const MULTI_SECTION_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>第一节第一段。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>第一节节尾段。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>第二节首段。</w:t></w:r></w:p>"#,
+        r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 单节无节符无分页的退化文档（原文整体 + 分页 + 译文整体）。
+    const PLAIN_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>甲段正文。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>乙段正文。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 单节多分页符文档：第二段以 `<w:br w:type="page"/>` 开启新页（整段归
+    /// 入新段的粗粒度近似考点）。
+    const PAGE_BREAK_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>甲页正文。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:br w:type="page"/></w:r><w:r><w:t>乙页首段。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>乙页次段。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 分节 + 表格文档：表格在节1 内（格单元译文进译文段的考点）。
+    const TABLE_SECTION_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>表格前的段落。</w:t></w:r></w:p>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>名称</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>数值</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr><w:r><w:t>第一节节尾。</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>第二节独段。</w:t></w:r></w:p>"#,
+        r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// alternating 便捷入口（与 write 同款）。
+    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) {
+        let translated: Vec<(String, String)> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        writeback_docx_alternating(in_path, &translated, out_path).unwrap();
+    }
+
+    /// 金测（核心验收）：节序 = 原1/译1/原2/译2、译文段 = 该段 TranslationOnly
+    /// 结果、原文段字节与输入一致、重解析（docforge parse = 重开 zip 解析）
+    /// 合法且文本正确；裸 sectPr 仍居末。
+    #[test]
+    fn alternating_sections_roundtrip() {
+        let dir = case_dir("alt-sections");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, MULTI_SECTION_XML);
+
+        // 与 writeback_docx 同一单元流（无新锚点体系）
+        assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b1", "p0-b2"]);
+
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "Section 1 para one."),
+                ("p0-b1", "Section 1 last para."),
+                ("p0-b2", "Section 2 first para."),
+            ],
+        );
+
+        // 重解析：原/译按节交替（整段原文在前、整段译文在后；节符段、译
+        // 文拷贝节符段、分页段都是空段不产块——解析侧 trim 非空才发块）
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            [
+                "第一节第一段。",
+                "第一节节尾段。",
+                "Section 1 para one.",
+                "Section 1 last para.",
+                "第二节首段。",
+                "Section 2 first para.",
+            ]
+        );
+        assert!(got.iter().all(|b| b.kind == Paragraph));
+
+        // 原文段字节与输入一致（只插入，不修改既有内容）
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        assert!(out_xml.contains(
+            r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>第一节节尾段。</w:t></w:r></w:p>"#
+        ));
+        assert!(out_xml.contains("<w:p><w:r><w:t>第二节首段。</w:t></w:r></w:p>"));
+
+        // 结构不变量：landscape 节符 = 原 + 译文拷贝各一；尾节译文前的分页
+        // 载体段仅一处；裸 sectPr 仍在 body 末尾且位于译文之后
+        const LANDSCAPE: &str =
+            r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr>"#;
+        assert_eq!(out_xml.matches(LANDSCAPE).count(), 2);
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 1);
+        let pbr = out_xml.find(PAGE_BREAK_P).unwrap();
+        let p2 = out_xml.find("第二节首段。").unwrap();
+        assert!(pbr > p2, "分页段在第二节原文之后");
+        let sect = out_xml.rfind("<w:sectPr").unwrap();
+        let tr2 = out_xml.rfind("Section 2 first para.").unwrap();
+        assert!(tr2 < sect, "尾节译文插在裸 sectPr 之前");
+        assert!(out_xml[sect..].contains("</w:body>"), "裸 sectPr 仍收尾");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 节保真：横向节的译文段 sectPr 与原节逐字节相同（译文段为字节拷贝
+    /// 自带节符、不追加载体段——设计取舍见模块头）；重开解析合法。
+    #[test]
+    fn alternating_translated_section_keeps_landscape_sectpr() {
+        let dir = case_dir("alt-landscape");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, MULTI_SECTION_XML);
+        // 只喂节1：节2 无命中不插译文段
+        alternating_write(&in_path, &out_path, &[("p0-b0", "S1 P1."), ("p0-b1", "S1 P2.")]);
+
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        // 译文段内的拷贝节符与原节符逐字节一致（同为横向：原 + 拷贝各一）
+        const LANDSCAPE: &str =
+            r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr>"#;
+        assert_eq!(out_xml.matches(LANDSCAPE).count(), 2);
+        // 译文节尾段 = 原段字节拷贝换文本（节符拷贝随拷贝而来）
+        assert!(out_xml.contains(
+            r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>S1 P2.</w:t></w:r></w:p>"#
+        ));
+        // 无命中段不插：第二节译文不存在、无分页载体段
+        assert!(!out_xml.contains("Section 2"));
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 0);
+        // 重开解析合法：原 3 块 + 节1 译文 2 块（整段原文在前、整段译文在后）
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            ["第一节第一段。", "第一节节尾段。", "S1 P1.", "S1 P2.", "第二节首段。"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单节退化：无 sectPr 无分页 → 原文整体 + 独立分页段 + 译文整体。
+    #[test]
+    fn alternating_single_segment_degenerate() {
+        let dir = case_dir("alt-degenerate");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, PLAIN_XML);
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Alpha body."), ("p0-b1", "Beta body.")],
+        );
+
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        // 插入结构：原文整体 + 分页段（恰一处，夹在原文与译文之间）+ 译文整体
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 1);
+        assert!(out_xml.contains(&format!(
+            "<w:p><w:r><w:t>乙段正文。</w:t></w:r></w:p>{PAGE_BREAK_P}\
+             <w:p><w:r><w:t>Alpha body.</w:t></w:r></w:p>"
+        )));
+        // 重解析：原 2 块 + 译 2 块
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            ["甲段正文。", "乙段正文。", "Alpha body.", "Beta body."]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分页符细分：单节多分页符 → 按分页符切段交替；以分页段落开启的段，
+    /// 译文段拷贝自带段首分页、不重复插分页段（否则译文段首双重分页留白页）。
+    #[test]
+    fn alternating_splits_by_page_breaks() {
+        let dir = case_dir("alt-pagebreak");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, PAGE_BREAK_XML);
+        // 单元流同 writeback_docx（分页 br 是文本占位 \n，不产生额外块）
+        assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b1", "p0-b2"]);
+
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "Alpha page."),
+                ("p0-b1", "Beta first."),
+                ("p0-b2", "Beta second."),
+            ],
+        );
+
+        // 重解析：甲页原/译 + 乙页原（两段）/译（两段）
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            [
+                "甲页正文。",
+                "Alpha page.",
+                "乙页首段。",
+                "乙页次段。",
+                "Beta first.",
+                "Beta second.",
+            ]
+        );
+
+        // 结构：甲页段（段首无分页）译文前插分页载体段恰一处；乙页段译文
+        // 自带拷贝的段首分页。br 计 3 = 分页载体段 1 + 原乙页段 1 + 译文乙
+        // 页首段 1
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 1);
+        assert_eq!(out_xml.matches(r#"<w:br w:type="page"/>"#).count(), 3);
+        // 译文乙页首段 = 原段字节拷贝换文本（段首分页随拷贝而来）
+        assert!(out_xml.contains(
+            r#"<w:p><w:r><w:br w:type="page"/></w:r><w:r><w:t>Beta first.</w:t></w:r></w:p>"#
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 部分命中：无命中段不插译文段（避免原样页翻两遍）；全书无命中 →
+    /// 原包透传（document.xml 也不动）。
+    #[test]
+    fn alternating_partial_hit_and_no_hit_passthrough() {
+        let dir = case_dir("alt-partial");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, MULTI_SECTION_XML);
+
+        // 只喂节1 首段：节2 无命中 → 不插译文段、无分页载体段
+        alternating_write(&in_path, &out_path, &[("p0-b0", "S1 P1.")]);
+        let got = blocks(&out_path);
+        assert_eq!(
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>(),
+            [
+                "第一节第一段。",
+                "第一节节尾段。", // 节1 整段原文在前
+                "S1 P1.",
+                "第一节节尾段。", // 节1 译文段内的未命中原样拷贝（译文段是完整正文拷贝）
+                "第二节首段。",
+            ]
+        );
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        assert!(!out_xml.contains("Section 2"), "无命中段不插译文");
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 0, "尾节无命中：无分页段");
+
+        // 全书无命中：输出 = 原包透传
+        let out2 = dir.join("empty.docx");
+        alternating_write(&in_path, &out2, &[]);
+        assert_eq!(blocks(&out2), blocks(&in_path));
+        assert_eq!(
+            entry_str(&in_path, "word/document.xml"),
+            entry_str(&out2, "word/document.xml"),
+            "无命中连 document.xml 都不动"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 含表格段：格单元译文进译文段（既有编辑流按字节区间归属段、平移套
+    /// 用，表格格位口径不变），原文段内的表格原样。
+    #[test]
+    fn alternating_table_cell_edits_flow_into_translated_segment() {
+        let dir = case_dir("alt-table");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, TABLE_SECTION_XML);
+
+        // 同一单元流：段落 + 格位交错（无新锚点）
+        assert_eq!(
+            unit_ids(&in_path),
+            ["p0-b0", "p0-b1-r0c0", "p0-b1-r0c1", "p0-b2", "p0-b3"]
+        );
+
+        alternating_write(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "Before the table."),
+                ("p0-b1-r0c0", "Name"),
+                ("p0-b1-r0c1", "Value"),
+                ("p0-b2", "Section 1 end."),
+                // p0-b3 不喂：第二节无命中不插
+            ],
+        );
+
+        // 重解析：原段（段+表+节尾）→ 译文段（段+表+节尾，格与段落全部
+        // 译文）→ 第二节原段（无命中）
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 7);
+        assert_eq!(got[0].content, "表格前的段落。");
+        let orig_tbl = got[1].table.as_ref().unwrap();
+        assert_eq!(
+            orig_tbl.rows,
+            vec![vec!["名称".to_string(), "数值".to_string()]]
+        );
+        assert_eq!(got[2].content, "第一节节尾。");
+        assert_eq!(got[3].content, "Before the table.");
+        let tr_tbl = got[4].table.as_ref().unwrap();
+        assert_eq!(
+            tr_tbl.rows,
+            vec![vec!["Name".to_string(), "Value".to_string()]]
+        );
+        assert_eq!(got[5].content, "Section 1 end.");
+        assert_eq!(got[6].content, "第二节独段。");
+
+        // 结构不变量：表格两份（原 + 译文拷贝）；节符三份（节1 原 + 译文拷
+        // 贝 + 裸 sectPr）；尾节无命中 → 无分页载体段
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        assert_eq!(out_xml.matches("<w:tbl>").count(), 2);
+        assert_eq!(out_xml.matches("<w:sectPr>").count(), 3);
+        assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
