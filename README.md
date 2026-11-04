@@ -106,7 +106,21 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
   + `shared` 标记（共享流擦一页伤多页，克隆或降级遮盖由 rumi 定）；偏移针对解码后流并带
   流指纹；`Option` = 无溯源（OCR 页本无算子，只能遮盖）。出现第二个渲染消费者时渲染层抽
   独立 crate（如 pdf-overlay）。
-- 性能队列：① 回写 benchmark 基线 + **A/B 实验**（改写条目 Stored vs Level1 vs 默认——注：我们已是 zlib-rs 后端而非咨询假设的 miniz_oxide，收益以实测为准；内存 Cursor vs 文件 I/O；解析/扫描分项）→ ② 流式 apply_edits（拼接产物不驻留第二份 String）+ 回写 I/O 包（按 A/B 结果采纳压缩等级/内存 Cursor<50MB/大 BufWriter；reflink 尾追加挂远期——CoW 文件系统依赖）→ ③ 超大件 O(段落) 内存重构门槛 = 解压后 document.xml > 200MB 或 WASM/移动端目标。
+- 性能（已完成：raw_copy 直拷未触碰条目、流式 apply_edits + 64KB 批冲、输入内存 Cursor、
+  A/B 压缩定案——Level1 省 18% 但体积 +10-20% 不采纳；对照数字与方法学见 BENCHMARK.md）。
+  挂账：① 超大件 O(段落) 内存重构，门槛 = 解压后 document.xml > 200MB 或 WASM/移动端
+  目标；② reflink 尾追加重打包（克隆 + 截断 Central Directory + 尾部追加新条目，恒定
+  2-5ms——CoW 文件系统依赖 APFS/Btrfs/XFS，远期）。
+- 优化储备（有空继续，按触发条件拾取）：
+  - docx 写入保真：样式感知字号（解析 styles.xml 继承链替代表格格内固定 9pt）；嵌套表格
+    格写入（v1 占位不写——清空留展平残留）；文本框内文翻译 opt-in（段落帧栈 + p_depth
+    设计已备，rumi 用户反馈"流程图内文字未翻"时启动）。
+  - 提取侧形态：epub 单节坍缩页的表格不产 Table 块/格单元（坍缩语义与表格翻译的取舍，
+    有真实单节带表 epub 场景再议）；odt/pptx 修订与域文本免疫审计（docx 经 w:t 限定天然
+    免疫 instrText/delText，odt tracked-changes 与 pptx 待同款核实）。
+  - xlsx：附录模式数值/日期格译文排除改为记 WritebackReport（现静默，W3 交付时留的口径）。
+  - 小众格式回写器（mobi/azw3、djvu、chm）："有真实场景再加"——PalmDOC 记录改写量级
+    独立立项。
 - crates.io 发布：依赖面已收敛（oar-ocr 移出发布面），待维护者邮箱验证。
 
 ## 许可
