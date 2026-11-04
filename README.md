@@ -88,9 +88,24 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
   `backends::pdf::parse_streaming`（深度流式，页产即吐）+ 回写侧
   `writeback::stream::WritebackSession`（译文流式喂入、spill 落盘）——
   「解析→翻→写」三层全通；吞吐/内存数字见 [BENCHMARK.md](BENCHMARK.md)。
-- PDF 双语输出：格内替换不可行（无重排），走**附录页模式**——
-  `writeback::appendix` 出按原文页分组的结构化译文序列，PDF 页生成在
-  消费者侧（rumi 的 oxidize-pdf）。
+- PDF 双语输出（三路线，按成本递增；"渲染归消费者"的分工不变）：
+  **① 附录页（已就绪）**：`writeback::appendix` 出按原文页分组载荷，rumi 用 oxidize-pdf
+  渲染追加页——只需"新建页 + 嵌入 CJK 字体子集 + ToUnicode"，能力匹配；
+  **② 覆盖式替换 / 双层对照（中间路线）**：原 bbox 内白底遮盖 + 框内断行 + 字号自适应
+  （PDFMathTranslate 形态，成本比完整重排低一个量级）。所需数据 IR 尚有缺口：文字层行
+  仅 bbox 无 quad、字号/颜色/行高、书写方向、UserUnit/CropBox 换算、遮盖背景采样——
+  按 rumi 实做时逐项补；注意 oxidize-pdf 往**已有页面追加内容流**与新建页是两种能力，双层
+  方案启动前先核实；
+  **③ 完整重排（BabelDOC 形态）= 排版引擎**，不做。
+  **边界决定（归属已定，实现待触发）**：溯源数据归 docforge、改写动作归 rumi——"哪些字形属于
+  这个块"只在内容流解释器运行时现成（聚合 glyph→line→block 时顺手可得，事后还原贵且两套
+  解释器结果可能不一致→擦错块）；删算子/`Tr 3`/重序列化/xref 是写侧能力，与遮盖+叠加同属
+  一个渲染流程。**前置问题**：双层对照若目标形态是"原文保留可检索、译文视觉叠加"，则整个
+  擦除需求推迟；只有"干净单语译文 PDF"才需要。预留 IR 扩展点（真做时实现）：glyph-run 级
+  （非算子级——TJ 数组可跨块）`(stream_id, op_index, 数组元素范围)`；Form XObject 嵌套路径
+  + `shared` 标记（共享流擦一页伤多页，克隆或降级遮盖由 rumi 定）；偏移针对解码后流并带
+  流指纹；`Option` = 无溯源（OCR 页本无算子，只能遮盖）。出现第二个渲染消费者时渲染层抽
+  独立 crate（如 pdf-overlay）。
 - 性能队列：① 回写 benchmark 基线 + **A/B 实验**（改写条目 Stored vs Level1 vs 默认——注：我们已是 zlib-rs 后端而非咨询假设的 miniz_oxide，收益以实测为准；内存 Cursor vs 文件 I/O；解析/扫描分项）→ ② 流式 apply_edits（拼接产物不驻留第二份 String）+ 回写 I/O 包（按 A/B 结果采纳压缩等级/内存 Cursor<50MB/大 BufWriter；reflink 尾追加挂远期——CoW 文件系统依赖）→ ③ 超大件 O(段落) 内存重构门槛 = 解压后 document.xml > 200MB 或 WASM/移动端目标。
 - crates.io 发布：依赖面已收敛（oar-ocr 移出发布面），待维护者邮箱验证。
 
