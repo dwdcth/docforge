@@ -1,0 +1,63 @@
+# docforge CI：把手动门禁纪律固化为自动强制（纪律来源见 CLAUDE.md「构建与门禁」）
+# 组合面 = 固定组合 + 单 feature 扫描（补集——office 门控 / cli_convert 门控
+# 两类历史 bug 都只在单开组合暴露，固定组合恒含 default 文本族抓不到）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 全目标编译面（lib/bins/tests/benches/examples × 全 feature）+ 裸 no-default
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features
+      - run: cargo check --no-default-features
+
+  # 固定组合测试面
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+      - run: cargo test --all-features
+      - run: cargo test --features docx,epub,fb2,html,odt,xlsx
+      - run: cargo test --features pdf
+
+  # 单 feature 扫描：每个 feature 独立编译 + 测试（无 default 面叠加）
+  each-feature:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [md, csv, html, rtf, encoding, json, lang-detect, pdf, ocr,
+                  docx, xlsx, pptx, epub, fb2, mobi, chm, djvu, cbz,
+                  archive, image-files, odt, ods, odp]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features --features ${{ matrix.feature }}
+      # 门控跳过的测试组（如 cli_convert 需 json+md）以退出码 0 静默通过——
+      # required-features 是声明式的组合语义，不是遗漏
+
+  # 严格 clippy（存量豁免已显式 allow，CI 零容忍）
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings

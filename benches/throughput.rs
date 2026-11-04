@@ -25,6 +25,7 @@
 //! 单页文本件流式无内存差异——如实记录；流式的内存收益场景在 pdf 千页件
 //!（页产即吐、峰值 = 单页），本机无 pdftoppm 渲染链与 OCR 模型，不测、不编数。
 
+#![allow(clippy::type_complexity)] // 合成 fixture 的表驱动签名（存量取舍）
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;

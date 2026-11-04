@@ -307,6 +307,9 @@ fn region_texts(xml: &str) -> Result<Vec<String>> {
 /// 从 `word/document.xml` 的 `<w:body>` 中提取 raw 文本项。
 /// 返回按文档序的节点序列：文本项与「该元素内的图片引用」(对齐 Python
 /// `items.append(("p", txt))` 之后紧跟 `items.append(("image", im))` 的顺序)。
+// 存量取舍：Item 变体携带 RawTextItem（含 TableData/BTreeMap）达数百字节，
+// 独立 Box 会改解析热路径的分配形态——量级可接受，显式豁免（CI 走 -D warnings）。
+#[allow(clippy::large_enum_variant)]
 enum DocxNode {
     /// 段落/表格项
     Item(crate::plugin::RawTextItem),
@@ -2466,12 +2469,8 @@ mod tests {
             let slot = solo_para_slot(&wrap(inner));
             assert!(slot.has_non_text_inline, "{why} 应判为内联物件");
         }
-        for (inner, why) in [
-            (r#"<w:r><w:t>甲乙丙丁。</w:t></w:r>"#, "纯文本"),
-        ] {
-            let slot = solo_para_slot(&wrap(inner));
-            assert!(!slot.has_non_text_inline, "{why} 不应命中（快路径）");
-        }
+        let slot = solo_para_slot(&wrap(r#"<w:r><w:t>甲乙丙丁。</w:t></w:r>"#));
+        assert!(!slot.has_non_text_inline, "纯文本不应命中（快路径）");
         // 布局承载元素（主管修正）：提取里是 \t/\n 占位、渲染里是布局——
         // 与内联物件同判，快路径整段净荷替换会删掉它们
         for (inner, why) in [
