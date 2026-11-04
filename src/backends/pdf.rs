@@ -36,6 +36,14 @@
 //  （Ok 语义，不报错）。
 // - `PdfOptions.keep_raster_pages` 扫描页渲染图保留：与 OCR 消费同一渲染
 //   图，PNG 字节进该页 RawPage.images（assemble 透传 Page.images）。
+// - `PdfOptions.ocr_batch` OCR 批量识别（吞吐 vs 首页延迟旋钮）：连续扫描
+//   页渲染后攒 N 页一次 `OcrEngine::recognize_batch` 再逐页组装投递（默认
+//   1 = 逐页 recognize，行为与单页路径逐字节一致；0 视同 1）。投递序与页
+//   级回调序不变，到达粒度变批——批内页全部识别完才产出，首页延迟随 N 增
+//   大；取消/进度检查点仍在页粒度（批间与区间渲染前，取消时已渲染未识别
+//   的页不进引擎）；批只聚连续 OCR 页段，文字层页照旧单页直提不进批（7 页
+//   OCR、batch=3 → 3+3+1）。引擎须覆写 recognize_batch 才有真批红利（默认
+//   实现逐图循环，行为等价）。
 // - `parse_streaming` pdf 深度流式入口：懒式循环逐页产 Page 直接投递 sink
 //   （RawDoc 不攒，峰值内存 = 单页，含 keep_raster_pages 的页图），统计按
 //   已投递页回填；sink false 与 on_progress false 同一截停语义。批式与
@@ -51,10 +59,12 @@
 //    无取消损耗）；取消先于区间首页则整段渲染不发起；
 // 3. 逐页 OCR 检查点：区间渲染是子进程一次性出全区间、无法逐页拆分，但区间
 //    内每页 OCR（算力大头）前查取消，取消即止；keep_raster_pages 的 PNG
-//    编码随之跳过。
+//    编码随之跳过。ocr_batch > 1 时该检查点即"批间"检查——新一批识别前查
+//    取消，已渲染未识别的页不进引擎（取消所在批内已识别页的算力发生在
+//    取消前，不可撤回，其产出按页语义照常出占位/保留）。
 // 已产出页保留，余页空占位（页号对齐），warnings 记中止页（Ok 语义）。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -65,7 +75,7 @@ use pdf_inspector::{DetectionConfig, ScanStrategy};
 use crate::error::{DocError, ErrorCode, Result};
 use crate::model::{blocks_to_text, Block, BlockKind, BlockSource, CoordUnits, DocMeta, Document,
     Page, Rect};
-use crate::ocr::OcrEngine;
+use crate::ocr::{OcrEngine, RecognizedLine};
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc, RawImage, RawPage, RawTextItem};
 use crate::registry::Registry;
 
@@ -106,6 +116,23 @@ pub struct PdfOptions {
     ///（Image.data，ext="png"）——原文/译文对照预览类需求。默认 false。
     /// 注意 IR 的 JSON 序列化会 base64 编码图片字节，输出体积随之增大。
     pub keep_raster_pages: bool,
+    /// OCR 批量识别页数（吞吐 vs 首页延迟旋钮）：连续扫描页渲染后攒 N 页
+    /// 一次 [`OcrEngine::recognize_batch`]，批内页全部识别完才逐页组装投递
+    /// （投递序/页级回调序不变，页序单调；首页延迟随 N 增大——吞吐换延迟）。
+    /// 默认 1 = 逐页 [`OcrEngine::recognize`]（调用序与单页路径逐字节一致，
+    /// 引擎不覆写批入口时行为完全等价）；0 视同 1。语义细节：
+    /// - 取消/进度检查点仍在页粒度：批间（新批识别前）与区间渲染前逐页检查
+    ///   `on_progress` / 流式 sink 取消；取消时已渲染未识别的页不进引擎
+    ///   （算力截停）；取消所在批内已识别页的算力发生在取消前、不可撤回，
+    ///   其中止页之后的产出照语义出占位；
+    /// - 混合路由文档批只聚连续 OCR 页段：文字层页照旧单页直提、不进批，
+    ///   批大小按连续段截断（7 页 OCR、batch=3 → 3+3+1）；
+    /// - `keep_raster_pages` / `intra_page` 与批正交：批内（行, 渲染图）按
+    ///   页序驻留至各页组装（峰值不高于既有区间渲染驻留），页内分治的区域
+    ///   裁剪仍逐图 recognize；
+    /// - 真批红利要求引擎覆写 `recognize_batch`（GPU batch inference），
+    ///   默认实现逐图循环仅省接口不改算力。
+    pub ocr_batch: usize,
 }
 
 impl Default for PdfOptions {
@@ -117,6 +144,7 @@ impl Default for PdfOptions {
             intra_page: false,
             on_progress: None,
             keep_raster_pages: false,
+            ocr_batch: 1,
         }
     }
 }
@@ -265,6 +293,13 @@ struct PageProducer<'a> {
     text_cache: Option<(Vec<Vec<RawTextItem>>, Vec<pdf_inspector::TextItem>)>,
     /// 区间渲染在途产物（扫描区间首页到达时整段渲染，区间内逐页消费）。
     pending: Option<PendingInterval>,
+    /// 批量识别在途结果：连续 OCR 页段按 `PdfOptions.ocr_batch` 分批识别后
+    /// 的（识别行, 渲染图）页序队列，[`Self::produce_page`] 逐页弹出组装。
+    /// 队列空 = 下一个扫描页是新一批首页；批内渲染图驻留至各页消费
+    ///（keep_raster_pages 的 PNG 编码随页组装时做，峰值不高于既有区间
+    /// 渲染驻留——批只是把区间产物头部分批挪出）。默认 ocr_batch=1 时
+    /// 队列粒度 1:1，调用序与旧单页路径逐字节一致。
+    batch_results: VecDeque<(Vec<RecognizedLine>, image::RgbaImage)>,
     /// 取消标志：on_progress 返回 false 或流式 sink 返回 false 即置位；
     /// 各截停点只读。
     canceled: bool,
@@ -329,6 +364,7 @@ impl<'a> PageProducer<'a> {
             text_pages,
             text_cache: None,
             pending: None,
+            batch_results: VecDeque::new(),
             canceled: false,
             cancelled_at: None,
             warnings,
@@ -374,8 +410,10 @@ impl<'a> PageProducer<'a> {
 
     /// 单页生产（原 parse_pdf 循环体单页化）。取消后余页出空占位（页号
     /// 对齐）；扫描页到达时若无在途区间产物则发起区间渲染（一次 pdftoppm），
-    /// 区间内逐页消费渲染产物进 OCR。不回调 on_progress——回调点由驱动方
-    /// 决定（批式：产出即回调；流式：sink 投递后回调）。
+    /// 区间内按 `ocr_batch` 攒批消费渲染产物进 OCR（批结果队列页序弹出，
+    /// 见 [`Self::batch_results`]；默认 1 时与旧单页路径逐字节一致）。不
+    /// 回调 on_progress——回调点由驱动方决定（批式：产出即回调；流式：
+    /// sink 投递后回调），批量路径因此对两处驱动同享。
     fn produce_page(&mut self, p: u32) -> Result<RawPage> {
         // 截停点（页级）：取消后余页全部空占位——不再回调、不再提取、
         // 不再发起区间渲染（占位保持页号对齐）
@@ -389,8 +427,12 @@ impl<'a> PageProducer<'a> {
             // 扫描页：连续区间合并渲染（一次 pdftoppm -f/-l，性能位，无取消
             // 损耗）。取消只能经由驱动方回调 / sink 置位，本函数入口未取消
             // 才进入本分支——"区间渲染前查取消"由此覆盖：取消页起的区间
-            // 整段不发起渲染。
-            if self.pending.as_ref().is_none_or(|pi| pi.next_page != p) {
+            // 整段不发起渲染。批结果队列非空说明本页的（行, 渲染图）已在
+            // 前一批中备好，跳过重渲染检查（批量取图会把 pending.next_page
+            // 推进到本页之后，单看页号会误判"消费点对不上"）。
+            if self.batch_results.is_empty()
+                && self.pending.as_ref().is_none_or(|pi| pi.next_page != p)
+            {
                 let mut last = p;
                 while last < self.page_count && self.raster_pages.contains(&(last + 1)) {
                     last += 1;
@@ -398,28 +440,67 @@ impl<'a> PageProducer<'a> {
                 let images = render_pages(path, p, last, opts.dpi)?;
                 self.pending = Some(PendingInterval { next_page: p, images: images.into_iter() });
             }
-            // 截停点（逐页 OCR）：OCR 是算力大头，取消后余页不再进引擎，
-            // keep_raster_pages 的 PNG 编码随之跳过（余页占位由驱动方逐页
-            // 补出——批式；流式直接停止投递）
+            // 截停点（逐页 OCR / 批间）：OCR 是算力大头，取消后余页不再进
+            // 引擎，keep_raster_pages 的 PNG 编码随之跳过（余页占位由驱动方
+            // 逐页补出——批式；流式直接停止投递）。ocr_batch > 1 时本检查点
+            // 即"批间"检查：取消后的占位页在函数入口返回，走不到这里，已
+            // 渲染未识别的页由此不进引擎。
             let engine = opts.engine.as_ref().expect("扫描页引擎已预检");
-            let (img, interval_done) = {
-                let pi = self.pending.as_mut().expect("区间渲染产物在途");
-                let Some(img) = pi.images.next() else {
+            // 批结果队列空 = 本页是连续 OCR 页段内新一批的首页：自区间产物
+            // 头取 min(ocr_batch, 区间余量) 张渲染图一次识别，结果（含各页
+            // 渲染图）按页序入队供本页与后续页弹出组装。批大小按连续段自然
+            // 截断（区间 = 连续扫描页段全长，段末批 < ocr_batch）。ocr_batch
+            // =1 走单图 recognize——调用序与旧单页路径逐字节一致（Mock 只
+            // 覆写 recognize 亦正确计数）。区间产物短少（损坏件防御）时
+            // 首图缺失仍报 Corrupt；中段短少由下方入队长度自然缩短、后续页
+            // 经"消费点对不上防御性重渲染"推进，不无限循环。
+            if self.batch_results.is_empty() {
+                let batch_n = opts.ocr_batch.max(1); // 0 视同 1
+                let mut imgs: Vec<image::RgbaImage> = Vec::with_capacity(batch_n);
+                let interval_done;
+                {
+                    let pi = self.pending.as_mut().expect("区间渲染产物在途");
+                    while imgs.len() < batch_n {
+                        let Some(img) = pi.images.next() else {
+                            break;
+                        };
+                        imgs.push(img);
+                    }
+                    pi.next_page += imgs.len() as u32;
+                    interval_done = pi.images.as_slice().is_empty();
+                }
+                if interval_done {
+                    self.pending = None; // 区间产物消费完即弃（不跨区间驻留）
+                }
+                if imgs.is_empty() {
                     return Err(DocError {
                         code: ErrorCode::Corrupt,
                         message: format!("区间渲染产物与页数不齐（第 {p} 页）"),
                         attempts: vec![],
                     });
+                }
+                let per_page = if batch_n == 1 {
+                    vec![engine.recognize(&imgs[0]).map_err(|e| DocError {
+                        code: ErrorCode::Unknown,
+                        message: e,
+                        attempts: vec![],
+                    })?]
+                } else {
+                    let refs: Vec<&image::RgbaImage> = imgs.iter().collect();
+                    engine.recognize_batch(&refs).map_err(|e| DocError {
+                        code: ErrorCode::Unknown,
+                        message: e,
+                        attempts: vec![],
+                    })?
                 };
-                pi.next_page += 1;
-                (img, pi.images.as_slice().is_empty())
-            };
-            if interval_done {
-                self.pending = None; // 区间产物消费完即弃（不跨区间驻留）
+                for (img, lines) in imgs.into_iter().zip(per_page) {
+                    self.batch_results.push_back((lines, img));
+                }
             }
-            let lines = engine
-                .recognize(&img)
-                .map_err(|e| DocError { code: ErrorCode::Unknown, message: e, attempts: vec![] })?;
+            let (lines, img) = self
+                .batch_results
+                .pop_front()
+                .expect("批结果队列非空（上分支刚保证）");
             let items = lines.into_iter().map(|l| {
                 let bbox = l.axis_rect();
                 RawTextItem {
@@ -1059,6 +1140,70 @@ pub(crate) mod sample {
         page.draw_image("region", 60.0, 40.0, 400.0, 300.0).ok()?;
         doc.add_page(page);
 
+        doc.save(path).ok()?;
+        Some(used)
+    }
+
+    /// 合成扫描页（页形态同 generate_mixed_pdf 页 2：全页图像 + 深灰条带），
+    /// 底灰随 `index` 逐页递减 8（248−8·index，JPEG 平坦区噪声 ±1 远小于
+    /// 间距）——页底灰即"图→页"指纹：批探针引擎按渲染图底灰回识别文本，
+    /// 批序错排/结果错位在等价比对中必然漂移。返回 None = JPEG 编码/绘制
+    /// 失败（调用方按生成失败处理）。图像名逐页唯一（防文档级资源同名覆盖）。
+    fn scan_page(index: u32) -> Option<Page> {
+        let gray = 248u8.saturating_sub((index as u8).saturating_mul(8));
+        let mut img = image::RgbImage::new(1200, 1600);
+        for (_, _, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([gray, gray, gray]);
+        }
+        for (x0, y0, w, h) in [
+            (100, 150, 1000, 40),
+            (100, 260, 800, 40),
+            (100, 400, 1000, 300),
+        ] {
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    img.put_pixel(x, y, image::Rgb([40, 40, 40]));
+                }
+            }
+        }
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .ok()?;
+        let scan = Image::from_jpeg_data(jpeg).ok()?;
+        let name = format!("scan{index}");
+        let mut page = Page::a4();
+        // add_image 收 impl Into<String>（泛型无 deref 强转），须显式 as_str
+        page.add_image(name.as_str(), scan);
+        page.draw_image(&name, 40.0, 40.0, 515.0, 762.0).ok()?;
+        Some(page)
+    }
+
+    /// 生成 n 页纯扫描件（无文字层、无字体依赖）：每页同 generate_mixed_pdf
+    /// 页 2 形态，底灰逐页 -8 作页序指纹（见 scan_page）。ocr_batch 批量
+    /// 用例的主件——OcrMode::On 全页走渲染+OCR。返回值语义同 generate_*：
+    /// None = 保存失败。
+    pub fn generate_scan_pages_pdf(path: &Path, n: u32) -> Option<String> {
+        let mut doc = Document::new();
+        for i in 0..n {
+            doc.add_page(scan_page(i)?);
+        }
+        doc.save(path).ok()?;
+        Some("scan-pages（无字体依赖）".to_string())
+    }
+
+    /// 生成 OCR/文字层交错件：[扫描×3, 文字层, 扫描×2] 共 6 页。ocr_batch
+    /// 混合路由用例的主件——批只聚连续 OCR 页段（3 页段截断 2+1；2 页段
+    /// 恰 1 批），文字层页不进批。
+    pub fn generate_interleaved_pdf(path: &Path) -> Option<String> {
+        let (mut doc, used) = doc_with_cjk_font()?;
+        for i in 0..3 {
+            doc.add_page(scan_page(i)?);
+        }
+        doc.add_page(text_page(SAMPLE_PAGES[0]));
+        for i in 3..5 {
+            doc.add_page(scan_page(i)?);
+        }
         doc.save(path).ok()?;
         Some(used)
     }
@@ -2282,6 +2427,324 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         assert_eq!(engine.count(), 0, "核心断言：sink 取消截停扫描页渲染与 OCR");
         let w = meta.extra.get("warnings").expect("应有中止告警");
         assert!(w.contains("用户中止于第 1 页"), "实际告警：{w}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // OCR 批量识别（PdfOptions.ocr_batch）：trait 批入口 + 吞吐旋钮
+    // -------------------------------------------------------------------------
+
+    /// 渲染依赖用例的公共壳：持 PATH_LOCK → 准备渲染器（真 pdftoppm 或
+    /// gs shim）→ shim 目录前插 PATH → 跑闭包 → 还原 PATH。渲染器不可用
+    /// 时返回 None（调用方 skip）。
+    fn with_renderer<T>(f: impl FnOnce() -> T) -> Option<T> {
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let shim = match prepare_renderer() {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("skip：{msg}");
+                return None;
+            }
+        };
+        let old = std::env::var_os("PATH");
+        if let Some(d) = &shim {
+            let new = match old.as_ref() {
+                Some(p) => format!("{}:{}", d.display(), p.to_string_lossy()),
+                None => d.display().to_string(),
+            };
+            std::env::set_var("PATH", new);
+        }
+        let out = f();
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        Some(out)
+    }
+
+    /// n 页纯扫描件（无字体依赖；磁盘正常时生成不会失败，失败即 panic）。
+    fn scan_fixture(tag: &str, n: u32) -> (PathBuf, PathBuf) {
+        let dir = probe_dir(tag);
+        let pdf = dir.join("scan.pdf");
+        sample::generate_scan_pages_pdf(&pdf, n).expect("扫描件生成失败");
+        (dir, pdf)
+    }
+
+    /// 批探针引擎：分别计数 recognize_batch（次数 + 批内图数）与 recognize
+    /// 调用；识别文本 = 渲染图底灰定点读数（见 probe_text）——逐页底灰相
+    /// 异，识别文本即"图→页"绑定指纹，批序错排/结果错位在 batch=N 与 =1
+    /// 等价比对中必然漂移。覆写 recognize_batch（batch>1 路径）与 recognize
+    ///（默认 1 路径 / intra_page 裁剪路径）各自计数、互不串账。
+    struct BatchProbeEngine {
+        batch_calls: std::sync::atomic::AtomicUsize,
+        batch_images: std::sync::atomic::AtomicUsize,
+        single_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BatchProbeEngine {
+        fn new() -> Self {
+            Self {
+                batch_calls: std::sync::atomic::AtomicUsize::new(0),
+                batch_images: std::sync::atomic::AtomicUsize::new(0),
+                single_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn batch_calls(&self) -> usize {
+            self.batch_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn batch_images(&self) -> usize {
+            self.batch_images.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn single_calls(&self) -> usize {
+            self.single_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// 底灰定点采样：扫描页画布 (40,40)-(555,802)pt、条带集中在画布
+        /// 上半部，页面相对点 (85%, 90%) 恒落在条带下方的平坦底色区——单点
+        /// 读数即底灰（JPEG 平坦区噪声 ±1，远小于逐页 8 的底灰间距）。
+        fn probe_text(image: &image::RgbaImage) -> String {
+            let px = image.get_pixel(image.width() * 85 / 100, image.height() * 9 / 10);
+            format!("底灰{}", px.0[0])
+        }
+        fn probe_line(image: &image::RgbaImage) -> crate::ocr::RecognizedLine {
+            crate::ocr::RecognizedLine {
+                text: Self::probe_text(image),
+                score: 0.9,
+                quad: [[0.0, 0.0], [100.0, 0.0], [100.0, 20.0], [0.0, 20.0]],
+            }
+        }
+    }
+
+    impl crate::ocr::OcrEngine for BatchProbeEngine {
+        fn name(&self) -> &str {
+            "batch-probe"
+        }
+        fn recognize(
+            &self,
+            image: &image::RgbaImage,
+        ) -> std::result::Result<Vec<crate::ocr::RecognizedLine>, String> {
+            self.single_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![Self::probe_line(image)])
+        }
+        fn recognize_batch(
+            &self,
+            images: &[&image::RgbaImage],
+        ) -> std::result::Result<Vec<Vec<crate::ocr::RecognizedLine>>, String> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.batch_images
+                .fetch_add(images.len(), std::sync::atomic::Ordering::SeqCst);
+            images
+                .iter()
+                .map(|im| Ok(vec![Self::probe_line(im)]))
+                .collect::<std::result::Result<Vec<_>, String>>()
+        }
+    }
+
+    /// 等价性金测：7 页全扫描件分别以 ocr_batch=3 与默认（=1）跑全管线
+    ///（渲染→识别→组装→assemble→finalize），Document 逐页 PartialEq 相等
+    /// 且 meta 统计一致；页文本为逐页相异的底灰指纹——批序错排必然漂移。
+    #[test]
+    fn ocr_batch_output_equals_single_page() {
+        let out = with_renderer(|| {
+            let (dir, pdf) = scan_fixture("batch-eq", 7);
+            let mk = |batch: usize| PdfOptions {
+                mode: OcrMode::On,
+                engine: Some(std::sync::Arc::new(BatchProbeEngine::new())),
+                ocr_batch: batch,
+                ..Default::default()
+            };
+            let mut d3 =
+                PdfPlugin.assemble(&parse_pdf(&pdf, &mk(3)).expect("batch=3 解析失败")).finalize();
+            d3.meta.file_type = "pdf".to_string();
+            let mut d1 =
+                PdfPlugin.assemble(&parse_pdf(&pdf, &mk(1)).expect("batch=1 解析失败")).finalize();
+            d1.meta.file_type = "pdf".to_string();
+            (dir, d3, d1)
+        });
+        let Some((dir, d3, d1)) = out else { return };
+        assert_eq!(d3.pages.len(), 7);
+        assert_eq!(d3.pages.len(), d1.pages.len(), "两轮页数一致");
+        for (i, (p3, p1)) in d3.pages.iter().zip(d1.pages.iter()).enumerate() {
+            assert_eq!(p3, p1, "第 {} 页 batch=3 与 batch=1 不相等", i + 1);
+        }
+        assert_eq!(d3.meta, d1.meta, "meta 统计一致");
+        // 指纹校验：每页恰一条"底灰N"文本且 7 页互不相同（图→页绑定成立）
+        let texts: Vec<&str> = d3.pages.iter().map(|p| p.text.as_str()).collect();
+        assert!(
+            texts.iter().all(|t| t.starts_with("底灰")),
+            "页文本应为底灰指纹，实际：{texts:?}"
+        );
+        let distinct: std::collections::HashSet<_> = texts.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            7,
+            "7 页指纹应互不相同（批序错排即漂移）：{texts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批调用计数：7 页全扫描件 batch=3 → recognize_batch 恰 3 次、批内图
+    /// 总数恰 7（3+3+1，段末自然截断）、单图 recognize 恰 0 次；默认
+    /// batch=1 与 0（视同 1）→ 单图 recognize 恰 7 次（现状路径）、批入口
+    /// 0 次——计数口径与现状完全一致。
+    #[test]
+    fn ocr_batch_call_counts() {
+        let out = with_renderer(|| {
+            let (dir, pdf) = scan_fixture("batch-count", 7);
+            let run = |batch: usize| {
+                let engine = std::sync::Arc::new(BatchProbeEngine::new());
+                let opts = PdfOptions {
+                    mode: OcrMode::On,
+                    engine: Some(engine.clone()),
+                    ocr_batch: batch,
+                    ..Default::default()
+                };
+                parse_pdf(&pdf, &opts).expect("解析失败");
+                engine
+            };
+            (dir, run(3), run(1), run(0))
+        });
+        let Some((dir, e3, e1, e0)) = out else { return };
+        assert_eq!(e3.batch_calls(), 3, "7 页 batch=3 → 恰 3 批（3+3+1）");
+        assert_eq!(e3.batch_images(), 7, "批内图总数 = 页数");
+        assert_eq!(e3.single_calls(), 0, "batch>1 应全走批入口");
+        for (label, e) in [("默认 batch=1", &e1), ("batch=0 视同 1", &e0)] {
+            assert_eq!(e.single_calls(), 7, "{label}：逐页单图识别（现状路径）");
+            assert_eq!(e.batch_calls(), 0, "{label}：不走批入口");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 混合路由：[扫描×3, 文字层, 扫描×2] 交错件 + batch=2 → 批只聚连续
+    /// OCR 页段（3 页段截断为 2+1、2 页段恰 1 批 → 恰 3 批共 5 图），文字
+    /// 层页零引擎调用（批内图总数 = 扫描页数）；5 个 OCR 页底灰指纹互不
+    /// 相同，证明识别结果仍按页序对位。
+    #[test]
+    fn ocr_batch_mixed_route_groups_consecutive_ocr_pages() {
+        let dir = probe_dir("batch-mixed");
+        let pdf = dir.join("interleaved.pdf");
+        if sample::generate_interleaved_pdf(&pdf).is_none() {
+            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
+            return;
+        }
+        let out = with_renderer(|| {
+            let engine = std::sync::Arc::new(BatchProbeEngine::new());
+            let opts = PdfOptions {
+                engine: Some(engine.clone()),
+                ocr_batch: 2,
+                ..Default::default()
+            };
+            let raw = parse_pdf(&pdf, &opts).expect("解析失败");
+            (engine, raw)
+        });
+        let Some((engine, raw)) = out else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!(raw.pages.len(), 6);
+        // 引擎调用：3 批共 5 图 = 扫描页数；文字层页零调用
+        assert_eq!(engine.batch_calls(), 3, "3页段(2+1) + 2页段(1批) → 恰 3 批");
+        assert_eq!(engine.batch_images(), 5, "批内图总数 = 扫描页数，文字层页不进批");
+        assert_eq!(engine.single_calls(), 0);
+        // 页级路由语义：页 4 文字层 Pt，其余 OCR 页 Px 且全为 OCR 块
+        for (i, rp) in raw.pages.iter().enumerate() {
+            if i == 3 {
+                assert_eq!(rp.coord_units, Some(CoordUnits::Pt), "页 4 应为文字层");
+                assert!(!rp.items.is_empty(), "页 4 文字层直提不应为空");
+                continue;
+            }
+            assert_eq!(
+                rp.coord_units,
+                Some(CoordUnits::Px { dpi: DEFAULT_DPI as f32 }),
+                "页 {} 应走渲染+OCR",
+                i + 1
+            );
+            assert!(
+                rp.items.iter().all(|it| it.source == BlockSource::Ocr),
+                "页 {} 应全部为 OCR 块",
+                i + 1
+            );
+        }
+        // 5 个 OCR 页的底灰指纹互不相同（页序对位）
+        let fingerprints: std::collections::HashSet<&str> = raw
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(i, _rp)| *i != 3)
+            .map(|(_, rp)| rp.items[0].text.as_str())
+            .collect();
+        assert_eq!(fingerprints.len(), 5, "OCR 页指纹应互不相同");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批式取消截停：7 页全扫描件 batch=3，页 2 回调 false → 中止页保留、
+    /// 余页出占位；未识别的已渲染页不进引擎（批恰 1 次、图数恰 3 = 页 4-7
+    /// 未识别）。页 3 与页 1/2 同批、识别发生在取消前，其算力不可撤回，
+    /// 产出按页语义照常出占位。
+    #[test]
+    fn ocr_batch_cancel_stops_unrecognized_pages() {
+        let out = with_renderer(|| {
+            let (dir, pdf) = scan_fixture("batch-cancel", 7);
+            let engine = std::sync::Arc::new(BatchProbeEngine::new());
+            let opts = PdfOptions {
+                mode: OcrMode::On,
+                engine: Some(engine.clone()),
+                ocr_batch: 3,
+                on_progress: Some(std::sync::Arc::new(|done, _total| done < 2)),
+                ..Default::default()
+            };
+            let raw = parse_pdf(&pdf, &opts).expect("取消是 Ok 语义，不应报错");
+            (dir, engine, raw)
+        });
+        let Some((dir, engine, raw)) = out else { return };
+        // 算力截停：仅页 1 触发的首批（3 图）进引擎，页 4-7 未识别
+        assert_eq!(engine.batch_calls(), 1, "取消后不再发起新批");
+        assert_eq!(engine.batch_images(), 3, "仅首批 3 图进引擎，页 4-7 未识别");
+        assert_eq!(engine.single_calls(), 0);
+        // 产出语义：页 1、2 保留，页 3-7 空占位（页号对齐）
+        assert_eq!(raw.pages.len(), 7);
+        assert!(!raw.pages[0].items.is_empty(), "页 1 已产出保留");
+        assert!(!raw.pages[1].items.is_empty(), "页 2（中止页）已产出保留");
+        for i in 2..7 {
+            assert!(raw.pages[i].items.is_empty(), "页 {} 应为空占位", i + 1);
+            let expected = (i + 1).to_string();
+            assert_eq!(raw.pages[i].name.as_deref(), Some(expected.as_str()), "页号对齐");
+        }
+        let w = raw.meta.get("warnings").expect("应有中止告警");
+        assert!(w.contains("用户中止于第 2 页"), "实际告警：{w}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 深度流式取消截停：7 页全扫描件 batch=3，页 2 sink 拒投 →
+    /// delivered==2、meta.page_count==2（被拒页计为已投递）、批恰 1 次
+    /// 图数恰 3（页 4-7 未识别的已渲染页不再进引擎）、warnings 记第 2 页。
+    #[test]
+    fn ocr_batch_streaming_cancel_stops_unrecognized_pages() {
+        let out = with_renderer(|| {
+            let (dir, pdf) = scan_fixture("batch-stream-cancel", 7);
+            let engine = std::sync::Arc::new(BatchProbeEngine::new());
+            let opts = PdfOptions {
+                mode: OcrMode::On,
+                engine: Some(engine.clone()),
+                ocr_batch: 3,
+                ..Default::default()
+            };
+            let mut delivered = 0usize;
+            let meta = parse_streaming(&pdf, &opts, &mut |_page: Page| {
+                delivered += 1;
+                delivered < 2
+            })
+            .expect("取消是 Ok 语义，不应报错");
+            (dir, engine, delivered, meta)
+        });
+        let Some((dir, engine, delivered, meta)) = out else { return };
+        assert_eq!(delivered, 2, "页 1、2 投递，页 2 拒投即停");
+        assert_eq!(meta.page_count, 2, "被拒页计为已投递");
+        assert_eq!(engine.batch_calls(), 1, "取消后不再发起新批");
+        assert_eq!(engine.batch_images(), 3, "仅首批 3 图进引擎，页 4-7 未识别");
+        let w = meta.extra.get("warnings").expect("应有中止告警");
+        assert!(w.contains("用户中止于第 2 页"), "实际告警：{w}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

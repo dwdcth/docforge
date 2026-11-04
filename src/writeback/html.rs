@@ -13,7 +13,15 @@
 //!   （格单元 `kind = Table`，回写在表格位逐格消费，见下「表格格级回写」），
 //!   Image/Code 结构块不进翻译流但仍占块序号（锚点不重排）。
 //! * 双保险：每个定位到的块与重块化文本做一致性比对，不一致跳过该块
-//!   （宁漏勿错）；未匹配 id / 空白译文一律忽略。
+//!   （宁漏勿错）；未匹配 id / 空白译文一律忽略；
+//! * ①→④ 边界校验：[`crate::emit::TranslationPair::source`]（消费者提取
+//!   译文依据的①侧源文本）与本波④单元文本不一致 → 该单元跳过并记报告
+//!   （①提取与④回写之间文件被改时，位置锚点在新文件里指向别的文本，
+//!   写下去就是静默错位写）；`None` = 信任锚点（不校验）。结果以
+//!   [`crate::writeback::WritebackReport`] 返回：`written` = 实际写入单元
+//!   数；`skipped` 只收「有译文但未写」（源文本不一致 / 文本守卫不一致 /
+//!   附录策略的表格格译文——结构限制；无译文 = 正常未翻译不记，非 UTF-8
+//!   拒绝是 `Err` 不记）。
 //! * 编码：仅支持 UTF-8 件（含 BOM，剥除后扫描、写回时补回）——非 UTF-8
 //!   件回写会与 `<meta charset>` 声明失配，直接拒绝（宁漏勿错）。
 //!
@@ -55,21 +63,22 @@ use crate::plugins::html::{decode_entities, find_tag_end, heading_level, strip_c
 use crate::plugins::html::HtmlPlugin;
 use crate::plugins::text::WholeTextParseCapability;
 
-use super::{apply_edits, Edit, escape_xml_text, translation_map};
+use super::{apply_edits, Edit, escape_xml_text, pair_map};
 
 /// 译文样式类（BilingualInline 插入段与表格格内分隔符统一挂它，便于下游
 /// 识别；epub 同值）。
 pub(crate) const TR_CLASS: &str = "docforge-tr";
 
-/// html 单文件双语回写：见模块级文档。`translated` 的 id 与
+/// html 单文件双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（`p0-b{块序}`）；
-/// 未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
+/// 未匹配 / 空白译文条目忽略；失败返回 `corrupt`。返回
+/// [`crate::writeback::WritebackReport`]（口径见模块级文档）。
 pub fn writeback_html(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -79,7 +88,8 @@ pub fn writeback_html(
     // 单元流全量（含表格格单元 kind = Table）：块级候选按块序消费、表格格
     // 在表格位逐格消费（见主循环的 Table 分支），两段消费拼满同一单元流。
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = crate::writeback::WritebackReport::default();
 
     // B. 读字节并解码：UTF-8（BOM 剥除后扫描、写回补回）；非 UTF-8 拒绝
     let bytes = std::fs::read(in_path)
@@ -112,16 +122,30 @@ pub fn writeback_html(
             for cell in &slots[b_idx].cells {
                 let Some(unit) = units.get(cursor) else { break };
                 cursor += 1;
-                // 双保险：格文本 ≠ 单元文本 → 该格不写（宁漏勿错；单元照常消费）
+                // 双保险：格文本 ≠ 单元文本 → 该格不写（宁漏勿错；单元照常
+                // 消费）；有译文的格守卫失败记报告（无译文 = 正常未翻译）
                 if unit.kind != BlockKind::Table || cell.text != unit.text {
+                    if let Some((tr, _)) = map.get(unit.id.as_str()) {
+                        if !tr.trim().is_empty() {
+                            report.skip(unit.id.clone(), "文本守卫不一致");
+                        }
+                    }
                     continue;
                 }
-                let Some(tr) = map.get(unit.id.as_str()) else {
+                let Some((tr, src_opt)) = map.get(unit.id.as_str()).copied() else {
                     continue;
                 };
                 let tr = tr.trim();
                 if tr.is_empty() {
                     continue;
+                }
+                // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+                //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+                if let Some(src) = src_opt {
+                    if src.trim() != unit.text.trim() {
+                        report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                        continue;
+                    }
                 }
                 match strategy {
                     BiStrategy::BilingualInline => {
@@ -130,6 +154,7 @@ pub fn writeback_html(
                             cell.end,
                             format!("<br class=\"{TR_CLASS}\"/>{}", escape_xml_text(tr)),
                         ));
+                        report.written += 1;
                     }
                     BiStrategy::TranslationOnly => {
                         // 格内首文本节点换译文、其余清空（与段落同款）
@@ -140,8 +165,12 @@ pub fn writeback_html(
                                 edits.push(Edit::Replace(*s, *e, String::new()));
                             }
                         }
+                        report.written += 1;
                     }
-                    BiStrategy::OriginalPlusAppendix => {}
+                    BiStrategy::OriginalPlusAppendix => {
+                        // 格译文结构性无处安放（附录是段落流）：有译文但未写 → 记报告
+                        report.skip(unit.id.clone(), "结构限制（表格格译文不进附录）");
+                    }
                 }
             }
             continue;
@@ -153,18 +182,33 @@ pub fn writeback_html(
         let Some(unit) = units.get(cursor) else { break };
         cursor += 1;
         let slot = &slots[b_idx];
-        // 双保险：重块化文本必须与权威单元文本一致
+        // 双保险：重块化文本必须与权威单元文本一致（④ 内部守卫）；有译文
+        // 的单元守卫失败记报告（无译文 = 正常未翻译，不是跳过）
         if slot.text != unit.text {
+            if let Some((tr, _)) = map.get(unit.id.as_str()) {
+                if !tr.trim().is_empty() {
+                    report.skip(unit.id.clone(), "文本守卫不一致");
+                }
+            }
             continue;
         }
-        let Some(tr) = map.get(unit.id.as_str()) else {
+        let Some((tr, src_opt)) = map.get(unit.id.as_str()).copied() else {
             continue;
         };
         let tr = tr.trim();
         if tr.is_empty() {
             continue;
         }
+        // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+        //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+        if let Some(src) = src_opt {
+            if src.trim() != unit.text.trim() {
+                report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                continue;
+            }
+        }
         matched.push(tr.to_string());
+        report.written += 1;
         match strategy {
             BiStrategy::BilingualInline => {
                 // 插在块内容终点之后；无块回退的全文 span 钳进 </body> 前
@@ -214,7 +258,8 @@ pub fn writeback_html(
     }
     out_bytes.extend_from_slice(out_text.as_bytes());
     std::fs::write(out, out_bytes)
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))
+        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    Ok(report)
 }
 
 /// UTF-8 严格解码：UTF-8 BOM 剥除（`(true, text)`），其余要求字节即 UTF-8；
@@ -618,10 +663,15 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_html(in_path, &translated, strategy, out_path).unwrap();
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string()).into()).collect();
+        writeback_html(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     fn out_str(path: &Path) -> String {
@@ -788,7 +838,7 @@ mod tests {
         std::fs::write(&bad, [0xFF, 0xFE, b'a', b'b']).unwrap();
         let err = writeback_html(
             &bad,
-            &[("p0-b0".to_string(), "x".to_string())],
+            &[("p0-b0".to_string(), "x".to_string()).into()],
             BiStrategy::BilingualInline,
             dir.join("bad-out.html"),
         )
@@ -1003,6 +1053,135 @@ mod tests {
         assert!(out.contains("<p>Body paragraph.</p>"), "段落译文进附录");
         assert!(out.contains("格甲"), "表格原样");
         assert!(!out.contains("Cell A"), "格译文不进附录：{out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验（①→④ 边界）金测：`source` 与④文本一致 → 与二元组形态
+    ///（source = None）逐字节等价；`source` 不一致（构造：提取后改
+    /// pair.source 为别串）→ 该单元跳过（原处保持原文）+ report.skipped
+    /// 含 (id, "源文本不一致…")。
+    #[test]
+    fn source_mismatch_skips_and_reports() {
+        let dir = case_dir("srcmismatch");
+        let in_path = dir.join("in.html");
+        std::fs::write(
+            &in_path,
+            "<html><body><p>正文一段句子。</p><p>尾段完整句子。</p></body></html>",
+        )
+        .unwrap();
+        assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b1"]);
+
+        // 第二单元的源文本故意与文件不一致（模拟①→④之间文件被改）
+        let pairs: Vec<crate::emit::TranslationPair> = vec![
+            (
+                "p0-b0".to_string(),
+                "正文一段句子。".to_string(),
+                "First paragraph.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b1".to_string(),
+                "提取后被改掉的别串。".to_string(),
+                "Drifted last sentence.".to_string(),
+            )
+                .into(),
+        ];
+        let out_path = dir.join("out.html");
+        let report =
+            writeback_html(&in_path, &pairs, BiStrategy::BilingualInline, &out_path).unwrap();
+        assert_eq!(report.written, 1, "一致的一条写入");
+        assert_eq!(
+            report.skipped,
+            vec![(
+                "p0-b1".to_string(),
+                "源文本不一致（提取后文件已变更）".to_string()
+            )]
+        );
+        let out = out_str(&out_path);
+        assert!(out.contains("尾段完整句子。"), "源不一致的单元保持原文");
+        assert!(!out.contains("Drifted last sentence."), "错位译文不落盘");
+        assert!(out.contains("First paragraph."));
+
+        // 迁移等价性：二元组（source = None）与三元组一致源输出逐字节一致
+        let tuples: Vec<crate::emit::TranslationPair> = vec![
+            ("p0-b0".to_string(), "First paragraph.".to_string()).into(),
+            ("p0-b1".to_string(), "Last sentence.".to_string()).into(),
+        ];
+        let with_src: Vec<crate::emit::TranslationPair> = vec![
+            (
+                "p0-b0".to_string(),
+                "正文一段句子。".to_string(),
+                "First paragraph.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b1".to_string(),
+                "尾段完整句子。".to_string(),
+                "Last sentence.".to_string(),
+            )
+                .into(),
+        ];
+        let out_none = dir.join("out-none.html");
+        let out_src = dir.join("out-src.html");
+        let r_none =
+            writeback_html(&in_path, &tuples, BiStrategy::BilingualInline, &out_none).unwrap();
+        let r_src =
+            writeback_html(&in_path, &with_src, BiStrategy::BilingualInline, &out_src).unwrap();
+        assert_eq!(
+            std::fs::read(&out_none).unwrap(),
+            std::fs::read(&out_src).unwrap(),
+            "None 与一致源逐字节等价"
+        );
+        assert_eq!((r_none.written, r_none.skipped.len()), (2, 0));
+        assert_eq!((r_src.written, r_src.skipped.len()), (2, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数（部分命中）+ 附录策略的表格格译文结构性跳过：无译文单元
+    /// 不记（正常未翻译）、未匹配 id 不记、段落命中计入 written、格译文
+    /// 记「结构限制」（有译文但结构性无处写）。
+    #[test]
+    fn report_counts_partial_hits() {
+        let dir = case_dir("report-counts");
+        let in_path = dir.join("in.html");
+        std::fs::write(
+            &in_path,
+            "<html><body><p>正文一段句子。</p><p>乙</p><p>尾段完整句子。</p>\
+             <table><tr><td>格甲</td></tr></table></body></html>",
+        )
+        .unwrap();
+        // 乙 = 1 字符 < min_chars，不占翻译位；表格占 b3
+        assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b2", "p0-b3-r0c0"]);
+
+        let pairs: Vec<crate::emit::TranslationPair> = vec![
+            ("p0-b0".to_string(), "First paragraph.".to_string()).into(),
+            // p0-b2 不给译文（正常未翻译，不记 skipped）
+            ("p0-b3-r0c0".to_string(), "Cell A".to_string()).into(),
+            ("p0-b99".to_string(), "bogus".to_string()).into(), // 未匹配 id：忽略
+        ];
+        let out_path = dir.join("out.html");
+        let report = writeback_html(
+            &in_path,
+            &pairs,
+            BiStrategy::OriginalPlusAppendix,
+            &out_path,
+        )
+        .unwrap();
+        assert_eq!(report.written, 1, "仅段落写入（附录形态格译文不写）");
+        assert_eq!(
+            report.skipped,
+            vec![(
+                "p0-b3-r0c0".to_string(),
+                "结构限制（表格格译文不进附录）".to_string()
+            )]
+        );
+        let out = out_str(&out_path);
+        assert!(out.contains("格甲"), "表格原样");
+        assert!(out.contains("<p>First paragraph.</p>"), "段落译文进附录");
+        assert!(!out.contains("Cell A"), "格译文不落盘");
+        assert!(!out.contains("bogus"), "未匹配 id 不落盘");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

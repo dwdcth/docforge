@@ -27,8 +27,11 @@
 //!   成文本会把数值格变文本格（对齐、公式引用、SUM 语义全变），宁可漏写也不
 //!   错写。文本守卫拦口径漂移，可写判据拦类型误写；格位照常占位保流对齐。
 //! * 双保险：每个格位与重解析的对应单元做文本一致性比对，不一致即跳过该格
-//!   （单元照常消费保流对齐）——宁漏勿错；`translated` 里对不上任何单元 id 的
+//!   （单元照常消费保流对齐）——宁漏勿错；`pairs` 里对不上任何单元 id 的
 //!   条目一律忽略（不报错），空白译文视同未提供。
+//! * ①→④ 源校验：`TranslationPair.source`（① 侧源文本）非 None 时写入前
+//!   与当前（④）文本比对，不一致跳过该格并记 `WritebackReport`（函数返回
+//!   written / skipped 报告——「宁漏勿错」的可见化）。
 //!
 //! # 为什么写 inlineStr（而不是改 sharedStrings.xml）
 //!
@@ -72,17 +75,22 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin as _, ParseCapability as _};
 
-use super::{apply_edits, escape_xml_text, translation_map, Edit};
+use super::{apply_edits, escape_xml_text, pair_map, Edit};
 
-/// xlsx 双语回写：见模块级文档。`translated` 的 id 与
+/// 数值/日期/布尔/错误格的跳过原因（可写判据与文本守卫归因共用同一文案）：
+/// 这类格写入会把数值格变文本格（对齐 / 公式 / SUM 语义全变），宁漏勿错。
+const TYPE_GUARD_SKIP: &str = "数值/日期/布尔/错误格不可写（类型守卫）";
+
+/// xlsx 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（格 `p{sheet}-b{块序}-r{行}c{列}`）；
-/// 未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
+/// 未匹配 / 空白译文条目忽略；`pair.source` 携带①侧源文本时写入前校验，
+/// 不一致跳过并记报告（见 [`crate::emit::TranslationPair`]）；失败返回 `corrupt`。
 pub fn writeback_xlsx(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -91,7 +99,8 @@ pub fn writeback_xlsx(
     let raw = XlsxRawBackend::default().parse(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = crate::writeback::WritebackReport::default();
 
     // 第二遍：ZIP 内逐 sheet 扫描格位，与单元流按文档序配对。
     let mut zip = open_zip(in_path)?;
@@ -132,7 +141,7 @@ pub fn writeback_xlsx(
     drop(zip);
 
     let sheet_names: Vec<String> = sheets.iter().map(|(_, name)| name.clone()).collect();
-    let matched = matched_translations(&slots, &units, &map);
+    let matched = matched_translations(&slots, &units, &map, &mut report);
 
     match strategy {
         BiStrategy::BilingualInline | BiStrategy::TranslationOnly => {
@@ -143,7 +152,9 @@ pub fn writeback_xlsx(
             for (k, tr) in &matched {
                 let slot = &slots[*k];
                 if !slot.writable {
-                    continue; // 数值/日期/布尔/错误格：结构性不可写（见模块头）
+                    // 数值/日期/布尔/错误格：结构性不可写（见模块头），记报告
+                    report.skip(units[*k].id.clone(), TYPE_GUARD_SKIP);
+                    continue;
                 }
                 let text = if inline {
                     format!("{}\n{}", units[*k].text.trim(), tr)
@@ -154,6 +165,7 @@ pub fn writeback_xlsx(
                     .entry(slot.sheet)
                     .or_default()
                     .push(Edit::Replace(slot.span.0, slot.span.1, inline_str_cell(slot, &text)));
+                report.written += 1;
             }
             let replaced: Vec<(String, Vec<u8>)> = by_sheet
                 .into_iter()
@@ -161,7 +173,8 @@ pub fn writeback_xlsx(
                     (parts[idx].clone(), apply_edits(&sheet_xmls[idx], edits).into_bytes())
                 })
                 .collect();
-            rewrite_zip_with_added(in_path, out, &replaced, &[])
+            rewrite_zip_with_added(in_path, out, &replaced, &[])?;
+            Ok(report)
         }
         BiStrategy::OriginalPlusAppendix => {
             // 附录只收真正写得出译文的格（可写字符串格且文本守卫命中）；
@@ -181,11 +194,14 @@ pub fn writeback_xlsx(
                 .collect();
             if rows.is_empty() {
                 // 无命中译文：输出 = 原包透传（对齐 docx 附录空命中不追加）
-                return rewrite_zip_with_added(in_path, out, &[], &[]);
+                rewrite_zip_with_added(in_path, out, &[], &[])?;
+                return Ok(report);
             }
+            report.written += rows.len(); // 附录每行 = 一个单元译文的实际写入
             let (replaced, added) =
                 build_appendix(&entry_names, &wb_xml, rels_xml.as_deref(), ct_xml.as_deref(), &sheet_names, &rows)?;
-            rewrite_zip_with_added(in_path, out, &replaced, &added)
+            rewrite_zip_with_added(in_path, out, &replaced, &added)?;
+            Ok(report)
         }
     }
 }
@@ -567,28 +583,54 @@ fn sheet_entries(xml: &str) -> Result<Vec<(String, String)>> {
 // 配对与改写
 // ---------------------------------------------------------------------------
 
-/// 格位 × 翻译单元按序配对（文本一致性守卫）+ 译文查找。
-/// 返回 (slot 下标, 译文) 列表，文档序。
+/// 格位 × 翻译单元按序配对（文本一致性守卫 + ①→④ 源校验）+ 译文查找。
+/// 返回 (slot 下标, 译文) 列表，文档序；守卫 / 校验失败**且有译文**的单元
+/// 记入 `report.skipped`（无译文是正常未翻译，不是跳过）。
 fn matched_translations(
     slots: &[CellSlot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
+    report: &mut crate::writeback::WritebackReport,
 ) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let n = slots.len().min(units.len());
     for k in 0..n {
-        // 双保险：格位文本与单元文本必须一致（同一解析器同一文件的确定性保证）
-        if slots[k].text.trim() != units[k].text.trim() {
+        let slot = &slots[k];
+        let unit = &units[k];
+        // 双保险：格位文本与单元文本必须一致（同一解析器同一文件的确定性
+        // 保证）。数值/日期格的格位文本是 XML 原文形态（如 "45292"），与
+        // 解析侧格式化串天然不等——按可写性归因：不可写格记类型守卫
+        if slot.text.trim() != unit.text.trim() {
+            if has_translation(map, &unit.id) {
+                let reason = if slot.writable { "文本守卫不一致" } else { TYPE_GUARD_SKIP };
+                report.skip(unit.id.clone(), reason);
+            }
             continue;
         }
-        if let Some(tr) = map.get(units[k].id.as_str()) {
-            let tr = tr.trim();
-            if !tr.is_empty() {
-                out.push((k, tr.to_string()));
+        let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
+            continue;
+        };
+        let tr = tr.trim();
+        if tr.is_empty() {
+            continue;
+        }
+        // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+        //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+        if let Some(src) = src_opt {
+            if src.trim() != unit.text.trim() {
+                report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                continue;
             }
         }
+        out.push((k, tr.to_string()));
     }
     out
+}
+
+/// 该单元是否带**非空白译文**：报告的 `skipped` 只收「有译文但没写」——
+/// 无译文是正常未翻译，不是跳过（与 `pair_map`「空白译文忽略」同口径）。
+fn has_translation(map: &HashMap<&str, (&str, Option<&str>)>, id: &str) -> bool {
+    map.get(id).is_some_and(|(tr, _)| !tr.trim().is_empty())
 }
 
 /// 目标格整格替换为 inlineStr：`r`（定位，缺 `r` 的格按行列换算补名）与 `s`
@@ -965,10 +1007,32 @@ mod tests {
             .clone()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_xlsx(in_path, &translated, strategy, out_path).unwrap();
+    /// (id, 译文) 二元组回写（`From<(String, String)>` = 无源校验形态），
+    /// 返回报告（多数用例不断言报告，忽略返回值即可）。
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string()).into()).collect();
+        writeback_xlsx(in_path, &pairs, strategy, out_path).unwrap()
+    }
+
+    /// (id, ①源文本, 译文) 三元组回写（`From<(String, String, String)>` =
+    /// 带源校验形态），返回报告。
+    fn write_src(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> = tr
+            .iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()).into())
+            .collect();
+        writeback_xlsx(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     fn entry_bytes(zip_path: &Path, name: &str) -> Vec<u8> {
@@ -1032,9 +1096,9 @@ mod tests {
         assert_eq!(units[5].text, "备注");
 
         // 格单元全译（含数字/日期格——回写侧应守卫跳过这两类）
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
         let out_path = dir.join("out.xlsx");
         writeback_xlsx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
@@ -1101,9 +1165,9 @@ mod tests {
             units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
             ["pS1-b0-r0c0", "pS1-b0-r0c1", "pS1-b0-r1c0", "pS1-b0-r2c0", "pS1-b0-r2c1"]
         );
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
         let out_path = dir.join("out.xlsx");
         writeback_xlsx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
@@ -1196,9 +1260,9 @@ mod tests {
         );
 
         let units = to_translation_units(&parse_doc(&in_path));
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
         let out_path = dir.join("out.xlsx");
         writeback_xlsx(&in_path, &translated, BiStrategy::OriginalPlusAppendix, &out_path).unwrap();
@@ -1278,9 +1342,9 @@ mod tests {
 
         let units = to_translation_units(&parse_doc(&in_path));
         assert_eq!(units.len(), 2);
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
         let out_path = dir.join("out.xlsx");
         writeback_xlsx(&in_path, &translated, BiStrategy::OriginalPlusAppendix, &out_path).unwrap();
@@ -1386,8 +1450,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 文本守卫（格位同款）：格文本 ≠ 单元文本 → 不命中（宁漏勿错）；
-    /// 位置配对是权威，文本守卫只把关写不写。
+    /// 文本守卫（格位同款）：格文本 ≠ 单元文本 → 不命中并记报告（宁漏勿
+    /// 错）；位置配对是权威，文本守卫只把关写不写。写入计数发生在改写分支，
+    /// 配对层不计数。
     #[test]
     fn text_guard_skips_mismatched_slot() {
         let unit = |id: &str, text: &str| crate::emit::TranslationUnit {
@@ -1402,8 +1467,11 @@ mod tests {
             header: false,
             running: false,
         };
-        let entries = [("pS1-b0-r0c0".to_string(), "格译文".to_string())];
-        let map = translation_map(&entries);
+        let pairs: Vec<crate::emit::TranslationPair> = [("pS1-b0-r0c0", "格译文")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect();
+        let map = pair_map(&pairs);
 
         let slots = [CellSlot {
             sheet: 0,
@@ -1413,14 +1481,23 @@ mod tests {
             writable: true,
             a1: "A1".to_string(),
         }];
+        let mut report = crate::writeback::WritebackReport::default();
         assert!(
-            matched_translations(&slots, &[unit("pS1-b0-r0c0", "单元文本")], &map).is_empty(),
+            matched_translations(&slots, &[unit("pS1-b0-r0c0", "单元文本")], &map, &mut report)
+                .is_empty(),
             "文本不一致的格不写"
         );
+        assert_eq!(
+            report.skipped,
+            vec![("pS1-b0-r0c0".to_string(), "文本守卫不一致".to_string())]
+        );
 
-        // 反例：文本一致时照常命中
-        let got = matched_translations(&slots, &[unit("pS1-b0-r0c0", "格文本")], &map);
+        // 反例：文本一致时照常命中（配对层不产 written——计数在改写分支）
+        let mut report2 = crate::writeback::WritebackReport::default();
+        let got = matched_translations(&slots, &[unit("pS1-b0-r0c0", "格文本")], &map, &mut report2);
         assert_eq!(got, vec![(0, "格译文".to_string())]);
+        assert_eq!(report2.written, 0);
+        assert!(report2.skipped.is_empty());
     }
 
     /// ref 换算双向：`AA`/`AZ`/`ZZ` 多字母列与解析侧 `col_from_ref` 互逆。
@@ -1430,5 +1507,199 @@ mod tests {
             assert_eq!(col_to_ref(col), want);
             assert_eq!(col_from_ref(&format!("{want}1")), col, "{want} 往返");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // 译文对（TranslationPair）源校验 + 回写报告
+    // -------------------------------------------------------------------------
+
+    /// 源校验金测①：格单元 `source` 与当前（④）文本一致 → 写入照常，
+    /// sheet XML 与无源形态（`source: None`）逐字节一致，报告相同——迁移
+    /// 不改变一致源的输出。
+    #[test]
+    fn source_match_writes_identical_to_unchecked() {
+        let dir = case_dir("src-match");
+        let in_path = dir.join("in.xlsx");
+        let sheet1 = worksheet(
+            concat!(
+                r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row>"#,
+                r#"<row r="2"><c r="A2" t="inlineStr"><is><t>华东</t></is></c></row>"#,
+            ),
+            "",
+        );
+        build_xlsx(
+            &in_path,
+            &[
+                ("xl/workbook.xml", WB_XML.to_string()),
+                ("xl/_rels/workbook.xml.rels", WB_RELS.to_string()),
+                ("xl/sharedStrings.xml", SST_XML.to_string()),
+                ("xl/worksheets/sheet1.xml", sheet1),
+            ],
+        );
+
+        // 单元流：共享串格 r0c0=名称、内联串格 r1c0=华东
+        let units = to_translation_units(&parse_doc(&in_path));
+        assert_eq!(
+            units.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+            ["pS1-b0-r0c0", "pS1-b0-r1c0"]
+        );
+
+        // ①侧源文本 = 提取侧单元文本（逐字一致）
+        let out_path = dir.join("out.xlsx");
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[("pS1-b0-r0c0", "名称", "[名称]"), ("pS1-b0-r1c0", "华东", "[华东]")],
+            BiStrategy::TranslationOnly,
+        );
+        let out_path_plain = dir.join("out-plain.xlsx");
+        let rep_plain = write(
+            &in_path,
+            &out_path_plain,
+            &[("pS1-b0-r0c0", "[名称]"), ("pS1-b0-r1c0", "[华东]")],
+            BiStrategy::TranslationOnly,
+        );
+
+        assert_eq!(
+            entry_bytes(&out_path, "xl/worksheets/sheet1.xml"),
+            entry_bytes(&out_path_plain, "xl/worksheets/sheet1.xml"),
+            "源一致：与无源形态逐字节等价"
+        );
+        assert_eq!(rep, rep_plain);
+        assert_eq!(rep.written, 2);
+        assert!(rep.skipped.is_empty());
+        assert_eq!(
+            table_rows(&out_path, 0),
+            vec![vec!["[名称]".to_string()], vec!["[华东]".to_string()]]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验金测②：格单元 `source` 与当前文本不一致（模拟①→④之间文件
+    /// 被改）→ 该格跳过：`<c>` 元素字节原样（共享串引用不动，重解析仍是
+    /// 原值），skipped 记 id 与原因；源一致的格照常 inlineStr 化。
+    #[test]
+    fn source_mismatch_keeps_shared_string_cell() {
+        let dir = case_dir("src-mismatch");
+        let in_path = dir.join("in.xlsx");
+        let sheet1 = worksheet(
+            r#"<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>"#,
+            "",
+        );
+        build_xlsx(
+            &in_path,
+            &[
+                ("xl/workbook.xml", WB_XML.to_string()),
+                ("xl/_rels/workbook.xml.rels", WB_RELS.to_string()),
+                ("xl/sharedStrings.xml", SST_XML.to_string()),
+                ("xl/worksheets/sheet1.xml", sheet1),
+            ],
+        );
+
+        let out_path = dir.join("out.xlsx");
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                // A1 ①侧记下的源文本与文件里现在的共享串不同（锚点指向了
+                // 别的文本——写下去就是静默错位写，必须拦下）
+                ("pS1-b0-r0c0", "提取时的旧表头", "[名称]"),
+                ("pS1-b0-r0c1", "数量", "[数量]"),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        assert_eq!(rep.written, 1, "只有源一致的格写入");
+        assert_eq!(
+            rep.skipped,
+            vec![(
+                "pS1-b0-r0c0".to_string(),
+                "源文本不一致（提取后文件已变更）".to_string()
+            )]
+        );
+
+        // 源不符的格保持共享串原值：`<c>` 字节原样、sharedStrings.xml 不动；
+        // 源一致的格照常替换
+        let out_sheet = entry_str(&out_path, "xl/worksheets/sheet1.xml");
+        assert!(out_sheet.contains(r#"<c r="A1" t="s"><v>0</v></c>"#), "{out_sheet}");
+        assert!(out_sheet.contains(r#"<c r="B1" t="inlineStr"><is><t>[数量]</t></is></c>"#));
+        assert_eq!(
+            entry_bytes(&in_path, "xl/sharedStrings.xml"),
+            entry_bytes(&out_path, "xl/sharedStrings.xml")
+        );
+        // 重解析：A1 仍是共享串原值
+        assert_eq!(
+            table_rows(&out_path, 0),
+            vec![vec!["名称".to_string(), "[数量]".to_string()]]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数金测：整数格（文本相等 → 改写分支可写判据拦截）与日期格
+    /// （XML 形态 ≠ 格式化串 → 文本守卫按不可写归因类型守卫）的译文都记
+    /// skipped；字符格写入计 written——计数逐项对账。
+    #[test]
+    fn report_counts_numeric_guard_skips() {
+        let dir = case_dir("report");
+        let in_path = dir.join("in.xlsx");
+        let sheet1 = worksheet(
+            concat!(
+                r#"<row r="1"><c r="A1" t="inlineStr"><is><t>华东</t></is></c><c r="B1" t="n"><v>220</v></c></row>"#,
+                r#"<row r="2"><c r="A2" s="1" t="n"><v>45292</v></c></row>"#,
+            ),
+            "",
+        );
+        build_xlsx(
+            &in_path,
+            &[
+                ("xl/workbook.xml", WB_XML.to_string()),
+                ("xl/_rels/workbook.xml.rels", WB_RELS.to_string()),
+                ("xl/styles.xml", STYLES_XML.to_string()),
+                ("xl/worksheets/sheet1.xml", sheet1),
+            ],
+        );
+
+        // 单元流：华东（字符格）、220（数字格规整串）、日期（格式化串）
+        let units = to_translation_units(&parse_doc(&in_path));
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].text, "华东");
+        assert_eq!(units[1].text, "220");
+        assert!(units[2].text.contains("24"), "日期格按解析侧格式化：{}", units[2].text);
+
+        // 三格全喂译文（源 = 单元文本）：两格数值类应被守卫拦下
+        let pairs: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), u.text.clone(), format!("[{}]", u.text)).into())
+            .collect();
+        let out_path = dir.join("out.xlsx");
+        let report = writeback_xlsx(&in_path, &pairs, BiStrategy::TranslationOnly, &out_path).unwrap();
+
+        assert_eq!(report.written, 1, "只有字符格写入");
+        assert_eq!(
+            report.skipped,
+            vec![
+                // 日期格：配对阶段文本守卫即不等（XML 形态 vs 格式化串），
+                // 不可写 → 归因类型守卫
+                (
+                    "pS1-b0-r1c0".to_string(),
+                    "数值/日期/布尔/错误格不可写（类型守卫）".to_string()
+                ),
+                // 整数格：文本守卫相等，改写分支可写判据拦截
+                (
+                    "pS1-b0-r0c1".to_string(),
+                    "数值/日期/布尔/错误格不可写（类型守卫）".to_string()
+                ),
+            ]
+        );
+
+        // 落盘对账：字符格替换、数值/日期格字节原样
+        let out_sheet = entry_str(&out_path, "xl/worksheets/sheet1.xml");
+        assert!(out_sheet.contains(r#"<c r="A1" t="inlineStr"><is><t>[华东]</t></is></c>"#), "{out_sheet}");
+        assert!(out_sheet.contains(r#"<c r="B1" t="n"><v>220</v></c>"#));
+        assert!(out_sheet.contains(r#"<c r="A2" s="1" t="n"><v>45292</v></c>"#));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

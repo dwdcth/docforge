@@ -5,6 +5,10 @@
 //! - 测试可注入 mock（金测不依赖模型缓存）；
 //! - 其它引擎（Paddle/Tesseract 绑定）无需改 pdf 后端即可接入。
 //!
+//! 批量入口：[`OcrEngine::recognize_batch`] 带默认实现（逐图循环
+//! recognize），引擎可覆写吃批红利（GPU batch inference）；pdf 后端经
+//! `PdfOptions::ocr_batch` 消费（吞吐 vs 首页延迟旋钮）。
+//!
 //! `ocr-oar` feature 提供 oar-ocr 默认实现（`oar` 模块）。
 
 pub mod images;
@@ -46,6 +50,7 @@ impl RecognizedLine {
 /// OCR 引擎：整页 RGBA 图像 → 识别行集合（行序即引擎输出序）。
 ///
 /// 实现须 `Send + Sync`（docforge 全同步 API，引擎内部自行串行化 session 访问）。
+/// 批量吞吐见 [`Self::recognize_batch`]（默认实现，可不覆写）。
 pub trait OcrEngine: Send + Sync {
     /// 引擎名（诊断/日志用，如 "oar-ocr pp-ocrv6-small"）。
     fn name(&self) -> &str;
@@ -56,6 +61,21 @@ pub trait OcrEngine: Send + Sync {
         &self,
         image: &image::RgbaImage,
     ) -> std::result::Result<Vec<RecognizedLine>, String>;
+
+    /// 批量识别（默认实现 = 逐图调 [`Self::recognize`]，首个错误即返回）。
+    /// 引擎侧可覆写吃批红利（GPU batch inference：oar/Paddle 类引擎一次
+    /// 前向多图，吞吐常显著高于逐图）。`images` 与返回的 Vec 按位对应。
+    ///
+    /// # 契约
+    /// 覆写侧必须与逐图调用结果一致——同一图在批内/批外产出相同行集（默认
+    /// 实现天然满足）；pdf 后端按此契约把批结果按位组装回各页，不做批间
+    /// 混排，逐页等价性由此保证。
+    fn recognize_batch(
+        &self,
+        images: &[&image::RgbaImage],
+    ) -> std::result::Result<Vec<Vec<RecognizedLine>>, String> {
+        images.iter().map(|im| self.recognize(im)).collect()
+    }
 }
 
 #[cfg(test)]

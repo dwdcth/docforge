@@ -45,7 +45,7 @@
 //!
 //! * push 阶段译文**零驻留**：每条译文以定长帧追加进 spill 临时文件后即弃
 //!   （每帧直写无缓冲，`push` 返回时字节已在盘上）；
-//! * finish 阶段**单份译文全集驻留**：回放组装 `Vec<(String, String)>` 交给
+//! * finish 阶段**单份译文全集驻留**：回放组装 `Vec<TranslationPair>` 交给
 //!   回写器。这是容器格式的现实——docx / epub / odt 是 zip 重打包、xml 单
 //!   件改写器也是一次性吃全集的既有 API，真·逐条增量落盘只对 txt / md
 //!   可行，v1 不做；API 形状已留出（`finish` 之外的增量出口未来加
@@ -53,11 +53,12 @@
 //!
 //! # spill 帧格式与防护
 //!
-//! 临时文件 `temp_dir()/docforge-wb-{pid}-{unix纳秒}.spill`；帧 =
-//! `(u32 LE id 字节数, id UTF-8 字节, u32 LE 译文字节数, 译文 UTF-8 字节)`。
-//! 单帧（id / 译文各计）上限 [`MAX_FRAME_BYTES`]：写侧超限当场拒绝，读侧
-//! 超限 / 截断 / 非 UTF-8 报 `corrupt`——防损坏文件的长度头炸内存。`Drop`
-//! 兜底删除 spill；`finish` 成败路径都删（Drop 对已删文件静默）。
+//! 临时文件 `temp_dir()/docforge-wb-{pid}-{unix纳秒}.spill`；每条记录 =
+//! **三帧** `(u32 LE 字节数 + UTF-8 字节)` 依次为 id、①侧源文本（空串 =
+//! 不校验，即 [`crate::emit::TranslationPair::source`] 为 `None`）、译文。
+//! 单帧上限 [`MAX_FRAME_BYTES`]：写侧超限当场拒绝，读侧超限 / 截断 /
+//! 非 UTF-8 报 `corrupt`——防损坏文件的长度头炸内存。`Drop` 兜底删除
+//! spill；`finish` 成败路径都删（Drop 对已删文件静默）。
 //!
 //! # 契约
 //!
@@ -219,18 +220,41 @@ impl WritebackSession {
         })
     }
 
-    /// 喂入一条译文（id = [`crate::emit::to_translation_units`] 的锚点）。
-    /// 空白译文静默忽略（与 `translation_map` 口径一致）；返回已接受总条数。
+    /// 喂入一条译文（id = [`crate::emit::to_translation_units`] 的锚点，
+    /// 不携带①侧源文本——回写不校验源一致性）。
+    /// 空白译文静默忽略（与回写器口径一致）；返回已接受总条数。
     /// 译文按帧追加落盘即弃——本调用不驻留译文 RAM。
     pub fn push(&mut self, id: &str, translation: &str) -> Result<usize> {
+        self.push_raw(id, None, translation)
+    }
+
+    /// [`Self::push`] 的带源校验形态：①侧源文本随译文落盘，回写器写入前
+    /// 校验它与当前（④）文本逐字一致，不一致跳过并记
+    /// [`super::WritebackReport`]（①→④ 文件变更边界，见
+    /// [`crate::emit::TranslationPair`] 的类型文档）。
+    pub fn push_with_source(
+        &mut self,
+        id: &str,
+        source: &str,
+        translation: &str,
+    ) -> Result<usize> {
+        self.push_raw(id, Some(source), translation)
+    }
+
+    /// 帧落盘的公共实现：id / 源（`None` 记空串帧）/ 译文三帧。
+    fn push_raw(&mut self, id: &str, source: Option<&str>, translation: &str) -> Result<usize> {
         if translation.trim().is_empty() {
             return Ok(self.accepted);
         }
+        let src_bytes = source.unwrap_or("").as_bytes();
         let id_bytes = id.as_bytes();
         let tr_bytes = translation.as_bytes();
-        if id_bytes.len() > MAX_FRAME_BYTES || tr_bytes.len() > MAX_FRAME_BYTES {
+        if id_bytes.len() > MAX_FRAME_BYTES
+            || tr_bytes.len() > MAX_FRAME_BYTES
+            || src_bytes.len() > MAX_FRAME_BYTES
+        {
             return Err(DocError::corrupt(format!(
-                "spill 帧超限（id/译文各上限 {MAX_FRAME_BYTES} 字节）"
+                "spill 帧超限（id/源/译文各上限 {MAX_FRAME_BYTES} 字节）"
             )));
         }
         let w = self
@@ -238,14 +262,17 @@ impl WritebackSession {
             .as_mut()
             .ok_or_else(|| DocError::corrupt("spill 写柄已关闭"))?;
         write_frame(w, id_bytes)?;
+        write_frame(w, src_bytes)?;
         write_frame(w, tr_bytes)?;
         self.accepted += 1;
         Ok(self.accepted)
     }
 
-    /// 回放 spill → 组 (id, 译文) 列表（重复 id 后者胜，HashMap 语义）→
-    /// 分发到对应回写器。成败路径都删除 spill（`Drop` 兜底二次删除静默）。
-    pub fn finish(mut self) -> Result<()> {
+    /// 回放 spill → 组 [`crate::emit::TranslationPair`] 列表（重复 id 后者
+    /// 胜，HashMap 语义）→ 分发到对应回写器，透传其
+    /// [`super::WritebackReport`]。成败路径都删除 spill（`Drop` 兜底二次
+    /// 删除静默）。
+    pub fn finish(mut self) -> Result<super::WritebackReport> {
         let outcome = self.finish_inner();
         drop(self.spill.take()); // 先关写柄再删（删打开中的文件在部分平台失败）
         let _ = std::fs::remove_file(&self.spill_path);
@@ -254,7 +281,7 @@ impl WritebackSession {
 
     /// finish 的实际工作：刷净写柄 → 回放 → 按格式分发（各回写器与全量
     /// API 同一入口，语义零分叉）。
-    fn finish_inner(&mut self) -> Result<()> {
+    fn finish_inner(&mut self) -> Result<super::WritebackReport> {
         if let Some(w) = self.spill.as_mut() {
             w.flush()
                 .map_err(|e| DocError::corrupt(format!("spill flush 失败: {e}")))?;
@@ -310,15 +337,21 @@ impl WritebackSession {
 
     /// Markdown 回写：提取侧同管线（`WholeTextParseCapability` + `MarkdownPlugin`，
     /// engine 装配 md 的同一组合）重解析 → [`crate::emit::to_bilingual_markdown_with`]
-    /// 纯文本重组 → 写文件。
+    /// 纯文本重组 → 写文件。md 是纯重组（无守卫/无跳过），报告口径 =
+    /// 非空白译文条数全部计入 `written`。
     #[cfg(feature = "md")]
-    fn finish_markdown(&self, pairs: &[(String, String)]) -> Result<()> {
+    fn finish_markdown(&self, pairs: &[crate::emit::TranslationPair]) -> Result<super::WritebackReport> {
         let raw = WholeTextParseCapability { id: "text.read.md", fmt: "md" }
             .parse(&self.in_path)?;
         let doc = MarkdownPlugin.assemble(&raw);
         let md = crate::emit::to_bilingual_markdown_with(&doc, pairs, self.strategy);
         std::fs::write(&self.out_path, md)
-            .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", self.out_path.display())))
+            .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", self.out_path.display())))?;
+        let written = pairs
+            .iter()
+            .filter(|p| !p.translation.trim().is_empty())
+            .count();
+        Ok(super::WritebackReport { written, skipped: Vec::new() })
     }
 }
 
@@ -370,16 +403,20 @@ fn read_frame(r: &mut File) -> Result<Option<String>> {
         .map_err(|_| DocError::corrupt("spill 帧非 UTF-8（文件可能损坏）"))
 }
 
-/// 回放 spill：逐帧读回 (id, 译文) 对，保持投递序（重复 id 后者胜——交由
-/// 回写器侧 translation_map 的 HashMap 语义收敛）。
-fn replay(spill_path: &Path) -> Result<Vec<(String, String)>> {
+/// 回放 spill：逐条读回 [`crate::emit::TranslationPair`]（id / 源 / 译文
+/// 三帧；源空串 = `None`），保持投递序（重复 id 后者胜——交由回写器侧
+/// `pair_map` 的 HashMap 语义收敛）。
+fn replay(spill_path: &Path) -> Result<Vec<crate::emit::TranslationPair>> {
     let mut r = File::open(spill_path)
         .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", spill_path.display())))?;
     let mut pairs = Vec::new();
     while let Some(id) = read_frame(&mut r)? {
+        let source = read_frame(&mut r)?
+            .ok_or_else(|| DocError::corrupt("spill 帧截断：id 有源无译文"))?;
         let tr = read_frame(&mut r)?
-            .ok_or_else(|| DocError::corrupt("spill 帧截断：id 有译文无"))?;
-        pairs.push((id, tr));
+            .ok_or_else(|| DocError::corrupt("spill 帧截断：源有译文无"))?;
+        let source = if source.is_empty() { None } else { Some(source) };
+        pairs.push(crate::emit::TranslationPair { id, translation: tr, source });
     }
     Ok(pairs)
 }
@@ -405,8 +442,10 @@ mod tests {
         dir
     }
 
-    fn pairs_of(tr: &[(&str, &str)]) -> Vec<(String, String)> {
-        tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    fn pairs_of(tr: &[(&str, &str)]) -> Vec<crate::emit::TranslationPair> {
+        tr.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect()
     }
 
     /// temp 目录里 `docforge-wb-{pid}-*.spill` 前缀的现存文件。
@@ -471,13 +510,13 @@ mod tests {
         assert_eq!(accepted, units.len() + 1);
         session.finish().unwrap();
 
-        // 直接路径：同一份 (id, 译文) 全集（含重复 id 与未匹配 id）
-        let mut direct: Vec<(String, String)> = units
+        // 直接路径：同一份译文对全集（含重复 id 与未匹配 id）
+        let mut direct: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("EN: {}", u.text)))
+            .map(|u| (u.id.clone(), format!("EN: {}", u.text)).into())
             .collect();
-        direct.push((last_id.clone(), "EN(revised): The final line.".into()));
-        direct.push(("p0-b999".into(), "bogus".into()));
+        direct.push((last_id.clone(), "EN(revised): The final line.".to_string()).into());
+        direct.push(("p0-b999".to_string(), "bogus".to_string()).into());
         let out_direct = dir.join("out-direct.txt");
         writeback_txt(&in_path, &direct, BiStrategy::BilingualInline, &out_direct).unwrap();
 
@@ -523,9 +562,9 @@ mod tests {
         }
         session.finish().unwrap();
 
-        let direct: Vec<(String, String)> = units
+        let direct: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("EN: {}", u.text)))
+            .map(|u| (u.id.clone(), format!("EN: {}", u.text)).into())
             .collect();
         let want = crate::emit::to_bilingual_markdown_with(&doc, &direct, BiStrategy::BilingualInline);
         assert_eq!(
@@ -920,10 +959,10 @@ mod tests {
 
         // 直接路径：同一份 (id, 译文) 全集 → 两者重解析逐块一致
         let out_direct = dir.join("out-direct.xlsx");
-        let direct: Vec<(String, String)> = units
+        let direct: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
-            .chain([("pX-b99".to_string(), "bogus".to_string())])
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
+            .chain([("pX-b99".to_string(), "bogus".to_string()).into()])
             .collect();
         writeback_xlsx(&in_path, &direct, BiStrategy::TranslationOnly, &out_direct).unwrap();
 

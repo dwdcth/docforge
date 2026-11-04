@@ -22,7 +22,11 @@
 //! # 对齐契约（与回写侧同口径）
 //!
 //! * 译文查找语义与 writeback 一致：id 精确匹配、重复 id 后者胜（HashMap）、
-//!   空白译文视为未提供（复用 [`super::translation_map`]）；
+//!   空白译文视为未提供（复用 [`super::pair_map`]）；
+//! * 消费侧自洽校验：译文对携带的①侧源文本（[`crate::emit::TranslationPair`]
+//!   的 `source`，`Some` 时）与本单元文本（trim 后）不一致 → 该条不收——
+//!   对照与原文对不上说明译文不是依据本单元文本产生（提取后文件已变），
+//!   写进附录就是错位事实（与 writeback 侧源校验同口径；`None` = 不校验）；
 //! * 未命中的单元不收——原 PDF 本来就不动，缺译文即该处无对照；
 //! * 不做 kind 过滤：凡 [`crate::emit::to_translation_units`] 发出的单元
 //!   （段落 / 标题 / 列表 / 表格单元格……）都进序列，消费者按需取舍。
@@ -62,6 +66,8 @@ pub struct AppendixPage {
 ///
 /// * 页组按首次命中序排列（即文档序），同页单元合入同组、组内保持文档序；
 /// * 未命中 / 空白译文的单元不收；无命中的页不产空组——空结果 = 无一命中；
+/// * 消费侧自洽校验：`pair.source` 为 `Some` 且与单元文本（trim 后）不一致
+///   的条目不收（附录无报告结构，静默跳过；`None` = 不校验，二元组形态）；
 /// * `running = true` 的单元（跨页重复的页眉/页脚类内容，检测见
 ///   `plugins::running_detect`）默认不进附录：同一页眉的译文以每页一条
 ///   重复灌满附录正是本模块要防的形态。附录是 docforge 自产工件，默认
@@ -71,9 +77,9 @@ pub struct AppendixPage {
 /// * `original` 取单元原文（零失真）；`translation` 裁剪首尾空白后收下。
 pub fn to_appendix_pages(
     units: &[TranslationUnit],
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
 ) -> Vec<AppendixPage> {
-    let map = super::translation_map(translated);
+    let map = super::pair_map(pairs);
     let mut pages: Vec<AppendixPage> = Vec::new();
     // 页名 → 页组下标（同名页合入同组；首次命中即建组，保持文档序）
     let mut index: std::collections::HashMap<Option<&str>, usize> =
@@ -82,12 +88,19 @@ pub fn to_appendix_pages(
         if unit.running {
             continue; // 跨页重复（页眉/页脚类）：默认不进附录（口径见上）
         }
-        let Some(tr) = map.get(unit.id.as_str()).copied() else {
+        let Some((tr, src)) = map.get(unit.id.as_str()).copied() else {
             continue; // 未命中：不收
         };
         let tr = tr.trim();
         if tr.is_empty() {
             continue; // 空白译文视为未提供（后者胜之后再判，口径见上）
+        }
+        // 消费侧自洽校验：译文对携带的①源文本与本单元文本不一致 → 不收
+        //（对照与原文对不上 = 提取后文本已变；附录无报告结构，静默不收）
+        if let Some(src) = src {
+            if src.trim() != unit.text.trim() {
+                continue;
+            }
         }
         let key = unit.page.as_deref();
         let idx = *index.entry(key).or_insert_with(|| {
@@ -198,10 +211,10 @@ mod tests {
 
         // 单元 0/1/3 给译文（半数命中口径），单元 2 不给；外加错锚一条
         let translated = vec![
-            (units[0].id.clone(), format!("译-{}", units[0].text)),
-            (units[1].id.clone(), format!("译-{}", units[1].text)),
-            (units[3].id.clone(), format!("译-{}", units[3].text)),
-            ("p9-b9".to_string(), "错锚不收".to_string()),
+            (units[0].id.clone(), format!("译-{}", units[0].text)).into(),
+            (units[1].id.clone(), format!("译-{}", units[1].text)).into(),
+            (units[3].id.clone(), format!("译-{}", units[3].text)).into(),
+            ("p9-b9".to_string(), "错锚不收".to_string()).into(),
         ];
         let pages = to_appendix_pages(&units, &translated);
 
@@ -242,9 +255,9 @@ mod tests {
         .unwrap();
         let units = units_of(&path);
         assert_eq!(units[1].text, "心悦君兮\n君不知。");
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)).into())
             .collect();
         let md = to_appendix_markdown(&to_appendix_pages(&units, &translated));
         assert_eq!(
@@ -263,13 +276,13 @@ mod tests {
     /// 空输入 / 全未命中 → 空 Vec / 空串；无条目页在 markdown 中跳过。
     #[test]
     fn empty_and_all_miss_yield_empty() {
-        assert!(to_appendix_pages(&[], &[("p0-b0".into(), "译".into())]).is_empty());
+        assert!(to_appendix_pages(&[], &[("p0-b0".into(), "译".into()).into()]).is_empty());
         assert_eq!(to_appendix_markdown(&[]), "");
 
         let path = case_dir("empty").join("in.srt");
         std::fs::write(&path, SRT).unwrap();
         let units = units_of(&path);
-        let miss = vec![("p9-b9".to_string(), "全错锚".to_string())];
+        let miss = vec![("p9-b9".to_string(), "全错锚".to_string()).into()];
         let pages = to_appendix_pages(&units, &miss);
         assert!(pages.is_empty(), "全未命中：无页组");
         assert_eq!(to_appendix_markdown(&pages), "");
@@ -293,11 +306,11 @@ mod tests {
         assert_eq!(units[0].page.as_deref(), Some("0"), "无名页 → 页序兜底");
 
         let translated = vec![
-            (units[0].id.clone(), "前者。".to_string()),
-            (units[0].id.clone(), "后者。".to_string()), // 重复 id：后者胜
-            (units[1].id.clone(), "   \n\t ".to_string()), // 空白译文：忽略
-            (units[2].id.clone(), "先到译。".to_string()),
-            (units[2].id.clone(), "   ".to_string()), // 胜者空白 → 未提供
+            (units[0].id.clone(), "前者。".to_string()).into(),
+            (units[0].id.clone(), "后者。".to_string()).into(), // 重复 id：后者胜
+            (units[1].id.clone(), "   \n\t ".to_string()).into(), // 空白译文：忽略
+            (units[2].id.clone(), "先到译。".to_string()).into(),
+            (units[2].id.clone(), "   ".to_string()).into(), // 胜者空白 → 未提供
         ];
         let pages = to_appendix_pages(&units, &translated);
 
@@ -364,9 +377,9 @@ mod tests {
         assert_eq!(units.len(), 2);
         assert!(units[0].running, "标记块的单元 running=true（emit 层复制）");
 
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<crate::emit::TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)).into())
             .collect();
         let pages = to_appendix_pages(&units, &translated);
         assert_eq!(pages.len(), 1, "running 单元被跳过：只余正文单元的页组");
@@ -376,5 +389,50 @@ mod tests {
         assert_eq!(pages[0].entries[0].translation, "译-正文一段。");
         let md = to_appendix_markdown(&pages);
         assert!(md.contains("译-正文一段。") && !md.contains("译-季度运营报告"));
+    }
+
+    /// 源校验（消费侧自洽）金测：`source` 与单元文本一致的三元组与二元组
+    /// 形态逐字节等价（页组与条目完全一致）；`source` 不一致（构造：提取后
+    /// 改 pair.source 为别串）的条目不收，其余条目照收；`None` 不校验。
+    #[test]
+    fn source_mismatch_entries_not_collected() {
+        let path = case_dir("srccheck").join("in.srt");
+        std::fs::write(&path, SRT).unwrap();
+        let units = units_of(&path);
+
+        let tuples: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)).into())
+            .collect();
+        let with_src: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), u.text.clone(), format!("译-{}", u.text)).into())
+            .collect();
+        assert_eq!(
+            to_appendix_pages(&units, &tuples),
+            to_appendix_pages(&units, &with_src),
+            "一致源与 None（二元组）形态逐字节等价"
+        );
+
+        // 源不一致：该单元不收（对照与原文对不上 = 提取后文本已变）
+        let mut drifted = with_src;
+        drifted[1] = (
+            units[1].id.clone(),
+            "提取后改过的别串".to_string(),
+            "译-漂移".to_string(),
+        )
+            .into();
+        let pages = to_appendix_pages(&units, &drifted);
+        assert_eq!(
+            pages.iter().map(|p| p.entries.len()).sum::<usize>(),
+            units.len() - 1,
+            "仅源不一致的条目不收"
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.entries.iter().all(|e| e.unit_id != units[1].id)),
+            "源不一致条目不进任何页组"
+        );
     }
 }

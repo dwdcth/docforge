@@ -24,6 +24,9 @@
 //!     裸 `<image>` 不产 item（提取侧同口径）。
 //! * 双保险：每个定位到的槽位文本与权威单元文本一致性比对，不一致跳过
 //!   （宁漏勿错）；未匹配 id / 空白译文一律忽略。
+//! * ①→④ 源校验：`TranslationPair.source`（① 侧源文本）非 None 时写入前
+//!   与当前（④）文本比对，不一致跳过该单元并记 `WritebackReport`（函数
+//!   返回 written / skipped 报告——「宁漏勿错」的可见化）。
 //! * OriginalPlusAppendix：正文不动，主文 `</body>` 前追加
 //!   `<section><title><p>译文</p></title>…</section>`（重解析自开新页）。
 //!
@@ -42,22 +45,23 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{apply_edits, Edit, escape_xml_text, translation_map};
+use super::{apply_edits, Edit, escape_xml_text, pair_map};
 
 /// section 递归上限（与提取侧 [`crate::backends::fb2`] 同值：只防病态嵌套）。
 const MAX_SECTION_DEPTH: u8 = 32;
 /// epigraph/cite 容器递归上限（同上）。
 const MAX_FLOW_DEPTH: u8 = 8;
 
-/// fb2 双语回写：见模块级文档。`translated` 的 id 与
+/// fb2 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径；未匹配 / 空白译文条目忽略；
-/// 失败返回 `corrupt`。
+/// `pair.source` 携带①侧源文本时写入前校验，不一致跳过并记报告（见
+/// [`crate::emit::TranslationPair`]）；失败返回 `corrupt`。
 pub fn writeback_fb2(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -85,7 +89,8 @@ pub fn writeback_fb2(
         // 单元流同步排除，表格在 XML 里保持原样。
         .filter(|u| u.kind != crate::model::BlockKind::Table)
         .collect();
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = crate::writeback::WritebackReport::default();
 
     // B. 主文 body 重扫描（提取侧遍历的镜像，带字节锚点）
     let xml = String::from_utf8(bytes).expect("UTF-8 已校验");
@@ -121,22 +126,48 @@ pub fn writeback_fb2(
             let unit = &units[cursor];
             cursor += 1;
             let slot = &slots[b_idx];
-            // 双保险：重扫描文本必须与权威单元文本一致
+            // 双保险：重扫描文本必须与权威单元文本一致（有译文的记报告——
+            // 无译文是正常未翻译，不是跳过）
             if slot.text != unit.text {
+                if has_translation(&map, &unit.id) {
+                    report.skip(unit.id.clone(), "文本守卫不一致");
+                }
                 continue;
             }
-            let Some(tr) = map.get(unit.id.as_str()) else {
+            let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
                 continue;
             };
             let tr = tr.trim();
             if tr.is_empty() {
                 continue;
             }
-            matched.push(tr.to_string());
+            // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+            //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+            if let Some(src) = src_opt {
+                if src.trim() != unit.text.trim() {
+                    report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                    continue;
+                }
+            }
             match strategy {
-                BiStrategy::BilingualInline => inline_edit(&slot.anchor, tr, &mut edits),
-                BiStrategy::TranslationOnly => tonly_edits(&slot.anchor, tr, &mut edits),
-                BiStrategy::OriginalPlusAppendix => {}
+                BiStrategy::BilingualInline => {
+                    if inline_edit(&slot.anchor, tr, &mut edits) {
+                        report.written += 1;
+                    } else {
+                        // poem 内不允许 <p>（fb2 内容模型）：非法插段，宁漏勿错
+                        report.skip(unit.id.clone(), "结构限制（poem 内不允许插段）");
+                    }
+                }
+                BiStrategy::TranslationOnly => {
+                    if tonly_edits(&slot.anchor, tr, &mut edits) {
+                        report.written += 1;
+                    }
+                }
+                // 附录：译文进 matched（主文 </body> 前追加 section），计一次写入
+                BiStrategy::OriginalPlusAppendix => {
+                    matched.push(tr.to_string());
+                    report.written += 1;
+                }
             }
         }
     }
@@ -160,31 +191,46 @@ pub fn writeback_fb2(
         apply_edits(&xml, edits)
     };
     std::fs::write(out, out_xml.into_bytes())
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))
+        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    Ok(report)
+}
+
+/// 该单元是否带**非空白译文**：报告的 `skipped` 只收「有译文但没写」——
+/// 无译文是正常未翻译，不是跳过（与 `pair_map`「空白译文忽略」同口径）。
+fn has_translation(
+    map: &std::collections::HashMap<&str, (&str, Option<&str>)>,
+    id: &str,
+) -> bool {
+    map.get(id).is_some_and(|(tr, _)| !tr.trim().is_empty())
 }
 
 /// BilingualInline 的锚点编辑：能在同级合法放 `<p>` 的锚点才插（宁漏勿错）。
-fn inline_edit(anchor: &Anchor, tr: &str, edits: &mut Vec<Edit>) {
+/// 返回是否实际插入（poem 内部锚点不合法 → false，调用方记结构跳过）。
+fn inline_edit(anchor: &Anchor, tr: &str, edits: &mut Vec<Edit>) -> bool {
     let esc = escape_xml_text(tr);
     match anchor {
         Anchor::Inline { after, p_ok, .. } if *p_ok => {
             edits.push(Edit::Insert(*after, format!("<p>{esc}</p>")));
+            true
         }
         Anchor::Title { after, p_ok, .. } if *p_ok => {
             edits.push(Edit::Insert(*after, format!("<p>{esc}</p>")));
+            true
         }
-        _ => {} // poem 内部（stanza / text-author / poem 标题）或无锚：跳过
+        _ => false, // poem 内部（stanza / text-author / poem 标题）或无锚：跳过
     }
 }
 
 /// TranslationOnly 的锚点编辑：Inline 换元素内文本；Title/Stanza 首 span 换
-/// 译文、其余清空（保留元素结构）。
-fn tonly_edits(anchor: &Anchor, tr: &str, edits: &mut Vec<Edit>) {
+/// 译文、其余清空（保留元素结构）。返回是否实际产生了编辑。
+fn tonly_edits(anchor: &Anchor, tr: &str, edits: &mut Vec<Edit>) -> bool {
+    let mut wrote = false;
     match anchor {
         Anchor::Inline { inner, .. } => {
             let (s, e) = *inner;
             if s < e {
                 edits.push(Edit::Replace(s, e, escape_xml_text(tr)));
+                wrote = true;
             }
         }
         Anchor::Title { spans, .. } | Anchor::Stanza { spans } => {
@@ -197,10 +243,12 @@ fn tonly_edits(anchor: &Anchor, tr: &str, edits: &mut Vec<Edit>) {
                 } else {
                     edits.push(Edit::Replace(*s, *e, String::new()));
                 }
+                wrote = true;
             }
         }
         Anchor::None => {}
     }
+    wrote
 }
 
 // ---------------------------------------------------------------------------
@@ -891,10 +939,32 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_fb2(in_path, &translated, strategy, out_path).unwrap();
+    /// (id, 译文) 二元组回写（`From<(String, String)>` = 无源校验形态），
+    /// 返回报告（多数用例不断言报告，忽略返回值即可）。
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string()).into()).collect();
+        writeback_fb2(in_path, &pairs, strategy, out_path).unwrap()
+    }
+
+    /// (id, ①源文本, 译文) 三元组回写（`From<(String, String, String)>` =
+    /// 带源校验形态），返回报告。
+    fn write_src(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> = tr
+            .iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()).into())
+            .collect();
+        writeback_fb2(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     /// 金测（核心验收）：BilingualInline 往返 —— 卷首/章/嵌套节/小标题的
@@ -1111,7 +1181,7 @@ mod tests {
         }
         let err = writeback_fb2(
             &zip_path,
-            &[("p第一章-b1".to_string(), "x".to_string())],
+            &[("p第一章-b1".to_string(), "x".to_string()).into()],
             BiStrategy::BilingualInline,
             dir.join("zip-out.fb2"),
         )
@@ -1131,6 +1201,132 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code.as_str(), "corrupt");
         assert!(err.message.contains("UTF-8"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 译文对（TranslationPair）源校验 + 回写报告
+    // -------------------------------------------------------------------------
+
+    /// 源校验金测①：`source` 与当前（④）文本一致 → 写入照常，输出与无源
+    /// 形态（`source: None`）逐字节一致，报告相同——迁移不改变一致源的输出。
+    #[test]
+    fn source_match_writes_identical_to_unchecked() {
+        let dir = case_dir("src-match");
+        let in_path = dir.join("in.fb2");
+        std::fs::write(&in_path, book_xml()).unwrap();
+        let out_path = dir.join("out.fb2");
+        let out_path_plain = dir.join("out-plain.fb2");
+
+        // ①侧源文本 = 提取侧单元文本（逐字一致）
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                ("p测试之书-b1", "卷首语。", "Epigraph text."),
+                ("p第一章-b1", "第一章正文一段。", "First paragraph."),
+            ],
+            BiStrategy::BilingualInline,
+        );
+        let rep_plain = write(
+            &in_path,
+            &out_path_plain,
+            &[
+                ("p测试之书-b1", "Epigraph text."),
+                ("p第一章-b1", "First paragraph."),
+            ],
+            BiStrategy::BilingualInline,
+        );
+
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            std::fs::read(&out_path_plain).unwrap(),
+            "源一致：与无源形态逐字节等价"
+        );
+        assert_eq!(rep, rep_plain);
+        assert_eq!(rep.written, 2);
+        assert!(rep.skipped.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验金测②：`source` 与当前文本不一致（模拟①→④之间文件被改）→
+    /// 该单元跳过（原文保留，不写入），skipped 记 id 与原因；源一致的单元
+    /// 照常写入。
+    #[test]
+    fn source_mismatch_skips_and_reports() {
+        let dir = case_dir("src-mismatch");
+        let in_path = dir.join("in.fb2");
+        std::fs::write(&in_path, book_xml()).unwrap();
+        let out_path = dir.join("out.fb2");
+
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                // ①侧记下的源文本与文件里现在的文本不同（锚点在新文件里
+                // 指向别处——写下去就是静默错位写，必须拦下）
+                ("p第一章-b1", "被改过的旧文本", "First paragraph."),
+                ("p第一章-b2", "第一章正文二段。", "Second paragraph."),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        assert_eq!(rep.written, 1, "只有源一致的单元写入");
+        assert_eq!(
+            rep.skipped,
+            vec![(
+                "p第一章-b1".to_string(),
+                "源文本不一致（提取后文件已变更）".to_string()
+            )]
+        );
+
+        // 跳过单元的原文保留；一致单元照常替换
+        let doc = parse_doc(&out_path);
+        let p1 = &doc.pages[1];
+        assert_eq!(p1.blocks[1].content, "第一章正文一段。", "源不一致：原文不动");
+        assert_eq!(p1.blocks[2].content, "Second paragraph.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数金测：poem stanza 在 BilingualInline 下不允许插 `<p>`
+    /// （fb2 内容模型）→ 结构跳过记因；可插单元照常写入；计数逐项对账。
+    #[test]
+    fn report_counts_poem_structural_skip() {
+        let dir = case_dir("report");
+        let in_path = dir.join("in.fb2");
+        std::fs::write(&in_path, book_xml()).unwrap();
+        let out_path = dir.join("out.fb2");
+
+        // p第二章-b1 = stanza（poem 内不允许 <p>）；p第二章-b2 = 尾段
+        let rep = write(
+            &in_path,
+            &out_path,
+            &[("p第二章-b1", "One couplet."), ("p第二章-b2", "Final paragraph.")],
+            BiStrategy::BilingualInline,
+        );
+
+        assert_eq!(rep.written, 1, "只有尾段插入");
+        assert_eq!(
+            rep.skipped,
+            vec![(
+                "p第二章-b1".to_string(),
+                "结构限制（poem 内不允许插段）".to_string()
+            )]
+        );
+
+        // stanza 原文保留（宁漏勿错）；尾段照常插入
+        let doc = parse_doc(&out_path);
+        assert_eq!(
+            doc.pages[2]
+                .blocks
+                .iter()
+                .map(|b| b.content.as_str())
+                .collect::<Vec<_>>(),
+            ["第二章", "白日依山尽\n黄河入海流", "第二章尾段。", "Final paragraph."]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

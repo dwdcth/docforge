@@ -130,13 +130,36 @@ pub(crate) fn apply_edits(xml: &str, edits: Vec<Edit>) -> String {
     out
 }
 
-/// id → 译文的查找表：重复 id 后者胜（HashMap 语义），未匹配 id 由调用方忽略。
-/// 空白译文视为「未提供」，同样忽略（避免插入空段 / 清空原文）。
-pub(crate) fn translation_map(translated: &[(String, String)]) -> std::collections::HashMap<&str, &str> {
-    translated
+/// [`crate::emit::TranslationPair`] 的查找表：值 =（译文, ①侧源文本）。
+/// 重复 id 后者胜、空白译文忽略——口径与既有 `(id, 译文)` 二元组时代一致；
+/// 源校验（①→④ 文件变更边界）见 `TranslationPair` 的类型文档。
+pub(crate) fn pair_map(
+    pairs: &[crate::emit::TranslationPair],
+) -> std::collections::HashMap<&str, (&str, Option<&str>)> {
+    pairs
         .iter()
-        .map(|(id, tr)| (id.as_str(), tr.as_str()))
+        .map(|p| (p.id.as_str(), (p.translation.as_str(), p.source.as_deref())))
         .collect()
+}
+
+/// 回写结果报告：「宁漏勿错」的可见化——写了多少、有译文但未写入的是谁、为什么。
+///
+/// `skipped` 只收**有译文但没写**的单元（无译文的单元是正常未翻译，不是
+/// 跳过）；原因是人类可读中文短句（如「源文本不一致（提取后文件已变更）」
+/// 「文本守卫不一致」「结构限制（嵌套表/重复格…）」）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WritebackReport {
+    /// 实际写入的单元数（含表格格单元格）。
+    pub written: usize,
+    /// 有译文但未写入的单元：`(id, 原因)`。
+    pub skipped: Vec<(String, String)>,
+}
+
+impl WritebackReport {
+    /// 记一条跳过（链式便捷）。
+    pub fn skip(&mut self, id: impl Into<String>, reason: &str) {
+        self.skipped.push((id.into(), reason.to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------

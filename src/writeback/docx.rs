@@ -24,6 +24,13 @@
 //!   文本框等嵌套 `w:p` 的 `w:t` 并入外层段落文本（解析侧同此行为）。
 //! * 双保险：每个位与重解析的对应单元做文本一致性比对（格位同款），不一致
 //!   跳过该位不写、单元照常消费保流对齐——宁漏勿错（防解析器演进后错位写）。
+//! * 源校验（①→④ 边界）：[`crate::emit::TranslationPair`] 的 `source` 携带
+//!   提取侧源文本时，写入前与当前位文本比对，不一致跳过并记入
+//!   [`WritebackReport`]——①与④两次解析之间文件被改时位置锚点会指向别的
+//!   文本，守卫两侧都来自④拦不住这种漂移（静默错位写是最恶劣故障模式）；
+//!   `source: None` = 信任锚点（原行为）。报告口径：written = 实际写入
+//!   （含格），skipped 收源校验失败 / 文本守卫失败 / 结构跳过（嵌套表格、
+//!   无文本节点、附录不含表格、单元无对应位等）。
 //! * 三策略的表格口径：`TranslationOnly` 格内首 `w:t` 换译文、其余清空
 //!   （多段落格的其余段一并清空——重解析格文本 = 译文，与提取侧 join 口径
 //!   一致）；`BilingualInline` 格内最后一个 `w:p` 之后追加译段（复制格内
@@ -80,17 +87,19 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{escape_xml_text, open_zip, rewrite_zip, translation_map};
+use super::{escape_xml_text, open_zip, pair_map, rewrite_zip, WritebackReport};
 
-/// docx 双语回写：见模块级文档。`translated` 的 id 与
+/// docx 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（块 `p{页}-b{块序}`、表格格
-/// `p{页}-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
+/// `p{页}-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；`pair.source`
+/// 携带①侧源文本时写入前校验，不一致跳过并记入报告（宁漏勿错）；失败返回
+/// `corrupt`。
 pub fn writeback_docx(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -101,7 +110,7 @@ pub fn writeback_docx(
     let raw = DocxRawBackend::default().parse(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
 
     // 第二遍：XML 扫描可翻译位（段落位 + 格位），与单元按序对齐。
     let mut zip = open_zip(in_path)?;
@@ -109,25 +118,31 @@ pub fn writeback_docx(
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
     let (slots, body_close) = scan_slots(&xml)?;
 
+    let mut report = WritebackReport::default();
     let new_xml = match strategy {
-        BiStrategy::BilingualInline => apply_inline(&xml, &slots, &units, &map),
-        BiStrategy::TranslationOnly => apply_translation_only(&xml, &slots, &units, &map),
-        BiStrategy::OriginalPlusAppendix => apply_appendix(&xml, &slots, &units, &map, body_close),
+        BiStrategy::BilingualInline => apply_inline(&xml, &slots, &units, &map, &mut report),
+        BiStrategy::TranslationOnly => {
+            apply_translation_only(&xml, &slots, &units, &map, &mut report)
+        }
+        BiStrategy::OriginalPlusAppendix => {
+            apply_appendix(&xml, &slots, &units, &map, body_close, &mut report)
+        }
     };
 
     rewrite_zip(
         in_path,
         out,
         &[("word/document.xml".to_string(), new_xml.into_bytes())],
-    )
+    )?;
+    Ok(report)
 }
 
 /// docx 节交替：按分节符（无节则按分页符）把正文切段，每有命中的原文段后
 /// 插入「该段的纯译文段」（新起一页）——PageAlt 在 Word 的最佳近似（rumi
 /// 接入方需求 #12；形态对照 epub 侧 `writeback_epub_alternating`，见模块头
-/// 「节交替」）。`translated` 的 id 与 [`writeback_docx`] 同口径（同一单元
-/// 流，含表格格单元，无新锚点体系）；全书无命中时输出 = 原包透传；失败返回
-/// `corrupt`。
+/// 「节交替」）。`pairs` 的 id 与 [`writeback_docx`] 同口径（同一单元流，含
+/// 表格格单元，无新锚点体系；源校验同款）；全书无命中时输出 = 原包透传；
+/// 失败返回 `corrupt`。
 ///
 /// # 切段规则（body 内容字节区间；优先级从高到低）
 ///
@@ -142,9 +157,9 @@ pub fn writeback_docx(
 /// 插独立分页段，均经金测验证重开解析合法）。
 pub fn writeback_docx_alternating(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -153,16 +168,17 @@ pub fn writeback_docx_alternating(
     let raw = DocxRawBackend::default().parse(in_path)?;
     let doc = OfficePlugin::default().assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
 
     let mut zip = open_zip(in_path)?;
     let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
     let (slots, _) = scan_slots(&xml)?;
-    let edits = translation_only_edits(&slots, &units, &map);
+    let mut report = WritebackReport::default();
+    let edits = translation_only_edits(&slots, &units, &map, &mut report);
     if edits.is_empty() {
         // 全书无命中：原包透传（document.xml 也不动，与 epub 交替同口径）
-        return rewrite_zip(in_path, out, &[]);
+        return rewrite_zip(in_path, out, &[]).map(|_| report);
     }
 
     // B. 分段（回写侧 XML 层的 body 顶层扫描）+ 逐段拼装：原文段字节不动，
@@ -174,7 +190,8 @@ pub fn writeback_docx_alternating(
         in_path,
         out,
         &[("word/document.xml".to_string(), new_xml.into_bytes())],
-    )
+    )?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,25 +662,50 @@ fn consume_nested_table_text<R: std::io::BufRead>(
 // 三种策略
 // ---------------------------------------------------------------------------
 
-/// 位 × 翻译单元按序配对（文本一致性守卫）+ 译文查找。
+/// 位 × 翻译单元按序配对（文本一致性守卫 + ①源文本校验）+ 译文查找。
 /// 返回 (slot 下标, 译文) 列表，文档序；段落位与格位都在其中——
 /// OriginalPlusAppendix 由调用方过滤只留段落位（表格不进附录）。
+/// 守卫/源校验失败与结构漂移（单元多于位）记入 `report`——只收**有译文**
+/// 者（无译文是正常未翻译，不是跳过，见 [`WritebackReport`]）。
 fn matched_translations(
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
+    report: &mut WritebackReport,
 ) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let n = slots.len().min(units.len());
     for k in 0..n {
-        // 双保险：位文本与单元文本必须一致（同一解析器同一文件的确定性保证）
-        if slots[k].text().trim() != units[k].text.trim() {
+        let unit = &units[k];
+        // 译文查找先行：无译文/空白译文 = 正常未翻译，守卫不记报告
+        let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
+            continue;
+        };
+        let tr = tr.trim();
+        if tr.is_empty() {
             continue;
         }
-        if let Some(tr) = map.get(units[k].id.as_str()) {
-            let tr = tr.trim();
-            if !tr.is_empty() {
-                out.push((k, tr.to_string()));
+        // 双保险：位文本与单元文本必须一致（同一解析器同一文件的确定性保证）
+        if slots[k].text().trim() != unit.text.trim() {
+            report.skip(unit.id.clone(), "文本守卫不一致");
+            continue;
+        }
+        // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+        //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+        if let Some(src) = src_opt {
+            if src.trim() != unit.text.trim() {
+                report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                continue;
+            }
+        }
+        out.push((k, tr.to_string()));
+    }
+    // 结构漂移兜底（sdt 深度 quirk 等上游特性）：单元多于位 → 尾部单元无位
+    // 可写，有译文的记跳过（能对到单元 id 的记 id）
+    for unit in units.iter().skip(n) {
+        if let Some((tr, _)) = map.get(unit.id.as_str()) {
+            if !tr.trim().is_empty() {
+                report.skip(unit.id.clone(), "结构限制（无可对应正文位）");
             }
         }
     }
@@ -678,9 +720,10 @@ fn apply_inline(
     xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
+    report: &mut WritebackReport,
 ) -> String {
-    let matched = matched_translations(slots, units, map);
+    let matched = matched_translations(slots, units, map, report);
     if matched.is_empty() {
         return xml.to_string();
     }
@@ -696,15 +739,18 @@ fn apply_inline(
                         escape_xml_text(&tr)
                     ),
                 ));
+                report.written += 1;
             }
             Slot::Cell(c) => {
                 // 插在最后一个 w:p 之后 = 格底追加（单段落格与「原位之后」
                 // 等价）；pPr 取首段的（格内主段样式）。译文独立成段而非
                 // w:br 软换行——软换行会破坏 docx 表格行高语义。
                 if c.has_nested_table {
+                    report.skip(units[k].id.clone(), "结构限制（嵌套表格）");
                     continue;
                 }
                 let Some(last) = c.paras.last() else {
+                    report.skip(units[k].id.clone(), "结构限制（格内无段落）");
                     continue;
                 };
                 let ppr = c.paras[0].ppr.clone().unwrap_or_default();
@@ -723,6 +769,7 @@ fn apply_inline(
                         escape_xml_text(&tr)
                     ),
                 ));
+                report.written += 1;
             }
         }
     }
@@ -739,22 +786,25 @@ fn apply_translation_only(
     xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
+    report: &mut WritebackReport,
 ) -> String {
-    splice_spans(xml, translation_only_edits(slots, units, map))
+    splice_spans(xml, translation_only_edits(slots, units, map, report))
 }
 
 /// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位首 `w:t` 换译
 /// 文、其余清空；格位口径见 [`apply_translation_only`] 文档（含嵌套表的格
 /// / 无文本节点的位保守跳过——跳过即无编辑，节交替的「命中」判定以此为
 /// 准）。[`writeback_docx`] 与 [`writeback_docx_alternating`] 共用：后者按
-/// 分段区间平移取用同一编辑流，不另写渲染。
+/// 分段区间平移取用同一编辑流，不另写渲染。报告：实际产出编辑的单元计
+/// written，结构跳过记因。
 fn translation_only_edits(
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
+    report: &mut WritebackReport,
 ) -> Vec<(usize, usize, String)> {
-    let matched = matched_translations(slots, units, map);
+    let matched = matched_translations(slots, units, map, report);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (k, tr) in matched {
         match &slots[k] {
@@ -762,6 +812,7 @@ fn translation_only_edits(
                 let spans = &p.text_spans;
                 if spans.is_empty() {
                     // 无文本节点可换（文本全来自 tab/br 占位）：保守跳过
+                    report.skip(units[k].id.clone(), "结构限制（无文本节点）");
                     continue;
                 }
                 let mut it = spans.iter();
@@ -770,19 +821,24 @@ fn translation_only_edits(
                 for span in it {
                     edits.push((span.0, span.1, String::new()));
                 }
+                report.written += 1;
             }
             Slot::Cell(c) => {
                 if c.has_nested_table {
+                    report.skip(units[k].id.clone(), "结构限制（嵌套表格）");
                     continue;
                 }
                 let mut it = c.paras.iter().flat_map(|p| p.text_spans.iter());
                 let Some(first) = it.next() else {
-                    continue; // 全格无文本节点（文本全来自 tab/br 占位）：保守跳过
+                    // 全格无文本节点（文本全来自 tab/br 占位）：保守跳过
+                    report.skip(units[k].id.clone(), "结构限制（无文本节点）");
+                    continue;
                 };
                 edits.push((first.0, first.1, escape_xml_text(&tr)));
                 for span in it {
                     edits.push((span.0, span.1, String::new()));
                 }
+                report.written += 1;
             }
         }
     }
@@ -796,24 +852,32 @@ fn apply_appendix(
     xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
-    map: &HashMap<&str, &str>,
+    map: &HashMap<&str, (&str, Option<&str>)>,
     body_close: usize,
+    report: &mut WritebackReport,
 ) -> String {
-    let matched: Vec<(usize, String)> = matched_translations(slots, units, map)
-        .into_iter()
-        .filter(|(k, _)| matches!(slots[*k], Slot::Para(_)))
-        .collect();
-    if matched.is_empty() {
+    let matched = matched_translations(slots, units, map, report);
+    let mut entries: Vec<String> = Vec::new();
+    for (k, tr) in matched {
+        if matches!(slots[k], Slot::Para(_)) {
+            entries.push(tr);
+        } else {
+            // 格译文不进附录（附录只收段落位，正文格原样）：有译文但未写入
+            report.skip(units[k].id.clone(), "结构限制（附录不含表格）");
+        }
+    }
+    if entries.is_empty() {
         return xml.to_string();
     }
+    report.written += entries.len();
     let mut appendix = String::from(
         "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>\
          <w:r><w:t>译文</w:t></w:r></w:p>",
     );
-    for (_k, tr) in matched {
+    for tr in &entries {
         appendix.push_str(&format!(
             "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
-            escape_xml_text(&tr)
+            escape_xml_text(tr)
         ));
     }
     let pos = appendix_insert_pos(xml, body_close);
@@ -1085,6 +1149,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::emit::to_translation_units;
+    use crate::emit::TranslationPair;
     use crate::model::BlockKind;
     use crate::model::BlockKind::{Heading, Paragraph, Table};
 
@@ -1112,6 +1177,53 @@ mod tests {
     );
 
     const STYLES_XML: &str = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:styleId="Heading1"><w:name w:val="heading 1"/></w:style></w:styles>"#;
+
+    /// sdt（内容控件）fixture：表格 + sdt 内段落（sdt 位测试与枚举等价
+    /// 属性测试共用）。
+    const SDT_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>表甲</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        r#"<w:sdt><w:sdtPr/><w:sdtContent><w:p><w:r><w:t>控件里的段落。</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
+        r#"</w:body></w:document>"#
+    );
+    const SPAN_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:tbl>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>跨列标题</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"<w:tr><w:tc><w:p><w:r><w:t>丙</w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t xml:space="preserve"> </w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t>丁</w:t></w:r></w:p></w:tc></w:tr>"#,
+        r#"</w:tbl></w:body></w:document>"#
+    );
+
+    const NESTED_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:tbl><w:tr>"#,
+        r#"<w:tc><w:p><w:r><w:t>外格</w:t></w:r></w:p>"#,
+        r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>内甲</w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t>内乙</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        r#"<w:p><w:r><w:t>尾段</w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t>普通格</w:t></w:r></w:p></w:tc>"#,
+        r#"</w:tr></w:tbl>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    const CELL_INLINE_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:tbl><w:tr>"#,
+        r#"<w:tc><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>甲段一</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>甲段二</w:t></w:r></w:p></w:tc>"#,
+        r#"<w:tc><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:tc>"#,
+        r#"</w:tr></w:tbl>"#,
+        r#"</w:body></w:document>"#
+    );
+
 
     fn case_dir(case: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1159,10 +1271,17 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_docx(in_path, &translated, strategy, out_path).unwrap();
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> WritebackReport {
+        let pairs: Vec<TranslationPair> = tr
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect();
+        writeback_docx(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     fn entry_str(zip_path: &Path, name: &str) -> String {
@@ -1322,13 +1441,6 @@ mod tests {
         let dir = case_dir("sdt");
         let in_path = dir.join("in.docx");
         let out_path = dir.join("out.docx");
-        const SDT_XML: &str = concat!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
-            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>表甲</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
-            r#"<w:sdt><w:sdtPr/><w:sdtContent><w:p><w:r><w:t>控件里的段落。</w:t></w:r></w:p></w:sdtContent></w:sdt>"#,
-            r#"</w:body></w:document>"#
-        );
         build_docx(&in_path, SDT_XML);
 
         // 表格产 Table 块并按格展开（b0 → 格单元 r0c0）；sdt 段落是 b1
@@ -1392,10 +1504,10 @@ mod tests {
             ]
         );
         // 除 r1c1 外全部给译文（部分命中：未命中的格原样）
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<TranslationPair> = units
             .iter()
             .filter(|u| u.id != "p0-b1-r1c1")
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
         writeback_docx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
 
@@ -1435,18 +1547,6 @@ mod tests {
         let dir = case_dir("tbl_span");
         let in_path = dir.join("in.docx");
         let out_path = dir.join("out.docx");
-        const SPAN_XML: &str = concat!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
-            r#"<w:tbl>"#,
-            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>跨列标题</w:t></w:r></w:p></w:tc></w:tr>"#,
-            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>甲</w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:tc></w:tr>"#,
-            r#"<w:tr><w:tc><w:p><w:r><w:t>丙</w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t xml:space="preserve"> </w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t>丁</w:t></w:r></w:p></w:tc></w:tr>"#,
-            r#"</w:tbl></w:body></w:document>"#
-        );
         build_docx(&in_path, SPAN_XML);
 
         // 格阈值恒 1：单字符格（甲/乙/丙/丁）都进流；空格占 r2 列 1 但不发
@@ -1463,9 +1563,9 @@ mod tests {
         );
 
         let units = to_translation_units(&parse_doc(&in_path));
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("译·{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译·{}", u.text)).into())
             .collect();
         writeback_docx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
 
@@ -1495,18 +1595,6 @@ mod tests {
         let dir = case_dir("tbl_nested");
         let in_path = dir.join("in.docx");
         let out_path = dir.join("out.docx");
-        const NESTED_XML: &str = concat!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
-            r#"<w:tbl><w:tr>"#,
-            r#"<w:tc><w:p><w:r><w:t>外格</w:t></w:r></w:p>"#,
-            r#"<w:tbl><w:tr><w:tc><w:p><w:r><w:t>内甲</w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t>内乙</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
-            r#"<w:p><w:r><w:t>尾段</w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t>普通格</w:t></w:r></w:p></w:tc>"#,
-            r#"</w:tr></w:tbl>"#,
-            r#"</w:body></w:document>"#
-        );
         build_docx(&in_path, NESTED_XML);
 
         // 格文本 = 直接段（外格/尾段）join 嵌套表展平串（行内 `,`）——解析侧同口径
@@ -1524,22 +1612,33 @@ mod tests {
 
         // 两个格位都在流上且文本守卫通过（嵌套展平镜像与解析侧一致 → 不因
         // 守卫漏配；配对是位置的，守卫只把关写不写）
-        let translated = vec![
-            ("p0-b0-r0c0".to_string(), "[外格]".to_string()),
-            ("p0-b0-r0c1".to_string(), "[普通格]".to_string()),
+        let translated: Vec<TranslationPair> = vec![
+            ("p0-b0-r0c0".to_string(), "[外格]".to_string()).into(),
+            ("p0-b0-r0c1".to_string(), "[普通格]".to_string()).into(),
         ];
         let xml = entry_str(&in_path, "word/document.xml");
         let (slots, _) = scan_slots(&xml).unwrap();
-        let entries = translated.clone();
-        let matched = matched_translations(&slots, &units, &translation_map(&entries));
+        let map = pair_map(&translated);
+        let mut probe = WritebackReport::default();
+        let matched = matched_translations(&slots, &units, &map, &mut probe);
         assert_eq!(
             matched.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [0, 1],
             "两个格位都命中（流对齐 + 展平镜像精确）"
         );
+        assert!(probe.skipped.is_empty(), "守卫通过：无跳过");
 
-        // TranslationOnly：嵌套格不写（原样），普通格替换
-        writeback_docx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
+        // TranslationOnly：嵌套格不写（原样 → 记结构跳过），普通格替换
+        let report =
+            writeback_docx(&in_path, &translated, BiStrategy::TranslationOnly, &out_path).unwrap();
+        assert_eq!(report.written, 1, "普通格写入");
+        assert_eq!(
+            report.skipped,
+            [(
+                "p0-b0-r0c0".to_string(),
+                "结构限制（嵌套表格）".to_string()
+            )]
+        );
         let out_blocks = blocks(&out_path);
         let table = out_blocks[0].table.as_ref().unwrap();
         assert_eq!(
@@ -1561,16 +1660,6 @@ mod tests {
         let dir = case_dir("tbl_inline");
         let in_path = dir.join("in.docx");
         let out_path = dir.join("out.docx");
-        const CELL_INLINE_XML: &str = concat!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
-            r#"<w:tbl><w:tr>"#,
-            r#"<w:tc><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>甲段一</w:t></w:r></w:p>"#,
-            r#"<w:p><w:r><w:t>甲段二</w:t></w:r></w:p></w:tc>"#,
-            r#"<w:tc><w:p><w:r><w:t>乙</w:t></w:r></w:p></w:tc>"#,
-            r#"</w:tr></w:tbl>"#,
-            r#"</w:body></w:document>"#
-        );
         build_docx(&in_path, CELL_INLINE_XML);
 
         // 格文本 = 格内多段落 join（提取侧同口径）
@@ -1583,9 +1672,9 @@ mod tests {
             [("p0-b0-r0c0", "甲段一\n甲段二"), ("p0-b0-r0c1", "乙")]
         );
 
-        let translated = vec![
-            ("p0-b0-r0c0".to_string(), "Cell translation".to_string()),
-            ("p0-b0-r0c1".to_string(), "Beta".to_string()),
+        let translated: Vec<TranslationPair> = vec![
+            ("p0-b0-r0c0".to_string(), "Cell translation".to_string()).into(),
+            ("p0-b0-r0c1".to_string(), "Beta".to_string()).into(),
         ];
         writeback_docx(&in_path, &translated, BiStrategy::BilingualInline, &out_path).unwrap();
 
@@ -1633,11 +1722,20 @@ mod tests {
 
         // 全部单元（含格）都给译文：附录仍只收段落
         let units = to_translation_units(&parse_doc(&in_path));
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("[{}]", u.text)))
+            .map(|u| (u.id.clone(), format!("[{}]", u.text)).into())
             .collect();
-        writeback_docx(&in_path, &translated, BiStrategy::OriginalPlusAppendix, &out_path).unwrap();
+        let report =
+            writeback_docx(&in_path, &translated, BiStrategy::OriginalPlusAppendix, &out_path)
+                .unwrap();
+        // 报告：written 只计附录写入的段落译文；格译文按设计不进附录 → 记跳过
+        assert_eq!(report.written, 2, "附录只写两个段落译文");
+        assert_eq!(report.skipped.len(), 4, "四个格译文记结构跳过");
+        assert!(report
+            .skipped
+            .iter()
+            .all(|(id, r)| id.starts_with("p0-b1-r") && r == "结构限制（附录不含表格）"));
 
         let orig = blocks(&in_path);
         let got = blocks(&out_path);
@@ -1672,11 +1770,14 @@ mod tests {
             header: false,
             running: false,
         };
-        let entries = [
+        let pairs: Vec<TranslationPair> = [
             ("p0-b0-r0c0".to_string(), "格译文".to_string()),
             ("p0-b1".to_string(), "段译文".to_string()),
-        ];
-        let map = translation_map(&entries);
+        ]
+        .iter()
+        .map(|(a, b)| (a.clone(), b.clone()).into())
+        .collect();
+        let map = pair_map(&pairs);
 
         // 格文本 / 段落文本都与对应单元不一致 → 全部不命中
         let slots = [
@@ -1696,9 +1797,18 @@ mod tests {
             unit("p0-b0-r0c0", "单元文本甲", Table),
             unit("p0-b1", "单元文本乙", Paragraph),
         ];
+        let mut report = WritebackReport::default();
         assert!(
-            matched_translations(&slots, &units, &map).is_empty(),
+            matched_translations(&slots, &units, &map, &mut report).is_empty(),
             "文本不一致的位不写"
+        );
+        // 守卫失败补记因（只收有译文者：两个 id 都有译文 → 都记）
+        assert_eq!(
+            report.skipped,
+            [
+                ("p0-b0-r0c0".to_string(), "文本守卫不一致".to_string()),
+                ("p0-b1".to_string(), "文本守卫不一致".to_string()),
+            ]
         );
 
         // 反例：文本一致时照常命中（守卫只把关写不写，不破坏流配对）
@@ -1706,12 +1816,17 @@ mod tests {
             unit("p0-b0-r0c0", "格文本", Table),
             unit("p0-b1", "段落文本", Paragraph),
         ];
+        let mut report = WritebackReport::default();
         assert_eq!(
-            matched_translations(&slots, &ok_units, &map)
+            matched_translations(&slots, &ok_units, &map, &mut report)
                 .iter()
                 .map(|(k, tr)| (*k, tr.as_str()))
                 .collect::<Vec<_>>(),
             [(0, "格译文"), (1, "段译文")]
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "守卫通过：无跳过（written 由写入方累计，配对函数不计）"
         );
     }
 
@@ -1764,10 +1879,12 @@ mod tests {
     );
 
     /// alternating 便捷入口（与 write 同款）。
-    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_docx_alternating(in_path, &translated, out_path).unwrap();
+    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) -> WritebackReport {
+        let pairs: Vec<TranslationPair> = tr
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect();
+        writeback_docx_alternating(in_path, &pairs, out_path).unwrap()
     }
 
     /// 金测（核心验收）：节序 = 原1/译1/原2/译2、译文段 = 该段 TranslationOnly
@@ -2038,6 +2155,216 @@ mod tests {
         assert_eq!(out_xml.matches("<w:sectPr>").count(), 3);
         assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 译文对（TranslationPair）源校验 + 报告
+    // -------------------------------------------------------------------------
+
+    /// 源校验一致路径：携带①侧源文本（= to_translation_units 文本）的译文
+    /// 对，输出与不带源（迁移前 `(id, 译文)` 形态）逐字节等价；written 计数
+    /// 齐全（含格）。
+    #[test]
+    fn source_validated_pairs_produce_identical_output() {
+        let dir = case_dir("src-ok");
+        let in_path = dir.join("in.docx");
+        let a = dir.join("a.docx");
+        let b = dir.join("b.docx");
+        build_docx(&in_path, DOCUMENT_XML);
+        let units = to_translation_units(&parse_doc(&in_path));
+
+        // 不带源：`(id, 译文)` 二元组 From（= 迁移前形态）
+        let plain: Vec<TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译·{}", u.text)).into())
+            .collect();
+        let rep_plain = writeback_docx(&in_path, &plain, BiStrategy::TranslationOnly, &a).unwrap();
+
+        // 带一致源文本：`(id, 源, 译文)` 三元组 From
+        let checked: Vec<TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), u.text.clone(), format!("译·{}", u.text)).into())
+            .collect();
+        let rep_checked =
+            writeback_docx(&in_path, &checked, BiStrategy::TranslationOnly, &b).unwrap();
+
+        // 逐字节等价：document.xml（其余部件本就透传）
+        assert_eq!(
+            entry_str(&a, "word/document.xml"),
+            entry_str(&b, "word/document.xml"),
+            "源一致 ⇒ 与无源形态输出逐字节一致"
+        );
+        assert_eq!(rep_checked.written, units.len(), "全部单元写入（含格）");
+        assert!(rep_checked.skipped.is_empty(), "一致源不产生跳过");
+        assert_eq!(rep_plain.written, rep_checked.written);
+        assert_eq!(rep_plain.skipped, rep_checked.skipped);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验失败路径：①源文本 ≠ ④文本 → 该单元跳过（报告记 id 与原因）、
+    /// 该处原文保留；段落与表格格各一例；一致单元照常写入（部分命中计数）。
+    #[test]
+    fn source_mismatch_skips_unit_keeps_original() {
+        let dir = case_dir("src-bad");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, DOCUMENT_XML);
+        let units = to_translation_units(&parse_doc(&in_path));
+
+        // p0-b1（段落）与 p0-b3-r0c0（表格格）的①源文本被篡改；其余一致
+        let bad = ["p0-b1", "p0-b3-r0c0"];
+        let pairs: Vec<TranslationPair> = units
+            .iter()
+            .map(|u| {
+                let src = if bad.contains(&u.id.as_str()) {
+                    format!("（提取后文件已变更）{}", u.text)
+                } else {
+                    u.text.clone()
+                };
+                (u.id.clone(), src, format!("译·{}", u.text)).into()
+            })
+            .collect();
+        let report =
+            writeback_docx(&in_path, &pairs, BiStrategy::BilingualInline, &out_path).unwrap();
+
+        assert_eq!(report.written, 3, "一致的 3 个单元写入（段 + 格 + 段）");
+        assert_eq!(
+            report.skipped,
+            [
+                (
+                    "p0-b1".to_string(),
+                    "源文本不一致（提取后文件已变更）".to_string()
+                ),
+                (
+                    "p0-b3-r0c0".to_string(),
+                    "源文本不一致（提取后文件已变更）".to_string()
+                ),
+            ],
+            "跳过按文档序记 id 与原因"
+        );
+
+        // 跳过单元该处原文：段落无译邻段、格文本原样
+        let got = blocks(&out_path);
+        assert!(
+            !got.iter().any(|b| b.content.contains("译·这是第一段")),
+            "源不一致段落不写：{:?}",
+            got.iter().map(|b| b.content.as_str()).collect::<Vec<_>>()
+        );
+        let table = got.iter().find(|b| b.table.is_some()).unwrap();
+        assert_eq!(
+            table.table.as_ref().unwrap().rows[0][0],
+            "表头甲",
+            "源不一致格原样"
+        );
+        // 一致单元照常写入：段落独立成块；表格格（Inline = 格内追加 w:p）
+        // 重解析后格文本 = 原文 join 译文（格内段落拼接），落在 Table.rows
+        assert!(got.iter().any(|b| b.content == "译·第一章 引言"));
+        assert!(
+            table
+                .table
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| r.iter().any(|c| c.contains("译·表头乙"))),
+            "一致格写入（格文本 join 形态）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数（部分命中 + 混合跳过原因）：源校验跳过与结构跳过（嵌套
+    /// 表格格）同场；written 只计实际写入；alternating 同口径透传并累计。
+    #[test]
+    fn report_counts_partial_hits_and_mixed_skips() {
+        let dir = case_dir("report-mix");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, NESTED_XML);
+        let units = to_translation_units(&parse_doc(&in_path));
+        assert_eq!(units.len(), 2, "嵌套格 + 普通格");
+
+        // 嵌套格源一致但结构不写；普通格源不一致
+        let pairs: Vec<TranslationPair> = vec![
+            (
+                "p0-b0-r0c0".to_string(),
+                "外格\n内甲,内乙\n尾段".to_string(),
+                "[外格]".to_string(),
+            )
+                .into(),
+            (
+                "p0-b0-r0c1".to_string(),
+                "（已变更）普通格".to_string(),
+                "[普通格]".to_string(),
+            )
+                .into(),
+        ];
+        let report =
+            writeback_docx(&in_path, &pairs, BiStrategy::TranslationOnly, &out_path).unwrap();
+
+        assert_eq!(report.written, 0, "全部未写入");
+        assert_eq!(
+            report.skipped,
+            [
+                (
+                    "p0-b0-r0c1".to_string(),
+                    "源文本不一致（提取后文件已变更）".to_string()
+                ),
+                ("p0-b0-r0c0".to_string(), "结构限制（嵌套表格）".to_string()),
+            ],
+            "混合跳过原因（配对期源校验在前、写入期结构跳过在后）"
+        );
+        // 全跳过 → 无编辑 → 输出原样
+        assert_eq!(blocks(&out_path), blocks(&in_path));
+
+        // alternating 同口径：全跳过 → 无命中 → 原包透传，报告照常累计
+        let alt = dir.join("alt.docx");
+        let rep_alt = writeback_docx_alternating(&in_path, &pairs, &alt).unwrap();
+        assert_eq!(rep_alt.written, 0);
+        assert_eq!(rep_alt.skipped, report.skipped);
+        assert_eq!(
+            entry_str(&alt, "word/document.xml"),
+            entry_str(&in_path, "word/document.xml"),
+            "无命中连 document.xml 都不动"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 枚举等价（解析器↔扫描器漂移报警器）：对全部 docx fixture 显式断言
+    /// 「扫描器槽位文本序列 == to_translation_units 文本序列」——两侧都来自
+    /// ④的同一文件；roundtrip 金测只隐式覆盖该不变量，这里独立钉死。
+    #[test]
+    fn scanner_slot_texts_enumerate_same_as_translation_units() {
+        let fixtures: Vec<(&str, &str)> = vec![
+            ("basic", DOCUMENT_XML),
+            ("sectpr", SECTPR_XML),
+            ("table", TABLE_DOC_XML),
+            ("gridspan", SPAN_XML),
+            ("nested", NESTED_XML),
+            ("cell-inline", CELL_INLINE_XML),
+            ("sdt", SDT_XML),
+            ("multi-section", MULTI_SECTION_XML),
+            ("plain", PLAIN_XML),
+            ("page-break", PAGE_BREAK_XML),
+            ("table-section", TABLE_SECTION_XML),
+        ];
+        let dir = case_dir("enum-equiv");
+        for (name, xml) in fixtures {
+            let path = dir.join(format!("{name}.docx"));
+            build_docx(&path, xml);
+            let (slots, _) = scan_slots(xml).unwrap();
+            let slot_texts: Vec<&str> = slots.iter().map(|s| s.text().trim()).collect();
+            let doc = parse_doc(&path);
+            let units = to_translation_units(&doc);
+            let unit_texts: Vec<&str> = units.iter().map(|u| u.text.trim()).collect();
+            assert_eq!(
+                slot_texts, unit_texts,
+                "fixture {name}: 解析器↔扫描器枚举漂移（宁在此响亮失败，不错位写）"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

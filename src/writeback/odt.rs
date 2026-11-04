@@ -36,6 +36,9 @@
 //! * 双保险：每个槽位文本与权威单元文本一致性比对（`text_until` 同口径：
 //!   `text:s`/`text:tab`/`text:line-break` 转换、纯空白文本节点丢弃、实体
 //!   解码），不一致跳过该块（宁漏勿错）；未匹配 id / 空白译文一律忽略。
+//! * ①→④ 源校验：`TranslationPair.source`（① 侧源文本）非 None 时写入前
+//!   与当前（④）文本比对，不一致跳过该单元并记 `WritebackReport`（函数
+//!   返回 written / skipped 报告——「宁漏勿错」的可见化）。
 //! * OriginalPlusAppendix：正文不动，`</office:text>` 前追加
 //!   `<text:h text:outline-level="1">译文</text:h>` + 译文段序列。
 //! * ZIP：其余条目字节透传（`mimetype` 首条目 + Stored 约定由共用
@@ -52,17 +55,19 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{apply_edits, Edit, escape_xml_text, open_zip, rewrite_zip, translation_map};
+use super::{apply_edits, Edit, escape_xml_text, open_zip, pair_map, rewrite_zip};
 
-/// odt 双语回写：见模块级文档。`translated` 的 id 与
+/// odt 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（段落类 `p0-b{块序}`、格单元
-/// `p0-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；失败返回 `corrupt`。
+/// `p0-b{块序}-r{行}c{列}`）；未匹配 / 空白译文条目忽略；`pair.source`
+/// 携带①侧源文本时写入前校验，不一致跳过并记报告（见
+/// [`crate::emit::TranslationPair`]）；失败返回 `corrupt`。
 pub fn writeback_odt(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -71,7 +76,8 @@ pub fn writeback_odt(
     let raw = OdtRawBackend.parse(in_path)?;
     let doc = OdfPlugin.assemble(&raw);
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = crate::writeback::WritebackReport::default();
     if doc.pages.len() != 1 {
         return Err(DocError::corrupt("odt 对齐失败：Document 页数异常"));
     }
@@ -116,24 +122,40 @@ pub fn writeback_odt(
                 }
                 let unit = &units[cursor];
                 cursor += 1;
-                // 双保险：重扫描格文本必须与权威单元文本一致
+                // 双保险：重扫描格文本必须与权威单元文本一致（有译文的记
+                // 报告——无译文是正常未翻译，不是跳过）
                 if cell.text != unit.text {
+                    if has_translation(&map, &unit.id) {
+                        report.skip(unit.id.clone(), "文本守卫不一致");
+                    }
                     continue;
                 }
                 // 重复格（cols-repeated > 1）：占单元位但不回写（见 consume_table）
                 if !cell.editable {
+                    if has_translation(&map, &unit.id) {
+                        report.skip(unit.id.clone(), "结构限制（重复格不回写）");
+                    }
                     continue;
                 }
-                let Some(tr) = map.get(unit.id.as_str()) else {
+                let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
                     continue;
                 };
                 let tr = tr.trim();
                 if tr.is_empty() {
                     continue;
                 }
+                // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+                //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+                if let Some(src) = src_opt {
+                    if src.trim() != unit.text.trim() {
+                        report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                        continue;
+                    }
+                }
                 match strategy {
                     BiStrategy::BilingualInline => {
                         let Some(after) = cell.last_para_after else {
+                            report.skip(unit.id.clone(), "结构限制（格内无段落锚点）");
                             continue; // 格内无 text:p 锚点：宁漏勿错
                         };
                         let style = cell
@@ -145,6 +167,7 @@ pub fn writeback_odt(
                             after,
                             format!("<text:p{style}>{}</text:p>", escape_xml_text(tr)),
                         ));
+                        report.written += 1;
                     }
                     BiStrategy::TranslationOnly => {
                         // 格内容区整体替换为单个译段（格内容必须是块级元素）
@@ -155,9 +178,10 @@ pub fn writeback_odt(
                                 e,
                                 format!("<text:p>{}</text:p>", escape_xml_text(tr)),
                             ));
+                            report.written += 1;
                         }
                     }
-                    // 表格不进附录、原样（格译文无处安放）
+                    // 表格不进附录、原样（格译文无处安放，附录策略设计口径）
                     BiStrategy::OriginalPlusAppendix => {}
                 }
             }
@@ -176,18 +200,29 @@ pub fn writeback_odt(
         }
         cursor += 1;
         let slot = &scanned.slots[b_idx];
-        // 双保险：重扫描文本必须与权威单元文本一致
+        // 双保险：重扫描文本必须与权威单元文本一致（有译文的记报告——
+        // 无译文是正常未翻译，不是跳过）
         if slot.text != unit.text {
+            if has_translation(&map, &unit.id) {
+                report.skip(unit.id.clone(), "文本守卫不一致");
+            }
             continue;
         }
-        let Some(tr) = map.get(unit.id.as_str()) else {
+        let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
             continue;
         };
         let tr = tr.trim();
         if tr.is_empty() {
             continue;
         }
-        matched.push(tr.to_string());
+        // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+        //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+        if let Some(src) = src_opt {
+            if src.trim() != unit.text.trim() {
+                report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                continue;
+            }
+        }
         match strategy {
             BiStrategy::BilingualInline => {
                 let style = slot
@@ -199,14 +234,20 @@ pub fn writeback_odt(
                     slot.after,
                     format!("<text:p{style}>{}</text:p>", escape_xml_text(tr)),
                 ));
+                report.written += 1;
             }
             BiStrategy::TranslationOnly => {
                 let (s, e) = slot.inner;
                 if s < e {
                     edits.push(Edit::Replace(s, e, escape_xml_text(tr)));
+                    report.written += 1;
                 }
             }
-            BiStrategy::OriginalPlusAppendix => {}
+            // 附录：译文进 matched（</office:text> 前追加），计一次写入
+            BiStrategy::OriginalPlusAppendix => {
+                matched.push(tr.to_string());
+                report.written += 1;
+            }
         }
     }
 
@@ -229,7 +270,17 @@ pub fn writeback_odt(
         in_path,
         out,
         &[("content.xml".to_string(), new_xml.into_bytes())],
-    )
+    )?;
+    Ok(report)
+}
+
+/// 该单元是否带**非空白译文**：报告的 `skipped` 只收「有译文但没写」——
+/// 无译文是正常未翻译，不是跳过（与 `pair_map`「空白译文忽略」同口径）。
+fn has_translation(
+    map: &std::collections::HashMap<&str, (&str, Option<&str>)>,
+    id: &str,
+) -> bool {
+    map.get(id).is_some_and(|(tr, _)| !tr.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -638,10 +689,32 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_odt(in_path, &translated, strategy, out_path).unwrap();
+    /// (id, 译文) 二元组回写（`From<(String, String)>` = 无源校验形态），
+    /// 返回报告（多数用例不断言报告，忽略返回值即可）。
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string()).into()).collect();
+        writeback_odt(in_path, &pairs, strategy, out_path).unwrap()
+    }
+
+    /// (id, ①源文本, 译文) 三元组回写（`From<(String, String, String)>` =
+    /// 带源校验形态），返回报告。
+    fn write_src(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> = tr
+            .iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()).into())
+            .collect();
+        writeback_odt(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     fn entry_str(zip_path: &Path, name: &str) -> String {
@@ -1023,6 +1096,154 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(table.rows, vec![vec!["格甲".to_string(), "格乙".to_string()]]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 译文对（TranslationPair）源校验 + 回写报告
+    // -------------------------------------------------------------------------
+
+    /// 源校验金测①：`source` 与当前（④）文本一致 → 写入照常，content.xml
+    /// 与无源形态（`source: None`）逐字节一致，报告相同（written 一致、
+    /// skipped 为空）——迁移不改变一致源的输出。
+    #[test]
+    fn source_match_writes_identical_to_unchecked() {
+        let dir = case_dir("src-match");
+        let in_path = dir.join("in.odt");
+        build_odt(&in_path, BODY);
+        let out_path = dir.join("out.odt");
+        let out_path_plain = dir.join("out-plain.odt");
+
+        // ①侧源文本 = 提取侧单元文本（逐字一致）
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "标题一", "Heading 1"),
+                ("p0-b1", "正文一段。", "First paragraph."),
+                ("p0-b4", "尾段一句。", "Final sentence."),
+            ],
+            BiStrategy::BilingualInline,
+        );
+        let rep_plain = write(
+            &in_path,
+            &out_path_plain,
+            &[
+                ("p0-b0", "Heading 1"),
+                ("p0-b1", "First paragraph."),
+                ("p0-b4", "Final sentence."),
+            ],
+            BiStrategy::BilingualInline,
+        );
+
+        assert_eq!(
+            entry_str(&out_path, "content.xml"),
+            entry_str(&out_path_plain, "content.xml"),
+            "源一致：与无源形态逐字节等价"
+        );
+        assert_eq!(rep, rep_plain);
+        assert_eq!(rep.written, 3);
+        assert!(rep.skipped.is_empty());
+
+        // 写入确实发生（对照形态：原/译交错落盘）
+        let blocks = &parse_doc(&out_path).pages[0].blocks;
+        assert_eq!(blocks[1].content, "Heading 1");
+        assert_eq!(blocks[3].content, "First paragraph.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验金测②：`source` 与当前文本不一致（模拟①→④之间文件被改）→
+    /// 该单元跳过（原文保留，不写入），skipped 记 id 与原因；源一致的单元
+    /// 照常写入。
+    #[test]
+    fn source_mismatch_skips_and_reports() {
+        let dir = case_dir("src-mismatch");
+        let in_path = dir.join("in.odt");
+        build_odt(&in_path, BODY);
+        let out_path = dir.join("out.odt");
+
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                // ①侧记下的源文本与文件里现在的文本不同（锚点在新文件里
+                // 指向别处——写下去就是静默错位写，必须拦下）
+                ("p0-b0", "被改过的旧标题", "Heading 1"),
+                ("p0-b1", "正文一段。", "First paragraph."),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        assert_eq!(rep.written, 1, "只有源一致的单元写入");
+        assert_eq!(
+            rep.skipped,
+            vec![("p0-b0".to_string(), "源文本不一致（提取后文件已变更）".to_string())]
+        );
+
+        // 跳过单元的原文保留；一致单元照常替换
+        let blocks = &parse_doc(&out_path).pages[0].blocks;
+        assert_eq!(blocks[0].content, "标题一", "源不一致：原文不动");
+        assert_eq!(blocks[1].content, "First paragraph.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数金测：written = 实际写入；重复格（占单元位但不可回写）的两
+    /// 份译文逐格记结构跳过——计数逐项对账。
+    #[test]
+    fn report_counts_writes_and_structural_skips() {
+        let dir = case_dir("report");
+        let body = concat!(
+            r#"<text:p>正文一段。</text:p>"#,
+            r#"<table:table table:name="T"><table:table-row>"#,
+            r#"<table:table-cell table:number-columns-repeated="2"><text:p>重复格</text:p></table:table-cell>"#,
+            r#"</table:table-row></table:table>"#,
+        );
+        let in_path = dir.join("in.odt");
+        build_odt(&in_path, body);
+        let out_path = dir.join("out.odt");
+
+        // 段落 b0 + 表格 b1：重复格展开两份单元（r0c0/r0c1，同文本）
+        assert_eq!(
+            unit_ids(&in_path),
+            ["p0-b0", "p0-b1-r0c0", "p0-b1-r0c1"]
+        );
+
+        let rep = write_src(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "正文一段。", "First paragraph."),
+                ("p0-b1-r0c0", "重复格", "Rep A."),
+                ("p0-b1-r0c1", "重复格", "Rep B."),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        assert_eq!(rep.written, 1, "段落写入；重复格两份译文都放弃");
+        assert_eq!(
+            rep.skipped,
+            vec![
+                (
+                    "p0-b1-r0c0".to_string(),
+                    "结构限制（重复格不回写）".to_string()
+                ),
+                (
+                    "p0-b1-r0c1".to_string(),
+                    "结构限制（重复格不回写）".to_string()
+                ),
+            ]
+        );
+
+        // 落盘对账：段落替换、重复格原文原样
+        let blocks = &parse_doc(&out_path).pages[0].blocks;
+        assert_eq!(blocks[0].content, "First paragraph.");
+        assert_eq!(
+            blocks[1].table.as_ref().unwrap().rows,
+            vec![vec!["重复格".to_string(), "重复格".to_string()]]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

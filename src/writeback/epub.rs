@@ -32,6 +32,11 @@
 //! * 双保险：单元文本与重块化文本一致性比对，不一致跳过该单元（宁漏勿错）；
 //!   非 UTF-8 的 spine 条目（罕见，如 GBK 声明件）不做改写（避免改写后
 //!   字节与编码声明失配），其余条目照常透传。
+//! * 源校验（①→④ 边界）：`TranslationPair` 的 `source` 携带提取侧源文本
+//!   时，写入前与当前文本比对，不一致跳过并记入 `WritebackReport`——①与
+//!   ④两次解析之间文件被改时位置锚点会指向别的文本（静默错位写是最恶劣
+//!   故障模式）；`source: None` = 信任锚点（原行为）。报告口径见 docx 模块
+//!   头「源校验」。
 //! * 未匹配 id / 空白译文一律忽略。
 //!
 //! # 部件级交替（[`writeback_epub_alternating`]，rumi「一页原文一页译文」）
@@ -66,53 +71,65 @@ use crate::model::{Block, BlockKind};
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc};
 
 use super::html::{scan_html_blocks, HtmlSlot, TR_CLASS};
-use super::{apply_edits, Edit, escape_xml_text, open_zip, rewrite_zip, translation_map};
+use super::{apply_edits, Edit, escape_xml_text, open_zip, pair_map, rewrite_zip, WritebackReport};
 
-/// epub 双语回写：见模块级文档。`translated` 的 id 与
+/// epub 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（`p{页}-b{块序}`，页名取
-/// Document 页名）。失败返回 `corrupt`。
+/// Document 页名）；`pair.source` 携带①侧源文本时写入前校验，不一致跳过并
+/// 记入报告（宁漏勿错）。失败返回 `corrupt`。
 pub fn writeback_epub(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
-    let mut plan = plan_epub_edits(in_path, translated, strategy)?;
+    let mut plan = plan_epub_edits(in_path, pairs, strategy)?;
+    let mut report = std::mem::take(&mut plan.report);
 
     // F. 改写并重打包（非 UTF-8 条目不改写，防编码声明失配）
     let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
+    let parts_len = plan.parts.len(); // iter_mut 借用期内不再借用 plan.parts
     for (i, part) in plan.parts.iter_mut().enumerate() {
         if plan.edits[i].is_empty() {
             continue;
         }
         if std::str::from_utf8(&part.bytes).is_err() {
+            report.skip(part.name.clone(), "部件非 UTF-8（防编码声明失配），未改写");
             continue;
+        }
+        // written 只计实际落盘改写的部件（规划期逐单元累计；附录条目随最后
+        // 部件的改写计入）
+        report.written += plan.part_units[i];
+        if strategy == BiStrategy::OriginalPlusAppendix && i + 1 == parts_len {
+            report.written += plan.appendix_entries;
         }
         part.xhtml = apply_edits(&part.xhtml, std::mem::take(&mut plan.edits[i]));
         replaced.push((part.name.clone(), part.xhtml.clone().into_bytes()));
     }
-    rewrite_zip(in_path, out, &replaced)
+    rewrite_zip(in_path, out, &replaced)?;
+    Ok(report)
 }
 
 /// EPUB 部件级交替：spine 每个有命中译文的部件后插入「该部件的纯译文部件」
-/// ——阅读器里即 真·一页原文一页译文（部件=章/页边界）。`translated` 的
-/// id 与 [`crate::emit::to_translation_units`] 同口径；无任何命中单元（无
-/// 实际编辑）的部件不插译文部件（避免逐页「相同页翻两遍」）。OPF 非
-/// UTF-8 返回 `corrupt`（译文部件的挂载骨架不可缺，见模块级文档）；其余
-/// 失败同样返回 `corrupt`。
+/// ——阅读器里即 真·一页原文一页译文（部件=章/页边界）。`pairs` 的
+/// id 与 [`crate::emit::to_translation_units`] 同口径（源校验同
+/// [`writeback_epub`]）；无任何命中单元（无实际编辑）的部件不插译文部件
+/// （避免逐页「相同页翻两遍」）。OPF 非 UTF-8 返回 `corrupt`（译文部件的
+/// 挂载骨架不可缺，见模块级文档）；其余失败同样返回 `corrupt`。
 pub fn writeback_epub_alternating(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> crate::error::Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
     // A–E 共用管线；策略固定 TranslationOnly——译文部件 = 该部件全部命中
     // 单元的纯译文渲染（未命中单元原样，部件仍是完整合法 XHTML）。
-    let mut plan = plan_epub_edits(in_path, translated, BiStrategy::TranslationOnly)?;
+    let mut plan = plan_epub_edits(in_path, pairs, BiStrategy::TranslationOnly)?;
+    let mut report = std::mem::take(&mut plan.report);
 
     // OPF 通道：包内路径 + 文本（非 UTF-8 整体拒绝，见函数头）。
     let (opf_name, opf_xml) = opf_channel(in_path)?;
@@ -136,13 +153,20 @@ pub fn writeback_epub_alternating(
             continue; // 无命中单元（无实际编辑）→ 不插译文部件（防「相同页翻两遍」）
         }
         if std::str::from_utf8(&part.bytes).is_err() {
-            continue; // 非 UTF-8 部件不改写（与 writeback_epub 同款守卫）：不插译文页
+            // 非 UTF-8 部件不改写（与 writeback_epub 同款守卫）：不插译文页
+            report.skip(
+                part.name.clone(),
+                "部件非 UTF-8（防编码声明失配），未插译文部件",
+            );
+            continue;
         }
         let tr_name = tr_part_name(&part.name);
         // 同一部件在 spine 重复出现（EPUB3 违规形态）：只挂一次译文部件
         if !seen_names.insert(tr_name.clone()) {
+            report.skip(part.name.clone(), "部件在 spine 重复出现，未插译文部件");
             continue;
         }
+        report.written += plan.part_units[i];
         let tr_id = tr_manifest_id(&part.id, &mut used_ids);
         let tr_xhtml = apply_edits(&part.xhtml, edits);
         added.push((tr_name, tr_xhtml.into_bytes()));
@@ -158,32 +182,45 @@ pub fn writeback_epub_alternating(
 
     if added.is_empty() {
         // 全书无命中：输出 = 原包透传（OPF 也不动）
-        return rewrite_zip(in_path, out, &[]);
+        return rewrite_zip(in_path, out, &[]).map(|_| report);
     }
     opf_edits.push(Edit::Insert(points.manifest, manifest_items));
     replaced.push((opf_name, apply_edits(&opf_xml, opf_edits).into_bytes()));
-    rewrite_zip_added(in_path, out, &replaced, &added)
+    rewrite_zip_added(in_path, out, &replaced, &added)?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
 // 回写共用前半（A–E）：两种回写形态的公共管线
 // ---------------------------------------------------------------------------
 
-/// [`plan_epub_edits`] 的产物：spine 部件通道 + 逐部件编辑。`writeback_epub`
-/// 拿它替换原部件字节；`writeback_epub_alternating` 拿它另立译文部件。
+/// [`plan_epub_edits`] 的产物：spine 部件通道 + 逐部件编辑 + 报告素材。
+/// `writeback_epub` 拿它替换原部件字节；`writeback_epub_alternating` 拿它
+/// 另立译文部件。
 struct EpubPlan {
     /// spine 部件通道（id/href 供 alternating 派生译文部件的 OPF 条目）。
     parts: Vec<SpinePart>,
     /// 逐部件编辑（与 parts 同下标；空 = 该部件无命中/无编辑）。
     edits: Vec<Vec<Edit>>,
+    /// 每部件「已产出编辑的单元数」（written 素材；部件实际改写 / 译文
+    /// 部件实际插入时才计入报告——规划了编辑但没落盘不算写入）。
+    part_units: Vec<usize>,
+    /// 附录条目数（OriginalPlusAppendix；附录编辑落在最后部件，随其改写
+    /// 计入 written）。
+    appendix_entries: usize,
+    /// 规划期记下的跳过（源校验/守卫/结构，配对处能对到单元 id 的记 id）；
+    /// 收尾时并入最终报告。
+    report: WritebackReport,
 }
 
 /// A–E 公共管线：权威解析 → spine 部件 → 重块化 → provenance → 按策略
 /// 产逐部件编辑（含 OriginalPlusAppendix 的附录追加）。两种回写形态的
 /// 差异全部在各自收尾（替换原部件字节 vs 另立译文部件 + OPF 编辑）。
+/// 报告：源校验/守卫/结构跳过在配对处记入 `report`，written 素材按部件
+/// 累计（收尾方决定哪些部件真正落盘）。
 fn plan_epub_edits(
     in_path: &Path,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
 ) -> Result<EpubPlan> {
     // A. 权威解析（提取侧同管线、同默认选项）拿 id / 文本
@@ -192,7 +229,9 @@ fn plan_epub_edits(
     // 单元流全量（含表格格单元 kind = Table）：块级候选按块序消费、表格格
     // 在表格位逐格消费（见主循环的 Table 分支），两段消费拼满同一单元流。
     let units = crate::emit::to_translation_units(&doc);
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = WritebackReport::default();
+    let mut appendix_entries = 0usize;
 
     // B. spine 部件通道（与 EpubRawBackend::parse 的 spine 循环同款跳过规则）
     let parts = spine_parts(in_path)?;
@@ -201,6 +240,7 @@ fn plan_epub_edits(
             "epub spine 对齐失败：部件通道与解析器页数不一致",
         ));
     }
+    let mut part_units = vec![0usize; parts.len()];
 
     // C. 逐 spine 文档重块化（parse_blocks 同口径扫描，带 span）
     let mut slots: Vec<Vec<HtmlSlot>> = Vec::with_capacity(parts.len());
@@ -238,17 +278,28 @@ fn plan_epub_edits(
                 for cell in &slot.cells {
                     let Some(unit) = units.get(cursor) else { break };
                     cursor += 1;
-                    // 双保险：格文本 ≠ 单元文本 → 该格不写（宁漏勿错；单元照常消费）
-                    if unit.kind != BlockKind::Table || cell.text != unit.text {
-                        continue;
-                    }
-                    let Some(tr) = map.get(unit.id.as_str()) else {
+                    // 译文查找先行：无译文/空白 = 正常未翻译，守卫不记报告
+                    let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
                         continue;
                     };
                     let tr = tr.trim();
                     if tr.is_empty() {
                         continue;
                     }
+                    // 双保险：格文本 ≠ 单元文本 → 该格不写（宁漏勿错；单元照常消费）
+                    if unit.kind != BlockKind::Table || cell.text != unit.text {
+                        report.skip(unit.id.clone(), "文本守卫不一致");
+                        continue;
+                    }
+                    // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+                    //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+                    if let Some(src) = src_opt {
+                        if src.trim() != unit.text.trim() {
+                            report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                            continue;
+                        }
+                    }
+                    let before = edits[doc_i].len();
                     match strategy {
                         BiStrategy::BilingualInline => {
                             // 格内容终点（闭标签前）插 <br class="docforge-tr"/> + 译文
@@ -270,6 +321,13 @@ fn plan_epub_edits(
                         }
                         BiStrategy::OriginalPlusAppendix => {}
                     }
+                    // 报告：产出编辑的格计 written；有译文但零编辑（格内无
+                    // 文本节点）记结构跳过；附录策略格不在此写（附录集中处理）
+                    if edits[doc_i].len() > before {
+                        part_units[doc_i] += 1;
+                    } else if strategy != BiStrategy::OriginalPlusAppendix {
+                        report.skip(unit.id.clone(), "结构限制（格内无文本节点）");
+                    }
                 }
                 continue;
             }
@@ -279,7 +337,8 @@ fn plan_epub_edits(
             }
             let unit = &units[cursor];
             cursor += 1;
-            let Some(tr) = map.get(unit.id.as_str()) else {
+            // 译文查找先行：无译文/空白 = 正常未翻译，守卫不记报告
+            let Some((tr, src_opt)) = map.get(unit.id.as_str()) else {
                 continue;
             };
             let tr = tr.trim();
@@ -301,8 +360,18 @@ fn plan_epub_edits(
             };
             // 双保险：重块化文本必须与权威单元文本一致
             if expect_text != unit.text {
+                report.skip(unit.id.clone(), "文本守卫不一致");
                 continue;
             }
+            // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+            //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+            if let Some(src) = src_opt {
+                if src.trim() != unit.text.trim() {
+                    report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                    continue;
+                }
+            }
+            let before = edits[doc_i].len();
             match strategy {
                 BiStrategy::BilingualInline => {
                     // 插在最后一块之后；无块回退的全文 span 钳进 </body> 前
@@ -345,20 +414,37 @@ fn plan_epub_edits(
                     // 末尾统一追加（见下）
                 }
             }
+            // 报告：产出编辑的单元计 written；有译文但零编辑（贡献块皆无
+            // 可写文本位）记结构跳过；附录策略单元在附录处集中计入
+            if edits[doc_i].len() > before {
+                part_units[doc_i] += 1;
+            } else if strategy != BiStrategy::OriginalPlusAppendix {
+                report.skip(unit.id.clone(), "结构限制（无可写文本位）");
+            }
         }
     }
 
     // Appendix：正文不动，最后 spine 文档 `</body>` 前追加「译文」小节
     if strategy == BiStrategy::OriginalPlusAppendix && !units.is_empty() && !parts.is_empty() {
-        let matched: Vec<&str> = units
-            .iter()
-            // 表格格译文不进附录（附录是段落流；表格正文原样）
-            .filter(|u| u.kind != BlockKind::Table)
-            .filter_map(|u| map.get(u.id.as_str()))
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .collect();
+        let mut matched: Vec<&str> = Vec::new();
+        for u in units.iter() {
+            let Some((t, _src)) = map.get(u.id.as_str()) else {
+                continue;
+            };
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            // 表格格译文不进附录（附录是段落流；表格正文原样）——有译文
+            // 但未写入，记跳过
+            if u.kind == BlockKind::Table {
+                report.skip(u.id.clone(), "结构限制（附录不含表格）");
+            } else {
+                matched.push(t);
+            }
+        }
         if !matched.is_empty() {
+            appendix_entries = matched.len();
             let doc_i = parts.len() - 1;
             let mut appendix = String::from("<h2>译文</h2>");
             for tr in matched {
@@ -369,7 +455,13 @@ fn plan_epub_edits(
         }
     }
 
-    Ok(EpubPlan { parts, edits })
+    Ok(EpubPlan {
+        parts,
+        edits,
+        part_units,
+        appendix_entries,
+        report,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -947,17 +1039,26 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_epub(in_path, &translated, strategy, out_path).unwrap();
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> = tr
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect();
+        writeback_epub(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     /// alternating 便捷入口（与 write 同款）。
-    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_epub_alternating(in_path, &translated, out_path).unwrap();
+    fn alternating_write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)]) -> WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> = tr
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()).into())
+            .collect();
+        writeback_epub_alternating(in_path, &pairs, out_path).unwrap()
     }
 
     /// 读 ZIP 条目为字符串（UTF-8 断言件）。
@@ -1606,9 +1707,124 @@ mod tests {
         let bad = dir.join("bad.epub");
         replace_zip_entry(&in_path, &bad, "OEBPS/content.opf", &utf16);
         let out = dir.join("out.epub");
-        let translated = vec![("p第一章-b0".to_string(), "Chapter 1".to_string())];
-        let err = writeback_epub_alternating(&bad, &translated, &out).unwrap_err();
+        let pairs: Vec<crate::emit::TranslationPair> =
+            vec![("p第一章-b0".to_string(), "Chapter 1".to_string()).into()];
+        let err = writeback_epub_alternating(&bad, &pairs, &out).unwrap_err();
         assert!(err.to_string().contains("OPF 非 UTF-8"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // 译文对（TranslationPair）源校验 + 报告
+    // -------------------------------------------------------------------------
+
+    /// 源校验一致路径：携带①侧源文本（= to_translation_units 文本）的译文
+    /// 对，全部包内条目与不带源（迁移前 `(id, 译文)` 形态）逐字节等价；
+    /// written 计数齐全（含格），无跳过。
+    #[test]
+    fn source_validated_pairs_produce_identical_output() {
+        let dir = case_dir("src-ok");
+        let in_path = build_epub_parts(&dir, &[CH1, CH2, CH3]);
+        let units = to_translation_units(&parse_doc(&in_path));
+
+        let a = dir.join("a.epub");
+        let b = dir.join("b.epub");
+        // 不带源：`(id, 译文)` 二元组 From（= 迁移前形态）
+        let plain: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), format!("译·{}", u.text)).into())
+            .collect();
+        let rep_plain = writeback_epub(&in_path, &plain, BiStrategy::TranslationOnly, &a).unwrap();
+
+        // 带一致源文本：`(id, 源, 译文)` 三元组 From
+        let checked: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| (u.id.clone(), u.text.clone(), format!("译·{}", u.text)).into())
+            .collect();
+        let rep_checked =
+            writeback_epub(&in_path, &checked, BiStrategy::TranslationOnly, &b).unwrap();
+
+        // 全部条目逐字节一致（改写件 + 透传件都覆盖，条目序同）
+        let mut za = open_zip(&a).unwrap();
+        let mut zb = open_zip(&b).unwrap();
+        assert_eq!(za.len(), zb.len());
+        for i in 0..za.len() {
+            let name = za.by_index(i).unwrap().name().unwrap().to_string();
+            let mut ba = Vec::new();
+            za.by_name(&name).unwrap().read_to_end(&mut ba).unwrap();
+            let mut bb = Vec::new();
+            zb.by_name(&name).unwrap().read_to_end(&mut bb).unwrap();
+            assert_eq!(ba, bb, "{name} 字节一致");
+        }
+        assert_eq!(rep_checked.written, units.len(), "全部单元写入（含格）");
+        assert!(rep_checked.skipped.is_empty(), "一致源不产生跳过");
+        assert_eq!(rep_plain.written, rep_checked.written);
+        assert_eq!(rep_plain.skipped, rep_checked.skipped);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验失败路径：段落与表格格各一例——该单元跳过（报告记 id 与
+    /// 原因）、该处原文保留；一致单元照常写入（部分命中计数）。
+    #[test]
+    fn source_mismatch_skips_para_and_cell_keeps_original() {
+        let dir = case_dir("src-bad");
+        let in_path = build_epub_parts(&dir, &[CH3]);
+        let out_path = dir.join("out.epub");
+        let units = to_translation_units(&parse_doc(&in_path));
+        // 坏源目标按**文本**锁定（段落「如下表所示。」+ 格「电压」）——
+        // 块序/单元数随 fixture 演进，id 动态推导而非硬编码
+        let bad_para_id = units
+            .iter()
+            .find(|u| u.text == "如下表所示。")
+            .expect("fixture 含该段落单元")
+            .id
+            .clone();
+        let bad_cell_id = units
+            .iter()
+            .find(|u| u.text == "电压")
+            .expect("fixture 含该格单元")
+            .id
+            .clone();
+        assert!(units.len() >= 3, "至少：坏段 + 坏格 + 一致格");
+
+        let bad = [bad_para_id.as_str(), bad_cell_id.as_str()];
+        let pairs: Vec<crate::emit::TranslationPair> = units
+            .iter()
+            .map(|u| {
+                let src = if bad.contains(&u.id.as_str()) {
+                    format!("（提取后文件已变更）{}", u.text)
+                } else {
+                    u.text.clone()
+                };
+                (u.id.clone(), src, format!("译·{}", u.text)).into()
+            })
+            .collect();
+        let report = writeback_epub(&in_path, &pairs, BiStrategy::TranslationOnly, &out_path).unwrap();
+
+        assert_eq!(report.written, units.len() - 2, "其余单元全部写入（含格）");
+        assert_eq!(
+            report.skipped,
+            [
+                (
+                    bad_para_id.clone(),
+                    "源文本不一致（提取后文件已变更）".to_string()
+                ),
+                (
+                    bad_cell_id.clone(),
+                    "源文本不一致（提取后文件已变更）".to_string()
+                ),
+            ],
+            "跳过按文档序记 id 与原因"
+        );
+
+        // 跳过单元该处原文保留；一致单元照常替换
+        let raw = EpubRawBackend::default().parse(&out_path).unwrap();
+        let ch3 = &raw.pages[0].items[0].text;
+        assert!(ch3.contains("<p>如下表所示。</p>"), "坏源段落原样：{ch3}");
+        assert!(ch3.contains("<td>电压</td>"), "坏源格原样：{ch3}");
+        assert!(ch3.contains("<th>译·名称</th>"), "一致格照常写入：{ch3}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

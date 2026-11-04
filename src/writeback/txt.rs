@@ -15,7 +15,14 @@
 //! * 可翻译判据 = [`crate::emit::is_translatable`] + `min_chars = 2` +
 //!   空白文本跳过（与 `to_translation_units` 完全同口径）。
 //! * 双保险：每个定位到的块与权威单元文本做一致性比对，不一致跳过该块
-//!   （宁漏勿错）；未匹配 id / 空白译文一律忽略。
+//!   （宁漏勿错）；未匹配 id / 空白译文一律忽略；
+//! * ①→④ 边界校验：[`crate::emit::TranslationPair::source`]（消费者提取
+//!   译文依据的①侧源文本）与本波④单元文本不一致 → 该单元跳过并记报告
+//!   （①提取与④回写之间文件被改时，位置锚点在新文件里指向别的文本，
+//!   写下去就是静默错位写）；`None` = 信任锚点（不校验）。结果以
+//!   [`crate::writeback::WritebackReport`] 返回：`written` = 实际写入单元
+//!   数；`skipped` 只收「有译文但未写」（源文本不一致 / 文本守卫不一致；
+//!   无译文 = 正常未翻译不记，编码拒绝类是 `Err` 不记）。
 //!
 //! # 三种策略（[`crate::emit::BiStrategy`]）
 //!
@@ -47,20 +54,21 @@ use crate::plugins::chapter::{split_chapters_with, ChapterRules, Subheading};
 use crate::plugins::text::{TextParseCapability, TextPlugin};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::translation_map;
+use super::pair_map;
 
 /// 附录分隔标记（OriginalPlusAppendix 文尾行）。
 const APPENDIX_MARK: &str = "【译文】";
 
-/// txt 双语回写：见模块级文档。`translated` 的 id 与
+/// txt 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（`p0-b{块序}`）；未匹配 /
-/// 空白译文条目忽略；失败返回 `corrupt`。
+/// 空白译文条目忽略；失败返回 `corrupt`。返回
+/// [`crate::writeback::WritebackReport`]（口径见模块级文档）。
 pub fn writeback_txt(
     in_path: impl AsRef<Path>,
-    translated: &[(String, String)],
+    pairs: &[crate::emit::TranslationPair],
     strategy: BiStrategy,
     out: impl AsRef<Path>,
-) -> Result<()> {
+) -> Result<crate::writeback::WritebackReport> {
     let in_path = in_path.as_ref();
     let out = out.as_ref();
 
@@ -79,7 +87,8 @@ pub fn writeback_txt(
         // 口径，未来 txt 管线若有变化也不会错位。
         .filter(|u| u.kind != crate::model::BlockKind::Table)
         .collect();
-    let map = translation_map(translated);
+    let map = pair_map(pairs);
+    let mut report = crate::writeback::WritebackReport::default();
 
     // C. 重扫描原文行，产块 × 行区间（解析侧同口径）
     let spans = line_spans(&text);
@@ -92,7 +101,7 @@ pub fn writeback_txt(
         return Err(DocError::corrupt("txt 对齐失败：重扫描槽位数与解析块数不一致"));
     }
 
-    // D. 块 × 单元按序配对（同一过滤口径）+ 一致性守卫 + 译文查找
+    // D. 块 × 单元按序配对（同一过滤口径）+ 一致性守卫 + 源校验 + 译文查找
     let mut matched: Vec<(usize, String)> = Vec::new(); // (块序, 译文)，文档序
     let mut cursor = 0usize;
     for (k, b) in blocks.iter().enumerate() {
@@ -102,18 +111,33 @@ pub fn writeback_txt(
         }
         let Some(unit) = units.get(cursor) else { break };
         cursor += 1;
-        // 双保险：重扫描文本必须与权威单元文本一致
+        // 双保险：重扫描文本必须与权威单元文本一致（④ 内部守卫）；有译文
+        // 的单元守卫失败记报告（无译文 = 正常未翻译，不是跳过）
         if slots[k].text != unit.text {
+            if let Some((tr, _)) = map.get(unit.id.as_str()) {
+                if !tr.trim().is_empty() {
+                    report.skip(unit.id.clone(), "文本守卫不一致");
+                }
+            }
             continue;
         }
-        let Some(tr) = map.get(unit.id.as_str()) else {
+        let Some((tr, src_opt)) = map.get(unit.id.as_str()).copied() else {
             continue;
         };
         let tr = tr.trim();
         if tr.is_empty() {
             continue;
         }
+        // ①→④ 边界：译文对携带的①源文本与当前(④)文本不一致 → 跳过并记报告
+        //（位置锚点在新文件里指向别的文本，写下去就是静默错位写）
+        if let Some(src) = src_opt {
+            if src.trim() != unit.text.trim() {
+                report.skip(unit.id.clone(), "源文本不一致（提取后文件已变更）");
+                continue;
+            }
+        }
         matched.push((k, tr.to_string()));
+        report.written += 1;
     }
 
     // E. 按策略重组（Appendix 原文原样 + 文尾附录；Inline/Only 行级重组）
@@ -141,7 +165,8 @@ pub fn writeback_txt(
     }
     out_bytes.extend_from_slice(out_text.as_bytes());
     std::fs::write(out, out_bytes)
-        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))
+        .map_err(|e| DocError::corrupt(format!("cannot create {}: {e}", out.display())))?;
+    Ok(report)
 }
 
 /// 输入解码：UTF-8（BOM 剥除后）直取；非 UTF-8 走解析侧同链
@@ -367,10 +392,15 @@ mod tests {
             .collect()
     }
 
-    fn write(in_path: &Path, out_path: &Path, tr: &[(&str, &str)], strategy: BiStrategy) {
-        let translated: Vec<(String, String)> =
-            tr.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
-        writeback_txt(in_path, &translated, strategy, out_path).unwrap();
+    fn write(
+        in_path: &Path,
+        out_path: &Path,
+        tr: &[(&str, &str)],
+        strategy: BiStrategy,
+    ) -> crate::writeback::WritebackReport {
+        let pairs: Vec<crate::emit::TranslationPair> =
+            tr.iter().map(|(a, b)| (a.to_string(), b.to_string()).into()).collect();
+        writeback_txt(in_path, &pairs, strategy, out_path).unwrap()
     }
 
     const NOVEL: &str = "\
@@ -624,13 +654,131 @@ mod tests {
             std::fs::write(&bad_path, [0xD6u8, 0xD0, 0xCE, 0xC4, 0x0A, 0x0A, b'b']).unwrap();
             let err = writeback_txt(
                 &bad_path,
-                &[("p0-b0".to_string(), "Chinese.".to_string())],
+                &[("p0-b0".to_string(), "Chinese.".to_string()).into()],
                 BiStrategy::BilingualInline,
                 &bad_out,
             )
             .unwrap_err();
             assert_eq!(err.code.as_str(), "corrupt");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源校验（①→④ 边界）金测：`source` 与④文本一致 → 与二元组形态
+    /// （source = None）逐字节等价（迁移无行为漂移）；`source` 不一致
+    ///（构造：提取后改 pair.source 为别串）→ 该单元跳过（原处保持原文）
+    /// + report.skipped 含 (id, "源文本不一致…")。
+    #[test]
+    fn source_mismatch_skips_and_reports() {
+        let dir = case_dir("srcmismatch");
+        let in_path = dir.join("in.txt");
+        std::fs::write(&in_path, "第一章 起\n\n正文一段句子。\n\n尾段完整句子。\n").unwrap();
+        assert_eq!(unit_ids(&in_path), ["p0-b0", "p0-b1", "p0-b2"]);
+
+        // 中间单元的源文本故意与文件不一致（模拟①→④之间文件被改）
+        let pairs: Vec<crate::emit::TranslationPair> = vec![
+            (
+                "p0-b0".to_string(),
+                "第一章 起".to_string(),
+                "The beginning.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b1".to_string(),
+                "提取后被改掉的别串。".to_string(),
+                "Drifted body.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b2".to_string(),
+                "尾段完整句子。".to_string(),
+                "The ending.".to_string(),
+            )
+                .into(),
+        ];
+        let out_path = dir.join("out.txt");
+        let report =
+            writeback_txt(&in_path, &pairs, BiStrategy::BilingualInline, &out_path).unwrap();
+        assert_eq!(report.written, 2, "一致的两条写入");
+        assert_eq!(
+            report.skipped,
+            vec![(
+                "p0-b1".to_string(),
+                "源文本不一致（提取后文件已变更）".to_string()
+            )]
+        );
+        let out = std::fs::read_to_string(&out_path).unwrap();
+        assert!(out.contains("正文一段句子。"), "源不一致的单元保持原文");
+        assert!(!out.contains("Drifted body."), "错位译文不落盘");
+        assert!(out.contains("The beginning.") && out.contains("The ending."));
+
+        // 迁移等价性：二元组（source = None）与三元组一致源输出逐字节一致
+        let tuples: Vec<crate::emit::TranslationPair> = vec![
+            ("p0-b0".to_string(), "The beginning.".to_string()).into(),
+            ("p0-b1".to_string(), "Body text.".to_string()).into(),
+            ("p0-b2".to_string(), "The ending.".to_string()).into(),
+        ];
+        let with_src: Vec<crate::emit::TranslationPair> = vec![
+            (
+                "p0-b0".to_string(),
+                "第一章 起".to_string(),
+                "The beginning.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b1".to_string(),
+                "正文一段句子。".to_string(),
+                "Body text.".to_string(),
+            )
+                .into(),
+            (
+                "p0-b2".to_string(),
+                "尾段完整句子。".to_string(),
+                "The ending.".to_string(),
+            )
+                .into(),
+        ];
+        let out_none = dir.join("out-none.txt");
+        let out_src = dir.join("out-src.txt");
+        let r_none =
+            writeback_txt(&in_path, &tuples, BiStrategy::BilingualInline, &out_none).unwrap();
+        let r_src =
+            writeback_txt(&in_path, &with_src, BiStrategy::BilingualInline, &out_src).unwrap();
+        assert_eq!(
+            std::fs::read(&out_none).unwrap(),
+            std::fs::read(&out_src).unwrap(),
+            "None 与一致源逐字节等价"
+        );
+        assert_eq!((r_none.written, r_none.skipped.len()), (3, 0));
+        assert_eq!((r_src.written, r_src.skipped.len()), (3, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 报告计数（部分命中）：无译文单元不记（正常未翻译）、未匹配 id 不记、
+    /// 命中计入 written；OriginalPlusAppendix 的文尾附录写入同样计数。
+    #[test]
+    fn report_counts_partial_hits() {
+        let dir = case_dir("report-counts");
+        let in_path = dir.join("in.txt");
+        std::fs::write(&in_path, "第一章 起\n\n正文一段句子。\n\n尾段完整句子。\n").unwrap();
+
+        // 只给首尾两条（p0-b1 无译文 = 正常未翻译，不记 skipped），外加未匹配 id
+        let pairs: Vec<crate::emit::TranslationPair> = vec![
+            ("p0-b0".to_string(), "The beginning.".to_string()).into(),
+            ("p0-b2".to_string(), "The ending.".to_string()).into(),
+            ("p0-b99".to_string(), "bogus".to_string()).into(),
+        ];
+        let out_path = dir.join("out.txt");
+        let report =
+            writeback_txt(&in_path, &pairs, BiStrategy::OriginalPlusAppendix, &out_path).unwrap();
+        assert_eq!(report.written, 2);
+        assert!(report.skipped.is_empty(), "无译文与未匹配 id 都不是 skip");
+        let out = std::fs::read_to_string(&out_path).unwrap();
+        assert!(out.contains(APPENDIX_MARK));
+        assert!(out.contains("The beginning.") && out.contains("The ending."));
+        assert!(!out.contains("bogus"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

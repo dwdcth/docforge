@@ -203,6 +203,40 @@ impl TranslationUnit {
     }
 }
 
+/// 译文对：id 锚点 + 译文 + 可选的**①侧源文本**（自校验锚点）。
+///
+/// 回写管线两处解析（① 消费者提取译文依据 / ④ 回写器重解析建立块序）
+/// 之间文件可能被修改——位置锚点在新文件里会指向**别的文本**，而回写器
+/// 内部的"槽位 ↔ 单元"守卫两侧都来自 ④，拦不住这种漂移（静默错位写，
+/// 回写族的最恶劣故障模式）。`source: Some` 把 ① 侧源文本随译文带上：
+/// 回写器写入前校验它与当前（④）文本逐字一致，不一致跳过该单元并在
+/// `WritebackReport` 记因（宁漏勿错）。
+///
+/// `None` = 信任锚点（现行为）；`(id, 译文)` 二元组 `From` 即此形态，
+/// `(id, 源文本, 译文)` 三元组 `From` 为带校验形态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationPair {
+    /// [`TranslationUnit::id`]（回写锚点）。
+    pub id: String,
+    /// 译文（空白视为未提供，与回写既有口径一致）。
+    pub translation: String,
+    /// 提取译文时依据的源文本（① 侧）；`None` = 不校验。
+    pub source: Option<String>,
+}
+
+impl From<(String, String)> for TranslationPair {
+    fn from((id, translation): (String, String)) -> Self {
+        TranslationPair { id, translation, source: None }
+    }
+}
+
+impl From<(String, String, String)> for TranslationPair {
+    /// `(id, 源文本, 译文)`——带源校验的形态。
+    fn from((id, source, translation): (String, String, String)) -> Self {
+        TranslationPair { id, translation, source: Some(source) }
+    }
+}
+
 /// 文本是否含**可翻译的自然语言**（事实谓词；策略归消费者）。
 ///
 /// 这是三级"什么值得翻译"判据的第三级事实：块类白名单（[`is_translatable`]）
@@ -413,11 +447,11 @@ fn translation_md(b: &crate::model::Block, translation: &str) -> String {
     }
 }
 
-/// 双语 Markdown 回写：`translated` 的键对应 [`to_translation_units`] 的 id
+/// 双语 Markdown 回写：`pairs` 的 id 对应 [`to_translation_units`] 的 id
 /// 锚点（`p{页}-b{块序}`）；无译文的块按策略保留原文。未匹配的译文 id 忽略。
 /// 默认 [`BiStrategy::BilingualInline`]；见 [`to_bilingual_markdown_with`]。
-pub fn to_bilingual_markdown(doc: &Document, translated: &[(String, String)]) -> String {
-    to_bilingual_markdown_with(doc, translated, BiStrategy::default())
+pub fn to_bilingual_markdown(doc: &Document, pairs: &[TranslationPair]) -> String {
+    to_bilingual_markdown_with(doc, pairs, BiStrategy::default())
 }
 
 /// [`to_bilingual_markdown`] 带策略。
@@ -445,14 +479,19 @@ pub fn to_bilingual_markdown(doc: &Document, translated: &[(String, String)]) ->
 /// 列表项逐条独立）；List/Quote 的译文为纯文本，Markdown 渲染中作为前文
 /// 续行/正文出现；Table 块按译后网格渲染（单元格锚点逐格查译文，无任何
 /// 命中格时输出与 [`to_markdown`] 的表格渲染逐字节一致）。
+///
+/// `TranslationPair::source` 在此**忽略**（md 无重解析，锚点与 doc 同对象）：
+/// 回写依据与输入 `doc` 是同一份块序，① 提取与 ④ 回写之间不存在文件变更
+/// 边界，源校验无从谈起——二元组与三元组（含不一致源）形态行为一致。
 pub fn to_bilingual_markdown_with(
     doc: &Document,
-    translated: &[(String, String)],
+    pairs: &[TranslationPair],
     strategy: BiStrategy,
 ) -> String {
-    let map: std::collections::HashMap<&str, &str> = translated
+    // md 无重解析，锚点与 doc 同对象：忽略 source（二元组/三元组形态一致）
+    let map: std::collections::HashMap<&str, &str> = pairs
         .iter()
-        .map(|(id, t)| (id.as_str(), t.as_str()))
+        .map(|p| (p.id.as_str(), p.translation.as_str()))
         .collect();
 
     if strategy == BiStrategy::OriginalPlusAppendix {
@@ -959,8 +998,8 @@ mod tests {
 
         // 附录只收正文：页眉译文不进（与 to_appendix_pages 同口径）
         let translated = vec![
-            ("p0-b0".to_string(), "Technical Whitepaper V3".to_string()),
-            ("p0-b1".to_string(), "Body paragraph.".to_string()),
+            ("p0-b0".to_string(), "Technical Whitepaper V3".to_string()).into(),
+            ("p0-b1".to_string(), "Body paragraph.".to_string()).into(),
         ];
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
         assert!(md.contains("# 译文"), "有命中译文，附录存在");
@@ -1137,9 +1176,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let translated: Vec<(String, String)> = to_translation_units(&doc)
+        let translated: Vec<TranslationPair> = to_translation_units(&doc)
             .iter()
-            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译{}", u.text)).into())
             .collect();
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
         assert_eq!(md, "| 译表头甲 | 译表头乙 |\n| --- | --- |\n| 译格一 | 译格二 |");
@@ -1156,9 +1195,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let translated: Vec<(String, String)> = to_translation_units(&doc)
+        let translated: Vec<TranslationPair> = to_translation_units(&doc)
             .iter()
-            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译{}", u.text)).into())
             .collect();
         assert_eq!(
             to_bilingual_markdown(&doc, &translated),
@@ -1176,9 +1215,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let translated: Vec<(String, String)> = to_translation_units(&doc)
+        let translated: Vec<TranslationPair> = to_translation_units(&doc)
             .iter()
-            .map(|u| (u.id.clone(), format!("译{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译{}", u.text)).into())
             .collect();
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
         // 正文 = to_markdown 原样（表格原文保留）；附录只收段落类译文
@@ -1204,7 +1243,7 @@ mod tests {
             ..Default::default()
         };
         // 只命中段落，表格格全部未命中（默认 BilingualInline：段内对照）
-        let translated = vec![("p0-b0".to_string(), "译正文一段。".to_string())];
+        let translated = vec![("p0-b0".to_string(), "译正文一段。".to_string()).into()];
         let md = to_bilingual_markdown(&doc, &translated);
         assert_eq!(
             md,
@@ -1229,7 +1268,7 @@ mod tests {
             "| a\\|b | c |\n| --- | --- |\n| d | e |"
         );
         // 仅译文：译格 r0c1 含竖线 → 转义后注入
-        let translated = vec![("p0-b0-r0c1".to_string(), "x|y".to_string())];
+        let translated = vec![("p0-b0-r0c1".to_string(), "x|y".to_string()).into()];
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
         assert_eq!(md, "| a\\|b | x\\|y |\n| --- | --- |\n| d | e |");
         // 对照形态：译文中竖线同样转义
@@ -1254,9 +1293,9 @@ mod tests {
         };
         let units = to_translation_units(&doc);
         assert_eq!(units.len(), 2 + 4, "标题 + 段落 + 2×2 格");
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)).into())
             .collect();
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
         assert_eq!(
@@ -1282,7 +1321,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string())];
+        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string()).into()];
         let md = to_bilingual_markdown(&doc, &translated);
         // 译文紧贴原文（对照紧凑），块与块之间仍空行分隔
         assert_eq!(md, "第一段原文。\n第一段译文。\n\n第二段原文。");
@@ -1298,7 +1337,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string())];
+        let translated = vec![("p0-b0".to_string(), "第一段译文。".to_string()).into()];
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::TranslationOnly);
         assert_eq!(md, "第一段译文。\n\n第二段原文。");
         assert!(!md.contains("第一段原文。"), "原文被译文替换，不再出现");
@@ -1322,9 +1361,9 @@ mod tests {
             ..Default::default()
         };
         let translated = vec![
-            ("p0-b0".to_string(), "开篇译文。".to_string()),
-            ("p0-b2".to_string(), "甲段译文。".to_string()),
-            ("p0-b4".to_string(), "乙段译文。".to_string()),
+            ("p0-b0".to_string(), "开篇译文。".to_string()).into(),
+            ("p0-b2".to_string(), "甲段译文。".to_string()).into(),
+            ("p0-b4".to_string(), "乙段译文。".to_string()).into(),
         ];
         let md = to_bilingual_markdown_with(&doc, &translated, BiStrategy::OriginalPlusAppendix);
         let expected = format!(
@@ -1345,8 +1384,8 @@ mod tests {
             ..Default::default()
         };
         let translated = vec![
-            ("p9-b9".to_string(), "错页译文。".to_string()),
-            ("p0-b99".to_string(), "错块译文。".to_string()),
+            ("p9-b9".to_string(), "错页译文。".to_string()).into(),
+            ("p0-b99".to_string(), "错块译文。".to_string()).into(),
         ];
         assert_eq!(
             to_bilingual_markdown(&doc, &translated),
@@ -1396,9 +1435,9 @@ mod tests {
             ["p7-b0", "p7-b1", "p7-b4", "p7-b5", "p1-b0"]
         );
         // 用提取侧发出的全部 id（译文取单元文本加前缀，逐单元可分辨）喂入回写
-        let translated: Vec<(String, String)> = units
+        let translated: Vec<TranslationPair> = units
             .iter()
-            .map(|u| (u.id.clone(), format!("译-{}", u.text)))
+            .map(|u| (u.id.clone(), format!("译-{}", u.text)).into())
             .collect();
         let md = to_bilingual_markdown(&doc, &translated); // BilingualInline
         // 全命中：每个单元的原文渲染与译文直连成对出现——漏命中即退化为
@@ -1411,6 +1450,33 @@ mod tests {
         //（原/译各 1），非单元块贡献原行数（Code 3 行 + 被 min_chars 滤掉的
         // 短块乙 1 行）：14 = 5×2 + 4
         assert_eq!(md.lines().filter(|l| !l.is_empty()).count(), 2 * units.len() + 4);
+    }
+
+    /// md 忽略 source（md 无重解析，锚点与 doc 同对象）：三元组形态带
+    /// 「错误源文本」不改变写入行为——回写依据与输入 doc 是同一份块序，
+    /// ① 提取与 ④ 回写之间不存在文件变更边界，源校验无从谈起（与
+    /// writeback 族「源不一致即跳过」的口径刻意相反，见金测注释）。
+    #[test]
+    fn bilingual_markdown_ignores_pair_source() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![para("第一段原文。")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // (id, 源文本, 译文) 三元组：源文本故意与块文本不一致
+        let pairs = vec![(
+            "p0-b0".to_string(),
+            "完全无关的别处文本".to_string(),
+            "第一段译文。".to_string(),
+        )
+            .into()];
+        assert_eq!(to_bilingual_markdown(&doc, &pairs), "第一段原文。\n第一段译文。");
+        assert_eq!(
+            to_bilingual_markdown_with(&doc, &pairs, BiStrategy::TranslationOnly),
+            "第一段译文。"
+        );
     }
 
     #[test]
