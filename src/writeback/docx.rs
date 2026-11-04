@@ -25,6 +25,28 @@
 //! * 文本提取语义与解析侧 `extract_para` 相同（同一实现，无镜像）：只收
 //!   `w:t` 文本（含实体解码 / CDATA），`w:tab`→`\t`、`w:br`/`w:cr`→`\n`、
 //!   `w:noBreakHyphen`→`-`；文本框等嵌套 `w:p` 的 `w:t` 并入外层段落文本。
+//!   `mc:Fallback` 子树同步跳过（β 红利缺陷①）：Choice/Fallback 内容完全
+//!   相同，只提取/改写 Choice 分支，Fallback 字节原样（现代渲染器全覆盖；
+//!   极老阅读器看未译 Fallback 可接受）。
+//! * 段落位 TranslationOnly 双路径（β 红利缺陷②：首 run 样式劫持修复）：
+//!   段内无内联物件（判据采集见解析侧 `extract_para`：drawing/pict/object/
+//!   oMath/脚注尾注引用/fldSimple 之一即物件；tab/br/cr/noBreakHyphen 等
+//!   布局承载元素同判物件——快路径整段净荷替换会删掉它们（软换行段落变
+//!   单行、tab 位/分页符丢失））时走**快路径**——
+//!   pPr 之后的整段净荷替换为单个干净 run（主导 rPr 原字节切片 + 恒带
+//!   preserve 的合成 `w:t`）。主导样式 = 段内可见字符最多的 run 直属 rPr
+//!   （上下标 run 不参选；无 rPr 的 run 胜出则不带切片）——译文不再被恰巧
+//!   排在段首的角标/装饰 run 劫持样式，普通段落整段替换零损失。含内联物件
+//!   （图/框/域/分页符）的段落走**保真路径**：维持「首 `w:t` 换译文、其余
+//!   清空」旧口径，物件字节原样。快路径的合成 `w:t` 恒带 preserve，
+//!   `xml:space` 条件补对它天然满足（保真路径维持 `preserve_space_tag_edit`
+//!   原逻辑）；净荷区间不包住全部 `w:t`（漂移防御）也落保真路径。格位不
+//!   参与双路径（格内首 `w:t` 换译口径不变）。
+//! * BilingualInline 译段 run 样式口径变化（β 红利兑现）：**正文段落**追加
+//!   译段的 run 切主导 rPr 原字节切片（双语对照的译文沿用原文主导样式，不
+//!   再极简无 rPr）；**表格格内**追加译段维持 9pt 最小 rPr（窄列长译文防
+//!   撑乱，见下方表格口径）。主导 run 无 rPr 时正文译段不带切片，与旧形态
+//!   字节一致。
 //! * 双保险（守卫保留）：每个位与对应单元做文本一致性比对（格位同款），
 //!   不一致跳过该位不写、单元照常消费保流对齐——宁漏勿错。位与单元同源后
 //!   守卫退化为不变量检查（触发即信物缺失落空位 / 发号↔展开漂移），①→④
@@ -245,8 +267,19 @@ struct ParaSlot {
     /// 原段 `<w:pPr ...>...</w:pPr>` 原文（无则 None）——BilingualInline 复制样式用。
     ppr: Option<String>,
     /// 段内 `w:t` 文本内容的字节 span（Text/GeneralRef/CData 事件级），
-    /// TranslationOnly 用：首段换译文、其余清空。
+    /// TranslationOnly 保真路径用：首段换译文、其余清空。
     text_spans: Vec<(usize, usize)>,
+    /// 段内各 `w:t` 完整元素字节区间——快路径漂移守卫：净荷替换区间必须
+    /// 包住全部 `w:t`，不满足（槽位与文件漂移的防御）落保真路径。
+    wt_spans: Vec<(usize, usize)>,
+    /// 主导 run 直属 rPr 原文切片（已从原 XML 取字节；None = 主导 run 无
+    /// rPr / 无候选 → 译文 run 不带 rPr）。快路径干净 run 与 BilingualInline
+    /// 正文译段的样式来源。
+    dominant_rpr: Option<String>,
+    /// 段内含非文本内联物件（解析侧判据）→ TranslationOnly 保真路径。
+    has_non_text_inline: bool,
+    /// 段净荷区间（pPr 之后到 `</w:p>` 起符）——快路径整段替换区间。
+    inner_content: (usize, usize),
 }
 
 /// 一个「表格格位」：`<w:tc>` 的格文本与格内直接子级 `w:p` 段位。
@@ -343,6 +376,13 @@ fn materialize_para(p: &crate::backends::office::docx::DocxParaSlot, xml: &str) 
         text: p.text.clone(),
         ppr: p.ppr.and_then(|(s, e)| xml.get(s..e).map(str::to_string)),
         text_spans: p.text_spans.clone(),
+        wt_spans: p.wt_spans.clone(),
+        // 主导 rPr 原字节切片（越界防御取 None = 不带切片，宁缺勿错）
+        dominant_rpr: p
+            .dominant_rpr_span
+            .and_then(|(s, e)| xml.get(s..e).map(str::to_string)),
+        has_non_text_inline: p.has_non_text_inline,
+        inner_content: p.inner_content,
     }
 }
 
@@ -353,6 +393,10 @@ fn empty_para_slot() -> Slot {
         text: String::new(),
         ppr: None,
         text_spans: Vec::new(),
+        wt_spans: Vec::new(),
+        dominant_rpr: None,
+        has_non_text_inline: false,
+        inner_content: (0, 0),
     })
 }
 
@@ -432,10 +476,12 @@ fn matched_translations(
     out
 }
 
-/// BilingualInline：在原 `</w:p>` 后插入译文段（复制原段 pPr，文本 = 译文）；
-/// 格位则追在格内最后一个 `w:p` 之后（复制格内首段的 pPr；译段 run 用全新
-/// 最小 rPr——仅 `w:sz`/`w:szCs` = 18 半点 = 9pt 的固定小字号，不复制原
-/// run 的 rPr，见模块头；含嵌套表的格 v1 不写，见模块头）。
+/// BilingualInline：在原 `</w:p>` 后插入译文段（复制原段 pPr，译文 run 切
+/// 主导 rPr 原字节切片——正文双语对照的译文沿用原文主导样式，主导 run 无
+/// rPr 则不带切片，见模块头口径变化）；格位则追在格内最后一个 `w:p` 之后
+/// （复制格内首段的 pPr；译段 run 用全新最小 rPr——仅 `w:sz`/`w:szCs` =
+/// 18 半点 = 9pt 的固定小字号，不复制原 run 的 rPr，见模块头；含嵌套表的
+/// 格 v1 不写，见模块头）。
 ///
 /// 返回编辑序列（流式拼接：原串 + 编辑由 [`EntryPayload::Spans`] 直写，整篇
 /// 的第二份 String 不再拼出）；无命中返回空序列（= 原样回写）。
@@ -460,10 +506,14 @@ fn apply_inline(
                 // 制节符 = 译文段自带换页边界，双语段间多一页空白（见
                 // strip_sectpr 与函数文档）。格位分支不剥：节符不落表格内。
                 let ppr = strip_sectpr(p.ppr.as_deref().unwrap_or_default());
+                // 正文译段 run 切主导 rPr 原字节切片（口径变化见模块头）：
+                // 译文沿用原文主导样式；主导 run 无 rPr（None）→ 不带切片，
+                // 与旧行为字节一致。切片是原文档自身字节，合法可嵌回。
+                let rpr = p.dominant_rpr.as_deref().unwrap_or_default();
                 edits.push(Edit::Insert(
                     p.end,
                     format!(
-                        "<w:p>{ppr}<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+                        "<w:p>{ppr}<w:r>{rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
                         escape_xml_text(&tr)
                     ),
                 ));
@@ -569,12 +619,16 @@ fn apply_translation_only(
         .collect()
 }
 
-/// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位首 `w:t` 换译
-/// 文、其余清空；格位口径见 [`apply_translation_only`] 文档（含嵌套表的格
-/// / 无文本节点的位保守跳过——跳过即无编辑，节交替的「命中」判定以此为
-/// 准）。[`writeback_docx`] 与 [`writeback_docx_alternating`] 共用：后者按
-/// 分段区间平移取用同一编辑流，不另写渲染。报告：实际产出编辑的单元计
-/// written，结构跳过记因。
+/// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位走双路径（快
+/// 路径 = 无内联物件段落整段净荷替换为「主导 rPr + preserve 合成 `w:t`」
+/// 的干净 run，首 run 样式劫持在此根治；保真路径 = 首 `w:t` 换译文、其余
+/// 清空——含图/框/域/分页符等物件或净荷区间漂移的段落，物件字节原样）；
+/// 格位口径见 [`apply_translation_only`] 文档（含嵌套表的格 / 无文本节点
+/// 的位保守跳过——跳过即无编辑，节交替的「命中」判定以此为准）。
+/// [`writeback_docx`] 与 [`writeback_docx_alternating`] 共用：后者按分段
+/// 区间平移取用同一编辑流，不另写渲染（快路径的净荷替换编辑同样只落单段
+/// 内、随段拷贝进译文段）。报告：实际产出编辑的单元计 written，结构跳过
+/// 记因。
 ///
 /// 首 `w:t` 写入文本 = 配对期 trim 后的译文；当译文**原文**（map 原始值，
 /// trim 之前）首/尾带空白、且其开始标签未带 `xml:space` 属性时，额外产出
@@ -598,18 +652,46 @@ fn translation_only_edits(
         let raw_tr = map.get(units[k].id.as_str()).map(|(raw, _)| *raw);
         match &slots[k] {
             Slot::Para(p) => {
-                let spans = &p.text_spans;
-                if spans.is_empty() {
+                if p.text_spans.is_empty() {
                     // 无文本节点可换（文本全来自 tab/br 占位）：保守跳过
                     report.skip(units[k].id.clone(), "结构限制（无文本节点）");
                     continue;
                 }
-                let mut it = spans.iter();
-                let first = it.next().unwrap();
-                edits.push((first.0, first.1, escape_xml_text(&tr)));
-                edits.extend(raw_tr.and_then(|raw| preserve_space_tag_edit(xml, first.0, raw)));
-                for span in it {
-                    edits.push((span.0, span.1, String::new()));
+                // 快路径判据：段内无内联物件与布局承载元素（tab/br/cr/
+                // noBreakHyphen——旧路径保留其 run，快路径整段替换会删掉；
+                // 分页 br 同为节交替分页语义载
+                // 体，删了破分页）且净荷区间包住全部 `w:t`（后者防御槽位与
+                // 文件漂移，不满足落保真路径，宁漏勿错）
+                let fast = !p.has_non_text_inline
+                    && p.wt_spans
+                        .iter()
+                        .all(|&(s, e)| p.inner_content.0 <= s && e <= p.inner_content.1);
+                if fast {
+                    // 整段净荷替换：pPr 之后到 `</w:p>` 之前 = 单个干净 run
+                    // （主导 rPr 原字节切片 + 恒带 preserve 的合成 `w:t`）。
+                    // 译文样式跟随段内可见字符最多的 run（上下标角标 run 已
+                    // 在解析侧排除参选），不再被段首角标/装饰 run 劫持；段落
+                    // 无内联物件时整段替换零损失。合成 `w:t` 恒带 preserve →
+                    // preserve_space_tag_edit 的条件补对快路径天然满足。
+                    let rpr = p.dominant_rpr.as_deref().unwrap_or_default();
+                    edits.push((
+                        p.inner_content.0,
+                        p.inner_content.1,
+                        format!(
+                            "<w:r>{rpr}<w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                            escape_xml_text(&tr)
+                        ),
+                    ));
+                } else {
+                    // 保真路径（含图/框/域/br/tab 等布局与物件）：维持「首 `w:t` 换译
+                    // 文、其余清空」旧口径——内联物件与书签/域结构字节原样
+                    let mut it = p.text_spans.iter();
+                    let first = it.next().unwrap();
+                    edits.push((first.0, first.1, escape_xml_text(&tr)));
+                    edits.extend(raw_tr.and_then(|raw| preserve_space_tag_edit(xml, first.0, raw)));
+                    for span in it {
+                        edits.push((span.0, span.1, String::new()));
+                    }
                 }
                 report.written += 1;
             }
@@ -1244,13 +1326,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// TranslationOnly 的 xml:space 条件补（保真小项①）：译文原文（map 原始
-    /// 值）首/尾带空白 → 首 `w:t` 开始标签补 `xml:space="preserve"`（写入文
-    /// 本仍为配对期 trim 后的译文，与合成段落口径一致）；译文无边缘空白 →
-    /// 标签字节原样（最小侵入：全文档无任何新增 preserve）；段落位与格位
-    /// 首 `w:t` 同款；重解析文本正确、结构零扰动。
+    /// TranslationOnly 的 xml:space 口径（快路径形态变化）：段落位走快路径
+    /// （普通段落整段净荷替换）后，合成 `w:t` **恒带** preserve——旧形态：
+    /// 只有译文原文带边缘空白时才条件补标签（断言更新理由：快路径的干净
+    /// run 是合成件，防 Word 吞空格与合成段落同口径，不再依赖译文边缘空白
+    /// 判据）；格位仍走旧「首 `w:t` 原地替换」路径，条件补判据不变（译文
+    /// 带边缘空白才补）；写入文本均为配对期 trim 后的译文；重解析文本正确、
+    /// 块数与原文一致。
     #[test]
-    fn translation_only_preserve_added_only_for_edge_whitespace() {
+    fn translation_only_preserve_fast_path_always_fidelity_conditional() {
         let dir = case_dir("tonly-space");
         let in_path = dir.join("in.docx");
         let out_path = dir.join("out.docx");
@@ -1259,20 +1343,22 @@ mod tests {
             &in_path,
             &out_path,
             &[
-                ("p0-b0", "  Chapter 1  "),    // 边缘空白 → 补 preserve
-                ("p0-b1", "Plain body"),       // 无边缘空白 → 标签不动
-                ("p0-b3-r0c0", " Cell Head "), // 格位首 w:t 同款
+                ("p0-b0", "  Chapter 1  "),    // 段落位快路径：恒 preserve
+                ("p0-b1", "Plain body"),       // 段落位快路径：恒 preserve（旧形态无）
+                ("p0-b3-r0c0", " Cell Head "), // 格位保真路径：边缘空白 → 条件补
             ],
             BiStrategy::TranslationOnly,
         );
 
         let out_xml = entry_str(&out_path, "word/document.xml");
-        // 带边缘空白的译文：开始标签补 preserve（写入文本 = trim 后译文）
+        // 段落位（快路径）：合成 w:t 恒带 preserve（写入文本 = trim 后译文）
         assert!(out_xml.contains(r#"<w:t xml:space="preserve">Chapter 1</w:t>"#));
+        assert!(out_xml.contains(r#"<w:t xml:space="preserve">Plain body</w:t>"#));
+        // 格位（旧口径不变）：译文带边缘空白 → 首 w:t 开始标签补 preserve
         assert!(out_xml.contains(r#"<w:t xml:space="preserve">Cell Head</w:t>"#));
-        // 无边缘空白的译文：标签字节原样；全文档 preserve 恰两处（最小侵入）
-        assert!(out_xml.contains("<w:t>Plain body</w:t>"));
-        assert_eq!(out_xml.matches("xml:space").count(), 2);
+        // 全文档 preserve 恰三处（旧形态 2：段落位条件补只对带边缘空白者；
+        // 新形态 3：两个段落位快路径恒带 preserve + 格位条件补一处）
+        assert_eq!(out_xml.matches("xml:space").count(), 3);
 
         // 重解析：写入文本正确（trim 后译文），块数与原文一致（无插入）
         let got = blocks(&out_path);
@@ -1740,6 +1826,10 @@ mod tests {
                 text: "段落文本".to_string(),
                 ppr: None,
                 text_spans: Vec::new(),
+                wt_spans: Vec::new(),
+                dominant_rpr: None,
+                has_non_text_inline: false,
+                inner_content: (0, 0),
             }),
         ];
         let units = vec![
@@ -1915,9 +2005,11 @@ mod tests {
         const LANDSCAPE: &str =
             r#"<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr>"#;
         assert_eq!(out_xml.matches(LANDSCAPE).count(), 2);
-        // 译文节尾段 = 原段字节拷贝换文本（节符拷贝随拷贝而来）
+        // 译文节尾段 = 原段字节拷贝净荷替换（节符拷贝随 pPr 原字节保留而来；
+        // 断言更新：旧形态首 w:t 原地换文无 preserve，新形态快路径合成 w:t
+        // 恒带 preserve，pPr 含节符字节原样）
         assert!(out_xml.contains(
-            r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t>S1 P2.</w:t></w:r></w:p>"#
+            r#"<w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr></w:pPr><w:r><w:t xml:space="preserve">S1 P2.</w:t></w:r></w:p>"#
         ));
         // 无命中段不插：第二节译文不存在、无分页载体段
         assert!(!out_xml.contains("Section 2"));
@@ -1948,9 +2040,12 @@ mod tests {
         let out_xml = entry_str(&out_path, "word/document.xml");
         // 插入结构：原文整体 + 分页段（恰一处，夹在原文与译文之间）+ 译文整体
         assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 1);
+        // 原文段字节原样（alternating 只插入不修改）；断言更新：译文拷贝里
+        // 的 Alpha 段走快路径 → 合成 w:t 恒带 preserve（旧形态原地换文无
+        // preserve）；乙段原文未译字节原样
         assert!(out_xml.contains(&format!(
             "<w:p><w:r><w:t>乙段正文。</w:t></w:r></w:p>{PAGE_BREAK_P}\
-             <w:p><w:r><w:t>Alpha body.</w:t></w:r></w:p>"
+             <w:p><w:r><w:t xml:space=\"preserve\">Alpha body.</w:t></w:r></w:p>"
         )));
         // 重解析：原 2 块 + 译 2 块
         let got = blocks(&out_path);
@@ -2003,7 +2098,10 @@ mod tests {
         let out_xml = entry_str(&out_path, "word/document.xml");
         assert_eq!(out_xml.matches(PAGE_BREAK_P).count(), 1);
         assert_eq!(out_xml.matches(r#"<w:br w:type="page"/>"#).count(), 3);
-        // 译文乙页首段 = 原段字节拷贝换文本（段首分页随拷贝而来）
+        // 译文乙页首段 = 原段字节拷贝换文本（段首分页随拷贝而来）。该段含
+        // 分页 br → has_non_text_inline → 走保真路径：分页载体字节原样、
+        // 首 w:t 原地换文无 preserve——快路径整段替换会删掉分页 br、破节交
+        // 替分页语义，这正是分页 br 列入内联物件判据的考点
         assert!(out_xml.contains(
             r#"<w:p><w:r><w:br w:type="page"/></w:r><w:r><w:t>Beta first.</w:t></w:r></w:p>"#
         ));
@@ -2361,6 +2459,11 @@ mod tests {
             ("plain", PLAIN_XML),
             ("page-break", PAGE_BREAK_XML),
             ("table-section", TABLE_SECTION_XML),
+            // 缺陷①/②新形态：Fallback 跳过 / 劫持段 / 内联物件段 / 主导样式段
+            ("fallback", FALLBACK_XML),
+            ("hijack", HIJACK_XML),
+            ("drawing", DRAWING_XML),
+            ("dominant", DOMINANT_XML),
         ];
         let dir = case_dir("enum-equiv");
         for (name, xml) in fixtures {
@@ -2437,6 +2540,267 @@ mod tests {
         // 槽位表自洽：信物区间全部落在表内
         assert_eq!(sidecar.slots.len(), 6);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // β 红利兑现金测：Fallback 子树跳过 + 主导 rPr 选举 / TranslationOnly 双路径
+    // -------------------------------------------------------------------------
+
+    /// 缺陷① fixture：正文段含 Choice（DrawingML 文本框）+ Fallback（VML 同
+    /// 文本镜像）的形状段（解析侧 Fallback 子树已跳过，槽位 span 只含 Choice）。
+    const FALLBACK_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps">"#,
+        r#"<w:drawing><w:txbxContent><w:p><w:r><w:t>形状文本。</w:t></w:r></w:p></w:txbxContent></w:drawing>"#,
+        r#"</mc:Choice><mc:Fallback>"#,
+        r#"<w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>形状文本。</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>"#,
+        r#"</mc:Fallback></mc:AlternateContent></w:r><w:r><w:t>段落尾文本。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 缺陷② fixture：段首上标角标 run（vertAlign，旧形态劫持源）+ 加粗正文
+    /// 长 run（主导样式）。
+    const HIJACK_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>1</w:t></w:r>"#,
+        r#"<w:r><w:rPr><w:b/></w:rPr><w:t>这里是被角标劫持样式的警告正文，字符明显更多。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 缺陷② fixture：含内联图（`w:drawing`）的段落——保真路径考点。
+    const DRAWING_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>图前文本。</w:t></w:r>"#,
+        r#"<w:r><w:drawing><wp:inline><a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+        r#"<w:r><w:t>图后文本。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 缺陷② fixture：主导 rPr 正文段（短 run 无样式 + 长 run 斜体 12pt = sz
+    /// 24 半点）——BilingualInline 正文译段主导样式考点。
+    const DOMINANT_XML: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:r><w:t>短</w:t></w:r><w:r><w:rPr><w:i/><w:sz w:val="24"/></w:rPr><w:t>这里是一段明显更长的斜体正文文本，用于赢得主导选举。</w:t></w:r></w:p>"#,
+        r#"</w:body></w:document>"#
+    );
+
+    /// 缺陷①金测：Choice+Fallback 同文本的形状段——译文只出现一次；Choice
+    /// 分支被改写；Fallback 字节原样（跳过 = 不改写）。
+    #[test]
+    fn fallback_choice_translated_once_fallback_bytes_untouched() {
+        let dir = case_dir("fallback");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, FALLBACK_XML);
+
+        // 单元流只有一段（Fallback 镜像不成第二个位、不重复提取）
+        assert_eq!(unit_ids(&in_path), ["p0-b0"]);
+        let units = to_translation_units(&parse_doc(&in_path));
+        assert_eq!(units[0].text, "形状文本。段落尾文本。");
+
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Shape text.")],
+            BiStrategy::TranslationOnly,
+        );
+        let out_xml = entry_str(&out_path, "word/document.xml");
+
+        // 译文恰一次（旧形态：Choice 与 Fallback 的 w:t 都在槽位，同句两
+        // 单元、双语输出重复段；新形态只改写 Choice 分支）
+        assert_eq!(out_xml.matches("Shape text.").count(), 1);
+        // Fallback 分支字节原样：未译镜像 + VML 结构未动（跳过 = 不改写）
+        assert!(out_xml.contains(
+            r#"<mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>形状文本。</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>"#
+        ));
+        assert_eq!(
+            out_xml.matches("形状文本。").count(),
+            1,
+            "只剩 Fallback 里的未译镜像"
+        );
+        // Choice 分支被改写：含 drawing → 保真路径（has_non_text_inline），
+        // 首个 w:t（Choice 文本框内）换译文、段落尾 w:t 清空
+        assert!(out_xml.contains(
+            r#"<w:drawing><w:txbxContent><w:p><w:r><w:t>Shape text.</w:t></w:r></w:p></w:txbxContent></w:drawing>"#
+        ));
+        assert!(out_xml.contains("<w:t></w:t>"), "段落尾 w:t 清空");
+        assert!(!out_xml.contains("xml:space"), "保真路径无边缘空白时零标签改写");
+
+        // 重解析合法：段落文本 = 译文（Fallback 不进文本）
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "Shape text.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缺陷②金测：段首上标角标 run + 加粗正文长 run——快路径整段净荷替换，
+    /// 译文样式跟随主导 run（vertAlign 劫持根治）。输出段落 = 单个干净 run
+    /// （主导 rPr 原字节切片 + 恒 preserve 的合成 w:t）；旧形态译文会继承
+    /// `<w:vertAlign w:val="superscript"/>`（首 w:t 恰在角标 run 里）。
+    #[test]
+    fn translation_only_fast_path_rebuilds_payload_with_dominant_rpr() {
+        let dir = case_dir("hijack");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, HIJACK_XML);
+
+        // 单元 = 全段文本（角标 + 正文拼接，同一信物）
+        let units = to_translation_units(&parse_doc(&in_path));
+        assert_eq!(
+            units[0].text,
+            "1这里是被角标劫持样式的警告正文，字符明显更多。"
+        );
+
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Bold body translation.")],
+            BiStrategy::TranslationOnly,
+        );
+        let out_xml = entry_str(&out_path, "word/document.xml");
+
+        // 全文档逐字节金测：角标 run 与正文 run 的整段净荷被替换为单个干净
+        // run（主导 = 加粗 run 的 rPr 原字节切片；无 pPr → 替换区间 = <w:p>
+        // 之后到 </w:p> 之前）
+        assert_eq!(
+            out_xml,
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+                r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Bold body translation.</w:t></w:r></w:p>"#,
+                r#"</w:body></w:document>"#
+            ),
+            "快路径净荷替换：pPr 原字节 + 单个干净 run（主导 rPr 切片）"
+        );
+        assert!(!out_xml.contains("vertAlign"), "译文不得继承上下标样式（劫持根治）");
+
+        // 重解析：单段单译文
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "Bold body translation.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缺陷②：含内联图的段落走保真路径——图片字节原样、首 `w:t` 换译文、
+    /// 其余清空（旧口径；快路径整段替换会毁掉 drawing 结构）。
+    #[test]
+    fn translation_only_fidelity_path_keeps_drawing_intact() {
+        let dir = case_dir("drawing");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, DRAWING_XML);
+
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Tr body.")],
+            BiStrategy::TranslationOnly,
+        );
+        let out_xml = entry_str(&out_path, "word/document.xml");
+
+        // 图字节原样（保真路径不动物件）
+        assert!(out_xml.contains(
+            r#"<w:drawing><wp:inline><a:graphic><a:graphicData><pic:pic/></a:graphicData></a:graphic></wp:inline></w:drawing>"#
+        ));
+        // 首 w:t 换译文（无边缘空白 → 不补 preserve，与快路径恒 preserve 相
+        // 区隔）；图后 w:t 清空
+        assert!(out_xml.contains("<w:t>Tr body.</w:t>"));
+        assert!(out_xml.contains("<w:t></w:t>"));
+        assert!(!out_xml.contains("xml:space"));
+
+        // 重解析：单段单译文（图不入文本）
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "Tr body.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缺陷②：BilingualInline 正文译段切主导 rPr 切片（口径变化：正文不再
+    /// 极简无 rPr / 固定 9pt；9pt 只保留在表格格内追加段）。
+    #[test]
+    fn inline_append_uses_dominant_rpr_for_body_para() {
+        let dir = case_dir("dominant");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(&in_path, DOMINANT_XML);
+
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Dominant style translation.")],
+            BiStrategy::BilingualInline,
+        );
+        let out_xml = entry_str(&out_path, "word/document.xml");
+
+        // 原段字节原样 + 追加译段 run = 主导（斜体 12pt）rPr 原字节切片
+        assert!(out_xml.contains(
+            r#"<w:p><w:r><w:t>短</w:t></w:r><w:r><w:rPr><w:i/><w:sz w:val="24"/></w:rPr><w:t>这里是一段明显更长的斜体正文文本，用于赢得主导选举。</w:t></w:r></w:p>"#
+        ));
+        assert!(out_xml.contains(
+            r#"<w:p><w:r><w:rPr><w:i/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve">Dominant style translation.</w:t></w:r></w:p>"#
+        ));
+        // 9pt 只保留在表格格内：全文档无 sz/szCs 18 半点
+        assert_eq!(out_xml.matches(r#"<w:sz w:val="18"/>"#).count(), 0);
+        assert_eq!(out_xml.matches(r#"<w:szCs w:val="18"/>"#).count(), 0);
+
+        // 重解析：原段 + 译段
+        let got = blocks(&out_path);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].content,
+            "短这里是一段明显更长的斜体正文文本，用于赢得主导选举。"
+        );
+        assert_eq!(got[1].content, "Dominant style translation.");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 布局承载元素回归（主管修正缺陷②补）：软 br 与 tab 段落走**保真路径**
+    /// ——首 w:t 换译、其余清空，`<w:br/>`/`<w:tab/>` 的 run 字节原样存活
+    /// （快路径整段净荷替换会把它们删掉：多行段落变单行、tab 位丢失）。
+    #[test]
+    fn soft_br_and_tab_paragraphs_take_fidelity_path() {
+        let dir = case_dir("layout-elems");
+        let in_path = dir.join("in.docx");
+        let out_path = dir.join("out.docx");
+        build_docx(
+            &in_path,
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+                r#"<w:p><w:r><w:t>甲乙。</w:t><w:br/><w:t>丙丁。</w:t></w:r></w:p>"#,
+                r#"<w:p><w:r><w:t>地址。</w:t></w:r><w:tab/><w:r><w:t>城市。</w:t></w:r></w:p>"#,
+                r#"</w:body></w:document>"#
+            ),
+        );
+        // 镜像生产解析（writeback 强制 Semantic）：软 br 的 \n 与 tab 的 \t
+        // 是段内占位、不产块（flat 快路径才会按行拆——语义路径一括号一单元）
+        let (raw, _) = DocxRawBackend::default()
+            .with_structure_mode(StructureMode::Semantic)
+            .parse_with_spans(&in_path)
+            .unwrap();
+        let units = to_translation_units(&OfficePlugin::default().assemble(&raw));
+        assert_eq!(units.len(), 2, "软 br/tab 是占位不产块");
+        let pairs: Vec<crate::emit::TranslationPair> = vec![
+            ("p0-b0".to_string(), "EN line.".to_string()).into(),
+            ("p0-b1".to_string(), "EN addr.".to_string()).into(),
+        ];
+        let report =
+            writeback_docx(&in_path, &pairs, BiStrategy::TranslationOnly, &out_path).unwrap();
+        assert_eq!(report.written, 2);
+        let out_xml = entry_str(&out_path, "word/document.xml");
+        assert!(out_xml.contains("<w:br/>"), "软 br 字节存活（保真路径）");
+        assert!(out_xml.contains("<w:tab/>"), "tab 字节存活（保真路径）");
+        assert!(out_xml.contains("EN line."), "译文写入");
+        assert!(out_xml.contains("EN addr."), "译文写入");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

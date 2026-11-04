@@ -2,7 +2,16 @@
 // docforge 改动：① crate 引用重写（docparser_core→docforge、office 内部→super）；
 // ② parse_with_spans 旁路增强：同一遍解析顺带发号产回写槽位表 DocxSlotSidecar
 //    （SourceToken 信物 + 字节 span，发号规则见类型文档；只加字段不改任何提取行为，
-//     影子割接见 writeback/docx.rs）。
+//     影子割接见 writeback/docx.rs）；
+// ③ mc:Fallback 子树跳过（β 红利缺陷①）：Word 对形状/文本框写 AlternateContent 时
+//    Choice（现代渲染）与 Fallback（VML 兼容）内容完全相同，旧实现两分支的 w:t 都
+//    进文本（同句两单元、双语回写重复段）。现在 Fallback 整棵子树跳过——文本提取与
+//    信物 span 同步跳过，只提取/改写 Choice 分支。取舍：现代渲染器全覆盖；极老阅读器
+//    看到未译的 VML Fallback 可接受（Fallback 字节原样保留，不毁文档）。
+// ④ 段落槽位超集字段（β 红利缺陷②，回写侧双路径见 writeback/docx.rs）：wt_spans
+//    （w:t 全元素区间）、dominant_rpr_span（主导 run 直属 rPr 区间，选举口径见
+//    extract_para）、has_non_text_inline（非文本内联物件判据）、inner_content（段净荷
+//    区间）。解析只采集，消费全在回写侧。
 //! DOCX 解析：ZIP + quick-xml 流式文本提取（与 Python `_docx_raw_stream` 语义对齐）。
 //!
 //! 架构：
@@ -22,6 +31,30 @@ use quick_xml::Reader;
 use super::attr_by;
 use super::structure::{docx_has_structure, StructureMode};
 use super::zip_read_str;
+
+// 本文件局部元素本地名（mod.rs 的 tags 表没有这些；只服务 Fallback 跳过与主导
+// rPr 选举，不进共享常量表）。比较口径与 tags 同款：`local_name().as_ref()`。
+/// `<mc:Fallback>`（AlternateContent 的 VML 兼容分支，缺陷①跳过对象）。
+const TAG_FALLBACK: &str = "Fallback";
+/// `<w:rPr>`（run 直属字符属性，主导选举的采样对象）。
+const TAG_RPR: &str = "rPr";
+/// `<w:vertAlign>`（上下标；含它的 run 不参选主导选举）。
+const TAG_VERT_ALIGN: &str = "vertAlign";
+/// 段内「非文本内联物件」本地名（`has_non_text_inline` 判据的一部分）：含其一
+/// 的段落翻译净荷不能整体替换（会毁掉图/框/域/注记），回写侧据此走保真路径。
+/// 布局承载元素（`w:tab`/`w:br`（含软换行与分页）/`w:cr`/`w:noBreakHyphen`）
+/// 不在本表、在 extract_para 的占位分支就地触发——它们在**提取**里是 \t/\n/-
+/// 文本占位，但在**渲染**里是布局元素（旧写入路径保留其 run，快路径整段替换
+/// 会删掉：软换行段落变单行、tab 位/分页符丢失）。
+const NON_TEXT_INLINE_TAGS: [&str; 7] = [
+    "drawing",
+    "pict",
+    "object",
+    "oMath",
+    "footnoteReference",
+    "endnoteReference",
+    "fldSimple",
+];
 
 /// DOCX raw 后端：跳过结构还原，直接提取文本。
 #[derive(Default)]
@@ -407,6 +440,25 @@ struct ParaSpans {
     /// 段内 `w:t` 文本内容的字节 span（Text/GeneralRef/CData 事件级；
     /// TranslationOnly 首 `w:t` 换译文、其余清空的定位依据）。
     text_spans: Vec<(usize, usize)>,
+    /// 段内各 `w:t` 完整元素字节区间（开标签起符 → 闭标签终符；自闭合空
+    /// `<w:t/>` 无内容不入表）。缺陷②超集字段：回写侧快路径的漂移守卫原料
+    /// （净荷替换区间必须包住全部 `w:t`，不满足落保真路径）。
+    wt_spans: Vec<(usize, usize)>,
+    /// 主导 run 直属 `<w:rPr>` 的字节区间（None = 主导 run 无 rPr / 段内无
+    /// 参选 run）。选举口径见 [`extract_para`]；`w:pPr` 内的 rPr 结构性不参选
+    /// （pPr 子树由 para_props_with 整树消费，不进本循环）。
+    dominant_rpr_span: Option<(usize, usize)>,
+    /// 段内含非文本内联物件或布局承载元素（[`NON_TEXT_INLINE_TAGS`] 之一，
+    /// 或 tab/br/cr/noBreakHyphen）——回写侧 TranslationOnly 据此走保真路径。
+    has_non_text_inline: bool,
+    /// 段净荷区间：pPr 之后（无 pPr = `<w:p ...>` 开始标签之后）到 `</w:p>`
+    /// 起符。快路径整段净荷替换的替换区间。
+    /// 段净荷字节区间（pPr 之后 → `</w:p>` 起符；无 pPr = `<w:p ...>` 开始
+    /// 标签之后）。**解析侧采集而非回写侧推导**：写入侧从 start 推导净荷起点
+    /// 需定位开始标签的 `>`——XML 属性值里合法的 `>`（只禁 `<`/`&`）会把
+    /// `find('>')` 骗进标签内部 → Replace 吃掉半个开始标签产坏 XML；解析时
+    /// buffer_position 精确无歧义（终点侧 end-5 可导，统一采集保持一致）。
+    inner_content: (usize, usize),
 }
 
 /// 一个「可翻译段落位」的字节级槽位（与回写侧 `ParaSlot` 消费面同构）。
@@ -424,6 +476,16 @@ pub(crate) struct DocxParaSlot {
     pub(crate) ppr: Option<(usize, usize)>,
     /// 段内 `w:t` 文本内容字节 span。
     pub(crate) text_spans: Vec<(usize, usize)>,
+    /// 段内各 `w:t` 完整元素字节区间（β 超集字段；快路径漂移守卫用，口径见
+    /// [`ParaSpans::wt_spans`]）。
+    pub(crate) wt_spans: Vec<(usize, usize)>,
+    /// 主导 run 直属 `<w:rPr>` 原文 span（None = 主导 run 无 rPr / 无候选；
+    /// 快路径/BilingualInline 译文 run 据此切原字节切片）。
+    pub(crate) dominant_rpr_span: Option<(usize, usize)>,
+    /// 段内含非文本内联物件 → TranslationOnly 保真路径（见 writeback/docx.rs）。
+    pub(crate) has_non_text_inline: bool,
+    /// 段净荷区间（pPr 之后到 `</w:p>` 起符）——快路径整段替换区间。
+    pub(crate) inner_content: (usize, usize),
 }
 
 /// 一个「表格格位」的字节级槽位（与回写侧 `CellSlot` 消费面同构 + 格自身 span）。
@@ -478,6 +540,10 @@ impl DocxSlotSidecar {
             text,
             ppr: spans.ppr,
             text_spans: spans.text_spans,
+            wt_spans: spans.wt_spans,
+            dominant_rpr_span: spans.dominant_rpr_span,
+            has_non_text_inline: spans.has_non_text_inline,
+            inner_content: spans.inner_content,
         }));
         SourceToken {
             first_slot,
@@ -549,11 +615,69 @@ fn extract_sdt_items<R: std::io::BufRead>(
     Ok(())
 }
 
+/// 主导 rPr 选举的单 run 结算（缺陷②）：run 带可见字符且不含 `w:vertAlign`
+/// （上下标 run 不参选——段首上标角标把样式劫持给整段译文正是要修的缺陷）时
+/// 入选；字符数严格大于当前 Winner 才替换（平手取文档序先者，确定性口径）。
+/// 无 rPr 的 run 同样参选：它胜出时 Winner 的 rPr = None → 快路径译文 run
+/// 不带 rPr 切片（口径：缺省样式即主导样式，见 writeback/docx.rs）。
+fn elect_run(
+    best: &mut Option<(usize, Option<(usize, usize)>)>,
+    chars: usize,
+    rpr: Option<(usize, usize)>,
+    vert: bool,
+) {
+    let wins = match best {
+        Some((c, _)) => chars > *c,
+        None => true,
+    };
+    if chars > 0 && !vert && wins {
+        *best = Some((chars, rpr));
+    }
+}
+
+/// 消费整个子树直到与开元素配对的 End 事件（缺陷①：`<mc:Fallback>` 整树跳过）。
+/// 深度计数口径：Start +1 / End -1，进入时置 1、清零恢复；自闭合 Empty 不进
+/// 本函数（调用方 Start 分支才匹配），天然免疫。与回写侧 `consume_subtree`
+/// 同构，与 para_props 同款「整树消费、主循环深度不增减」；Eof 兜底（病态
+/// 截断不悬死）。
+fn skip_subtree<R: std::io::BufRead>(reader: &mut Reader<R>) -> Result<()> {
+    let mut buf = Vec::new();
+    let mut depth = 1usize;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref _e)) => depth += 1,
+            Ok(Event::End(ref _e)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
+            Ok(Event::Eof) => return Ok(()),
+            Err(e) => return Err(DocError::corrupt(format!("XML fallback skip error: {e}"))),
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// 提取 `<w:p>` 段落的文本与段落属性，处理 w:pPr / w:r / w:t / w:tab / w:br / w:cr。
 /// 调用时 reader 刚读过 `<w:p>` Start 事件（`p_start` = 该 Start 的字节起点），
 /// 退出时 reader 处于 `</w:p>` End 事件之后。
 /// 第三个返回值是段落内出现的图片关系 id（`a:blip` / `v:imagedata`，文档序）；
 /// 第四个是段落字节位（旁路槽位表原料，不消费者可丢弃）。
+///
+/// 缺陷①：`<mc:Fallback>` 子树整树跳过（[`skip_subtree`]）——文本、span、
+/// rid、占位符同步跳过，只提取 Choice 分支。
+/// 缺陷②采集（同一遍顺带，不改文本行为）：主导 rPr 选举（见 [`elect_run`]；
+/// 采样 = run 直属 rPr + `w:t` 内解码字符数；`w:pPr` 内的 rPr 由 para_props
+/// 整树消费、结构性不参选——「只认 run 直属」）、`w:t` 全元素区间、段净荷
+/// 区间、非文本内联物件判据（[`NON_TEXT_INLINE_TAGS`] + tab/br/cr/noBreakHyphen，
+/// br / tab 是文本占位不算物件）。
+///
+/// 嵌套说明：文本框等嵌套 `w:p` 的 `w:t` 照旧并入外层段落文本（不重复计数）；
+/// 选举用单 run 上下文（不深跟踪嵌套 run）——含文本框/图段的段落必带
+/// `has_non_text_inline` 走回写保真路径、选举结果不被消费，而合法 OOXML 中
+/// 快路径段落（无内联物件）不存在嵌套 run，单上下文即精确。
 fn extract_para<R: std::io::BufRead>(
     reader: &mut Reader<R>,
     styles: &HashMap<String, u8>,
@@ -571,47 +695,120 @@ fn extract_para<R: std::io::BufRead>(
     // 只在 `w:t` 内收文本：段落里的缩进空白是 Text 事件，但属于 XML 格式而非正文
     // （Python `_docx_para_text` 也只取 `w:t` 文本，且 `w:t` 内的空白是有意义的）
     let mut in_t = false;
+    // 净荷起点 = `<w:p ...>` 开始标签之后（调用方刚消费 Start 事件，此位即标签
+    // 终点）；pPr 消费后改记 pPr 终点（快路径替换区间 = pPr 之后到 `</w:p>` 之前）
+    let mut inner_start = bpos(reader);
+    // 当前 `w:t` 开标签起符（wt_spans 记完整元素区间）
+    let mut wt_open: Option<usize> = None;
+    // 主导选举的当前 run 上下文（口径见函数文档）
+    let mut in_run = false;
+    let mut run_rpr: Option<(usize, usize)> = None;
+    let mut run_rpr_open: Option<usize> = None;
+    let mut run_chars = 0usize;
+    let mut run_vert = false;
+    // 选举 Winner：(可见字符数, 该 run 直属 rPr span)
+    let mut best: Option<(usize, Option<(usize, usize)>)> = None;
 
     loop {
         let pos_before = bpos(reader);
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
+                let local = e.name().local_name();
+                let local = local.as_ref();
                 // 同一元素内的重复引用只算一次（Python `_blip_rids`：`v not in rids`）
                 if let Some(rid) = super::image::rid_of_image_node(e) {
                     push_rid(&mut rids, rid);
                 }
-                match e.name().local_name().as_ref() {
+                if NON_TEXT_INLINE_TAGS.contains(&local) {
+                    spans.has_non_text_inline = true;
+                }
+                match local {
                     // 段落属性在跑文本之前：由 para_props 整个消费掉，深度不增减
                     super::tags::W_PPR => {
                         let ppr_start = pos_before;
                         props = para_props_with(reader, styles)?;
                         spans.ppr = Some((ppr_start, bpos(reader)));
+                        // 净荷起点改记 pPr 终点（快路径净荷 = pPr 之后）
+                        inner_start = bpos(reader);
                     }
+                    // 缺陷①：Fallback 是 Choice 的同内容 VML 镜像，整树跳过
+                    // （Enter 置 1 / 配对清零由整树消费等价实现，主循环深度不增减）
+                    TAG_FALLBACK => skip_subtree(reader)?,
                     super::tags::W_T => {
                         in_t = true;
+                        wt_open = Some(pos_before);
+                        depth += 1;
+                    }
+                    super::tags::W_R => {
+                        // run 边界：结算上一 run（合法文档 run 不嵌套，此处只兜
+                        // 病态悬空；同款重置见 `</w:r>` 分支）
+                        elect_run(&mut best, run_chars, run_rpr, run_vert);
+                        in_run = true;
+                        run_rpr = None;
+                        run_rpr_open = None;
+                        run_chars = 0;
+                        run_vert = false;
+                        depth += 1;
+                    }
+                    TAG_RPR => {
+                        // 只认 run 直属 rPr（pPr 内 rPr 已整树消费，不进本循环）
+                        if in_run {
+                            run_rpr_open = Some(pos_before);
+                        }
+                        depth += 1;
+                    }
+                    TAG_VERT_ALIGN => {
+                        if in_run {
+                            run_vert = true;
+                        }
                         depth += 1;
                     }
                     super::tags::W_TAB => {
                         depth += 1;
+                        // tab/br/cr/noBreakHyphen 是**布局承载元素**：旧写入路径
+                        // 保留这些 run（非 w:t 不清空），快路径整段净荷替换会把
+                        // 它们删掉——软换行段落变单行、tab 位/分页符丢失。凡提取
+                        // 为 \t/\n/- 占位的都触发保真路径（含分页 br）。
+                        spans.has_non_text_inline = true;
                         out.push('\t');
                     }
                     super::tags::W_BR | super::tags::W_CR => {
                         depth += 1;
+                        spans.has_non_text_inline = true; // 同上：布局承载
                         out.push('\n');
                     }
                     super::tags::W_NBH => {
                         depth += 1;
+                        spans.has_non_text_inline = true; // 同上
                         out.push('-');
                     }
                     _ => depth += 1,
                 }
             }
             Ok(Event::End(ref e)) => {
-                if e.name().local_name().as_ref() == super::tags::W_T {
+                let local = e.name().local_name();
+                let local = local.as_ref();
+                if local == super::tags::W_T {
                     in_t = false;
+                    if let Some(open) = wt_open.take() {
+                        spans.wt_spans.push((open, bpos(reader)));
+                    }
+                } else if local == TAG_RPR {
+                    if let Some(s) = run_rpr_open.take() {
+                        run_rpr = Some((s, bpos(reader)));
+                    }
+                } else if local == super::tags::W_R {
+                    elect_run(&mut best, run_chars, run_rpr, run_vert);
+                    in_run = false;
+                    run_rpr = None;
+                    run_rpr_open = None;
+                    run_chars = 0;
+                    run_vert = false;
                 }
                 depth -= 1;
                 if depth == 0 {
+                    // `</w:p>` 起符 = 净荷终点（不含闭标签）
+                    spans.inner_content = (inner_start, pos_before);
                     break;
                 }
             }
@@ -620,11 +817,36 @@ fn extract_para<R: std::io::BufRead>(
                 if let Some(rid) = super::image::rid_of_image_node(e) {
                     push_rid(&mut rids, rid);
                 }
-                match e.name().local_name().as_ref() {
-                    super::tags::W_TAB => out.push('\t'),
-                    super::tags::W_BR | super::tags::W_CR => out.push('\n'),
+                let local = e.name().local_name();
+                let local = local.as_ref();
+                if NON_TEXT_INLINE_TAGS.contains(&local) {
+                    spans.has_non_text_inline = true;
+                }
+                match local {
+                    // 布局承载元素（Start 分支同款注释）：全部触发保真路径
+                    super::tags::W_TAB => {
+                        spans.has_non_text_inline = true;
+                        out.push('\t');
+                    }
+                    super::tags::W_BR | super::tags::W_CR => {
+                        spans.has_non_text_inline = true;
+                        out.push('\n');
+                    }
                     // 不间断连字符（Python `W_NBH` → "-"）
-                    super::tags::W_NBH => out.push('-'),
+                    super::tags::W_NBH => {
+                        spans.has_non_text_inline = true;
+                        out.push('-');
+                    }
+                    TAG_VERT_ALIGN => {
+                        if in_run {
+                            run_vert = true;
+                        }
+                    }
+                    TAG_RPR
+                        // 自闭合空 rPr：切片 = `<w:rPr/>` 本身（合法可嵌回）
+                        if in_run && run_rpr.is_none() && run_rpr_open.is_none() => {
+                            run_rpr = Some((pos_before, bpos(reader)));
+                        }
                     _ => {}
                 }
             }
@@ -635,6 +857,8 @@ fn extract_para<R: std::io::BufRead>(
                     let raw = e.xml10_content();
                     if let Ok(t) = quick_xml::escape::unescape(&raw) {
                         out.push_str(&t);
+                        // 主导选举：run 内可见字符计数（解码后口径）
+                        run_chars += t.chars().count();
                     }
                     spans.text_spans.push((span_start, bpos(reader)));
                 }
@@ -643,6 +867,8 @@ fn extract_para<R: std::io::BufRead>(
                 if in_t {
                     let span_start = pos_before;
                     super::push_general_ref(&mut out, e);
+                    // 命名实体至多展开为短串，按一个可见字形计（选举只比相对占比）
+                    run_chars += 1;
                     spans.text_spans.push((span_start, bpos(reader)));
                 }
             }
@@ -651,6 +877,7 @@ fn extract_para<R: std::io::BufRead>(
                     let span_start = pos_before;
                     // CDATA 内容不含实体，直接取字符串
                     out.push_str(e.as_ref());
+                    run_chars += e.as_ref().chars().count();
                     spans.text_spans.push((span_start, bpos(reader)));
                 }
             }
@@ -658,6 +885,13 @@ fn extract_para<R: std::io::BufRead>(
             _ => {}
         }
         buf.clear();
+    }
+    // 段尾悬空 run（病态输入）的防御性结算；正常文档 `</w:r>` 先于 `</w:p>` 闭合
+    elect_run(&mut best, run_chars, run_rpr, run_vert);
+    spans.dominant_rpr_span = best.and_then(|(_, rpr)| rpr);
+    // Eof 兜底（无 `</w:p>` 的病态截断）：净荷终点随段终点
+    if spans.inner_content.1 == 0 {
+        spans.inner_content.1 = bpos(reader);
     }
     spans.end = bpos(reader);
     Ok((out, props, rids, spans))
@@ -1058,6 +1292,10 @@ fn extract_table_rows<R: std::io::BufRead>(
                             text: t,
                             ppr: spans.ppr,
                             text_spans: spans.text_spans,
+                            wt_spans: spans.wt_spans,
+                            dominant_rpr_span: spans.dominant_rpr_span,
+                            has_non_text_inline: spans.has_non_text_inline,
+                            inner_content: spans.inner_content,
                         });
                         continue;
                     }
@@ -2065,6 +2303,221 @@ mod tests {
 
         // 图片项不发号：表格后跟 ImageRids 节点不影响上述计数（上面 token 序
         // 已隐式验证——表格项之后的 sdt 段仍从 4 续号）
+    }
+
+    // -------------------------------------------------------------------------
+    // 缺陷①/②采集测试：Fallback 子树跳过 + 主导 rPr 选举 + 槽位超集字段
+    // -------------------------------------------------------------------------
+
+    /// 单段文档 → 该段的段落槽位（缺陷①/②采集断言的便捷入口）。
+    fn solo_para_slot(xml: &str) -> DocxParaSlot {
+        let (_, sidecar) =
+            docx_raw_text_with_slots(xml, &Numbering::default(), &HashMap::new()).unwrap();
+        match sidecar.slots.into_iter().next() {
+            Some(DocxSlot::Para(p)) => p,
+            other => panic!("应有且仅有一个段落槽位，得到 {other:?}"),
+        }
+    }
+
+    /// 缺陷①：`mc:Fallback` 子树整树跳过——Choice 分支文本照常提取，Fallback
+    /// 的同内容 VML 镜像不进文本、不进信物 span（文本与发号同步跳过）。
+    #[test]
+    fn fallback_subtree_skipped_from_text_and_spans() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r>"#,
+            r#"<mc:AlternateContent><mc:Choice Requires="wps">"#,
+            r#"<w:drawing><w:txbxContent><w:p><w:r><w:t>Choice 文本甲。</w:t></w:r></w:p></w:txbxContent></w:drawing>"#,
+            r#"</mc:Choice>"#,
+            r#"<mc:Fallback>"#,
+            r#"<w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Fallback 镜像乙。</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>"#,
+            r#"</mc:Fallback></mc:AlternateContent>"#,
+            r#"</w:r><w:r><w:t>段落尾。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let items = parse_items(xml);
+        assert_eq!(items.len(), 1, "Fallback 镜像不得成段");
+        assert_eq!(items[0].text, "Choice 文本甲。段落尾。");
+        assert!(!items[0].text.contains("镜像"), "镜像文本不得进单元流");
+
+        let slot = solo_para_slot(xml);
+        // 文本与信物 span 同步跳过：text_spans 只含 Choice 的 w:t 与段落尾 w:t
+        assert_eq!(slot.text_spans.len(), 2);
+        assert_eq!(slot.text, "Choice 文本甲。段落尾。");
+        // Choice 分支带 w:drawing → 回写保真路径判据为 true（Fallback 里的
+        // w:pict 已随子树跳过，不影响判据——drawing 已足以触发）
+        assert!(slot.has_non_text_inline);
+    }
+
+    /// 缺陷①：自闭合 `<mc:Fallback/>` 是 Empty 事件，不触发整树跳过（免疫）。
+    #[test]
+    fn fallback_self_closing_is_ignored() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:t>前后文本。</w:t></w:r><mc:Fallback/></w:p>"#,
+            r#"</w:body>"#
+        );
+        let items = parse_items(xml);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "前后文本。");
+    }
+
+    /// 缺陷②：主导 rPr 选举——可见字符占比最高的 run 胜出。
+    #[test]
+    fn dominant_rpr_elects_longest_run() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:t>短</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:b/></w:rPr><w:t>这里是最长的加粗正文内容。</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:i/></w:rPr><w:t>斜体次长。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        let (s, e) = slot.dominant_rpr_span.expect("最长 run 带 rPr 应当选");
+        assert_eq!(&xml[s..e], "<w:rPr><w:b/></w:rPr>");
+    }
+
+    /// 缺陷②：上下标 run（`w:vertAlign`）不参选——即便它字符最多（劫持场景：
+    /// 段首上标角标 ¹ 不得把 vertAlign 继承给整段译文）。
+    #[test]
+    fn dominant_rpr_excludes_vert_align_runs() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>1234567890</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:b/></w:rPr><w:t>正文。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        let (s, e) = slot.dominant_rpr_span.expect("非上标 run 应当选");
+        assert_eq!(&xml[s..e], "<w:rPr><w:b/></w:rPr>", "上标 run 不得当选");
+    }
+
+    /// 缺陷②：`w:pPr` 内的 rPr（段落标记 rPr）不参选——只认 run 直属
+    /// （结构性保证：pPr 子树由 para_props 整树消费，不进段落事件循环）。
+    #[test]
+    fn dominant_rpr_ignores_ppr_internal_rpr() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:pPr><w:rPr><w:b/><w:sz w:val="40"/></w:rPr></w:pPr>"#,
+            r#"<w:r><w:rPr><w:i/></w:rPr><w:t>正文文字若干。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        let (s, e) = slot.dominant_rpr_span.expect("run 直属 rPr 应当选");
+        assert_eq!(&xml[s..e], "<w:rPr><w:i/></w:rPr>", "pPr 内 rPr 不入选举");
+    }
+
+    /// 缺陷②：无 rPr 的 run 字符最多时 dominant = None（口径：缺省样式即主导
+    /// 样式）→ 快路径译文 run 不带 rPr 切片。
+    #[test]
+    fn dominant_rpr_none_when_default_run_wins() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>短</w:t></w:r>"#,
+            r#"<w:r><w:t>不带样式的正文明显更长，应当胜出。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        assert!(
+            slot.dominant_rpr_span.is_none(),
+            "无 rPr run 胜出 → dominant = None（若误选带 rPr 短 run 会得 Some）"
+        );
+    }
+
+    /// 缺陷②：字符数平手取文档序先者（确定性口径）。
+    #[test]
+    fn dominant_rpr_tie_takes_first() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>甲乙丙丁</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:i/></w:rPr><w:t>戊己庚辛</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        let (s, e) = slot.dominant_rpr_span.expect("平手仍应有一者当选");
+        assert_eq!(&xml[s..e], "<w:rPr><w:b/></w:rPr>", "平手取先者");
+    }
+
+    /// 缺陷②采集：has_non_text_inline 判据——drawing / fldSimple 命中；布局
+    /// 承载元素（tab、软 br、分页 br、noBreakHyphen）全部命中（提取里是
+    /// \t/\n 占位、渲染里是布局——快路径整段替换会删掉：软换行变单行、
+    /// 丢 tab/丢分页）；纯文本不命中（唯一快路径形态）。
+    #[test]
+    fn has_non_text_inline_detection() {
+        let wrap = |inner: &str| {
+            format!(
+                r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p>{inner}</w:p></w:body>"#
+            )
+        };
+        for (inner, why) in [
+            (
+                r#"<w:r><w:t>甲</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r>"#,
+                "drawing",
+            ),
+            (
+                r#"<w:fldSimple w:instr=" X "><w:r><w:t>甲乙丙。</w:t></w:r></w:fldSimple>"#,
+                "fldSimple",
+            ),
+            (
+                r#"<w:r><w:br w:type="page"/></w:r><w:r><w:t>甲乙丙。</w:t></w:r>"#,
+                "分页 br",
+            ),
+        ] {
+            let slot = solo_para_slot(&wrap(inner));
+            assert!(slot.has_non_text_inline, "{why} 应判为内联物件");
+        }
+        for (inner, why) in [
+            (r#"<w:r><w:t>甲乙丙丁。</w:t></w:r>"#, "纯文本"),
+        ] {
+            let slot = solo_para_slot(&wrap(inner));
+            assert!(!slot.has_non_text_inline, "{why} 不应命中（快路径）");
+        }
+        // 布局承载元素（主管修正）：提取里是 \t/\n 占位、渲染里是布局——
+        // 与内联物件同判，快路径整段净荷替换会删掉它们
+        for (inner, why) in [
+            (r#"<w:r><w:t>甲乙。</w:t><w:br/><w:t>丙丁。</w:t></w:r>"#, "软 br"),
+            (
+                r#"<w:r><w:t>甲乙。</w:t></w:r><w:tab/><w:r><w:t>丙丁。</w:t></w:r>"#,
+                "tab",
+            ),
+        ] {
+            let slot = solo_para_slot(&wrap(inner));
+            assert!(slot.has_non_text_inline, "{why} 应判为布局承载");
+        }
+    }
+
+    /// 缺陷②采集：wt_spans = `w:t` 完整元素区间；inner_content = pPr 之后到
+    /// `</w:p>` 起符（无 pPr = 开始标签之后）——快路径整段替换区间。
+    #[test]
+    fn wt_spans_and_inner_content_capture() {
+        let xml = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>甲</w:t></w:r><w:r><w:t>乙</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml);
+        assert_eq!(slot.wt_spans.len(), 2);
+        let (s, e) = slot.wt_spans[0];
+        assert_eq!(&xml[s..e], "<w:t>甲</w:t>", "wt span = 完整 w:t 元素");
+        let (s, e) = slot.wt_spans[1];
+        assert_eq!(&xml[s..e], "<w:t>乙</w:t>");
+        let (s, e) = slot.inner_content;
+        assert_eq!(
+            &xml[s..e],
+            r#"<w:r><w:t>甲</w:t></w:r><w:r><w:t>乙</w:t></w:r>"#,
+            "净荷 = pPr 之后到 </w:p> 起符"
+        );
+
+        // 无 pPr：净荷起点 = `<w:p>` 开始标签之后
+        let xml2 = concat!(
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:p><w:r><w:t>全净荷。</w:t></w:r></w:p>"#,
+            r#"</w:body>"#
+        );
+        let slot = solo_para_slot(xml2);
+        assert!(slot.ppr.is_none());
+        let (s, e) = slot.inner_content;
+        assert_eq!(&xml2[s..e], r#"<w:r><w:t>全净荷。</w:t></w:r>"#);
     }
 }
 

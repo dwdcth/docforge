@@ -173,7 +173,7 @@ fn write_spans<W: std::io::Write>(
     // 降三个量级——流式的内存收益与整写的吞吐兼得（实测对照见 BENCHMARK.md）。
     const FLUSH: usize = 64 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(FLUSH * 2);
-    let mut flush = |buf: &mut Vec<u8>, w: &mut W| -> std::io::Result<()> {
+    let flush = |buf: &mut Vec<u8>, w: &mut W| -> std::io::Result<()> {
         if !buf.is_empty() {
             w.write_all(buf)?;
             buf.clear();
