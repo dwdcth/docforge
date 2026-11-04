@@ -1,28 +1,31 @@
 # docforge 项目纪律
 
-## 构建与门禁（mbx 全局缓存下的确定性）
+## 构建与门禁（mbx 全局缓存：正常使用 + 按疑点核验）
 
-本机 cargo 经 mise→mbx（mr-boxington）包装：target 是指向 `~/.cache/mbx/targets/v1/<hash>` 的符号链接，
-跨项目共享内容寻址缓存 + 每小时自动 GC + learned incremental 状态。日常开发吃缓存没问题。
+本机 cargo 经 mise→mbx 包装：全局内容寻址缓存（跨项目共享依赖/制品）、
+learned incremental 状态、每小时自动 GC。门禁与日常开发**一律走全局缓存**——
+全 feature 矩阵是最贵的构建，绕开缓存得不偿失，独立临时目录是反模式
+（既丢缓存收益，自己还会变成第二份越攒越陈的状态）。
 
-**验证性门禁（测试/clippy/发布前检查）必须用独立干净 target 目录**——mbx 在剧烈并行政改
-+ 多 feature 组合频繁切换时出现过陈旧产物命中（幻影编译错/测试红，重跑自愈），干净目录杜绝：
+防"陈旧产物幻影红"（历史仅在多代理并行政代码 + feature 组合高频切换时出现）
+用**信任但核验**协议：
 
-```bash
-export CARGO_TARGET_DIR=/tmp/docforge-gate-target   # 门禁专用，与日常缓存隔离
-cargo test --all-features
-```
+1. 门禁失败先重跑一次：仍红 = 真实失败，照常修；
+2. 翻绿 / 结果自相矛盾（未动的模块红、局部编译错但对应源码完好）→
+   `mbx cache remove /mnt/s790/project/docforge` 后重跑拿可信结果。
+   该命令只清本工作区的 managed target + learned state + claims——**共享依赖
+   对象保留**，重建时 deps 照常缓存命中，只重编本 crate（分钟级）。
+   **不要**用全局 `mbx gc`（殃及全部活跃工作区）。
 
-- 同一项目避免多个 cargo 进程并发（cargo 有 target 锁会串行化，但 mbx 的 restore/GC 在锁外）；
-  并行子代理流水线由主管串行调度门禁。
-- 遇"改了不该相关的代码却红/重跑变绿"：先 `CARGO_TARGET_DIR=/tmp/x cargo test` 复验；
-  确系缓存则 `mbx cache remove /mnt/s790/project/docforge`（精准清本工作区 managed target +
-  learned state + claims，共享依赖对象保留，重建大头仍命中）——**不要**用全局 `mbx gc`。
-- 子代理任务书里写验收命令时，一律带上面的 export 行。
+预防面：
+- 并行子代理改代码期间，门禁由主管**串行**调度（cargo 有 target 锁天然串行，
+  但避免与 mbx restore/GC 叠加竞争）；
+- 一波并行改动接线完成后、跑全量门禁前，可预防性 `mbx cache remove
+  <workspace>` 一次——成本仅本 crate 重编，换取门禁从干净一致的学习状态出发。
 
 ## 工作流
 
-- 实现工作派 sonnet 子代理：主管写任务书（文件边界互斥/验收命令含干净 target/报告格式）→ 并行执行 →
+- 实现工作派 sonnet 子代理：主管写任务书（文件边界互斥/验收命令/报告格式）→ 并行执行 →
   主管接线共享文件 → 绿门禁自动 commit+push（规范 message + 子代理署名）。
 - 回写器铁律：**回写侧对齐机制必须逐字节镜像解析侧行为**（锚点权威在解析产物，解析侧没做的
   span/merge 展开回写侧绝不做）——docx/html/odt 表格回写三代理已实证。
