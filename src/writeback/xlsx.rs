@@ -75,7 +75,7 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin as _, ParseCapability as _};
 
-use super::{apply_edits, escape_xml_text, pair_map, Edit};
+use super::{Edit, EntryPayload, escape_xml_text, pair_map, write_entry_payload};
 
 /// 数值/日期/布尔/错误格的跳过原因（可写判据与文本守卫归因共用同一文案）：
 /// 这类格写入会把数值格变文本格（对齐 / 公式 / SUM 语义全变），宁漏勿错。
@@ -102,7 +102,9 @@ pub fn writeback_xlsx(
     let map = pair_map(pairs);
     let mut report = crate::writeback::WritebackReport::default();
 
-    // 第二遍：ZIP 内逐 sheet 扫描格位，与单元流按文档序配对。
+    // 第二遍：ZIP 内逐 sheet 扫描格位，与单元流按文档序配对。这次 open_zip
+    // 是规划期的多部件扫描读取（workbook / rels / SST / 各 sheet），保持文
+    // 件路径不整读——≤64MB 整读 Cursor 的优化在 rewrite_zip_with_added 内部做。
     let mut zip = open_zip(in_path)?;
     let entry_names: Vec<String> = (0..zip.len())
         .filter_map(|i| {
@@ -167,10 +169,12 @@ pub fn writeback_xlsx(
                     .push(Edit::Replace(slot.span.0, slot.span.1, inline_str_cell(slot, &text)));
                 report.written += 1;
             }
-            let replaced: Vec<(String, Vec<u8>)> = by_sheet
+            // sheet 产出 = 原串 + 编辑序列（Spans 流式直写）——第二份 sheet
+            // 全量 String 不再拼出。
+            let replaced: Vec<(String, EntryPayload<'_>)> = by_sheet
                 .into_iter()
                 .map(|(idx, edits)| {
-                    (parts[idx].clone(), apply_edits(&sheet_xmls[idx], edits).into_bytes())
+                    (parts[idx].clone(), EntryPayload::Spans { original: &sheet_xmls[idx], edits })
                 })
                 .collect();
             rewrite_zip_with_added(in_path, out, &replaced, &[])?;
@@ -767,15 +771,17 @@ fn build_appendix(
         rid = rid,
         base = part_base
     );
-    let mut replaced: Vec<(String, Vec<u8>)> =
-        vec![("xl/workbook.xml".to_string(), new_wb.into_bytes())];
-    let mut added: Vec<(String, Vec<u8>)> =
-        vec![(part.clone(), appendix_sheet_xml(rows).into_bytes())];
+    let mut replaced: ZipParts =
+        vec![("xl/workbook.xml".to_string(), EntryPayload::Bytes(new_wb.into_bytes()))];
+    let mut added: ZipParts = vec![(
+        part.clone(),
+        EntryPayload::Bytes(appendix_sheet_xml(rows).into_bytes()),
+    )];
     match rels_xml {
         Some(xml) => match xml.rfind("</Relationships>") {
             Some(p) => replaced.push((
                 "xl/_rels/workbook.xml.rels".to_string(),
-                insert_at(xml, p, &rel).into_bytes(),
+                EntryPayload::Bytes(insert_at(xml, p, &rel).into_bytes()),
             )),
             None => {
                 return Err(DocError::corrupt(
@@ -785,10 +791,12 @@ fn build_appendix(
         },
         None => added.push((
             "xl/_rels/workbook.xml.rels".to_string(),
-            format!(
-                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rel}</Relationships>"#
-            )
-            .into_bytes(),
+            EntryPayload::Bytes(
+                format!(
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rel}</Relationships>"#
+                )
+                .into_bytes(),
+            ),
         )),
     }
 
@@ -802,16 +810,18 @@ fn build_appendix(
             if let Some(p) = xml.rfind("</Types>") {
                 replaced.push((
                     "[Content_Types].xml".to_string(),
-                    insert_at(xml, p, &override_el).into_bytes(),
+                    EntryPayload::Bytes(insert_at(xml, p, &override_el).into_bytes()),
                 ));
             }
         }
         None => added.push((
             "[Content_Types].xml".to_string(),
-            format!(
-                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">{override_el}</Types>"#
-            )
-            .into_bytes(),
+            EntryPayload::Bytes(
+                format!(
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">{override_el}</Types>"#
+                )
+                .into_bytes(),
+            ),
         )),
     }
     Ok((replaced, added))
@@ -854,29 +864,67 @@ fn insert_at(xml: &str, pos: usize, piece: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ZIP 透传重打包（xlsx 专用：支持新增条目——「译文」附录 sheet 是新部件；
-// writeback::zip_util 的 rewrite_zip 只支持替换既有条目，xlsx-only 构建下也
-// 不参与那套 cfg 门控）
+// ZIP 透传重打包（xlsx 专用：带新增条目——「译文」附录 sheet 是新部件。
+// 不共用 writeback::zip_util 的 rewrite_zip / rewrite_zip_added：xlsx-only
+// 构建不参与那套 cfg 门控，且要保留追加撞名防御、无 mimetype 特判的现状
+// 语义；输入 Cursor 与 EntryPayload 载荷直写两处优化同款落地）
 // ---------------------------------------------------------------------------
 
-/// 一批 ZIP 部件（条目名 → 字节）：替换 / 新增清单共用此形。
-type ZipParts = Vec<(String, Vec<u8>)>;
+/// 一批 ZIP 部件（条目名 → 载荷）：替换 / 新增清单共用此形。附录部件都是
+/// 已拼好的小件（workbook/rels/content-types 的定点插入与新 sheet），恒走
+/// [`EntryPayload::Bytes`]；sheet 正文改写走 [`EntryPayload::Spans`]（见
+/// [`writeback_xlsx`] 的 inline 路径）。
+type ZipParts = Vec<(String, EntryPayload<'static>)>;
 
-/// 逐条目透传原包字节，`replaced` 中的条目换成新字节，末尾追加 `added` 新条目，
-/// 重打包到 `out`。未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]——
-/// 原压缩流直拷（不解压不重压，CRC / 时间戳原样），只有命中条目写新字节；
+/// 输入侧整读内存的上限（字节）：包 ≤ 此值时 `fs::read` 整块读入 +
+/// `ZipArchive<Cursor<&[u8]>>`——条目寻址退化为指针运算，消 `BufReader`
+/// 缓存失效引发的碎片 lseek 抖动；更大的包回退原文件路径。xlsx 不参与
+/// writeback::zip_util 的 cfg 门控（xlsx-only 构建），故本地保一份同值常量
+/// 与同款开包逻辑。
+const CURSOR_INPUT_MAX: u64 = 64 * 1024 * 1024;
+
+/// 逐条目透传原包字节，`replaced` 中的条目换成新载荷，末尾追加 `added` 新
+/// 条目，重打包到 `out`。未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]
+/// ——原压缩流直拷（不解压不重压，CRC / 时间戳原样），只有命中条目写新
+/// 载荷（[`write_entry_payload`]：Bytes 整块 / Spans 切片交替直写）；
 /// 输出经同目录临时文件落盘后 rename（原子替换，见 [`super::temp_sibling`]），
 /// 中途失败 / ENOSPC 不在目标路径留半残文件。
+///
+/// 输入侧：包 ≤ 64MB 整读内存走 `Cursor`，否则原文件路径——`ZipArchive`
+/// 泛型于 `Read + Seek`，[`repack_xlsx`] 一份条目循环吃两个构造路径。
 fn rewrite_zip_with_added(
     in_path: &Path,
     out_path: &Path,
-    replaced: &[(String, Vec<u8>)],
-    added: &[(String, Vec<u8>)],
+    replaced: &[(String, EntryPayload<'_>)],
+    added: &[(String, EntryPayload<'_>)],
 ) -> Result<()> {
-    use std::io::Write as _;
+    let len = std::fs::metadata(in_path)
+        .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", in_path.display())))?
+        .len();
+    if len <= CURSOR_INPUT_MAX {
+        let bytes = std::fs::read(in_path)
+            .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", in_path.display())))?;
+        let zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+            .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+        repack_xlsx(zip, out_path, replaced, added)
+    } else {
+        let file = std::fs::File::open(in_path)
+            .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", in_path.display())))?;
+        let zip = zip::ZipArchive::new(file)
+            .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+        repack_xlsx(zip, out_path, replaced, added)
+    }
+}
 
-    let mut zip = open_zip(in_path)?;
-    // 预读条目名即可（目录条目照旧丢弃）：替换条目用 replaced 新字节、
+/// 重打包的条目循环（两种输入构造路径共用这一份）：replaced 载荷 / raw copy
+/// 透传 / added 载荷 三路。
+fn repack_xlsx<R: std::io::Read + std::io::Seek>(
+    mut zip: zip::ZipArchive<R>,
+    out_path: &Path,
+    replaced: &[(String, EntryPayload<'_>)],
+    added: &[(String, EntryPayload<'_>)],
+) -> Result<()> {
+    // 预读条目名即可（目录条目照旧丢弃）：替换条目用 replaced 新载荷、
     // 未触碰条目稍后 raw copy 直拷，均无需旧数据
     let mut entries: Vec<(usize, String)> = Vec::new();
     for i in 0..zip.len() {
@@ -909,11 +957,10 @@ fn rewrite_zip_with_added(
     let mut write = |zw: &mut zip::ZipWriter<std::fs::File>| -> Result<()> {
         let opts = zip::write::SimpleFileOptions::default();
         for (idx, name) in &entries {
-            if let Some((_, new_data)) = replaced.iter().find(|(n, _)| n == name) {
+            if let Some((_, payload)) = replaced.iter().find(|(n, _)| n == name) {
                 zw.start_file(name.as_str(), opts)
                     .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-                zw.write_all(new_data)
-                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                write_entry_payload(zw, name, payload)?;
             } else {
                 // 未触碰条目：压缩流直拷（不解压不重压）
                 let f = zip
@@ -923,11 +970,10 @@ fn rewrite_zip_with_added(
                     .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
             }
         }
-        for (name, data) in added {
+        for (name, payload) in added {
             zw.start_file(name.as_str(), opts)
                 .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-            zw.write_all(data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+            write_entry_payload(zw, name, payload)?;
         }
         Ok(())
     };

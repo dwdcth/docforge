@@ -55,7 +55,7 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{apply_edits, Edit, escape_xml_text, open_zip, pair_map, rewrite_zip};
+use super::{Edit, EntryPayload, escape_xml_text, open_zip, pair_map, rewrite_zip};
 
 /// odt 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（段落类 `p0-b{块序}`、格单元
@@ -82,7 +82,9 @@ pub fn writeback_odt(
         return Err(DocError::corrupt("odt 对齐失败：Document 页数异常"));
     }
 
-    // B. content.xml 读出（与解析侧同一条 UTF-8 门禁）+ 槽位重扫描
+    // B. content.xml 读出（与解析侧同一条 UTF-8 门禁）+ 槽位重扫描。这次
+    // open_zip 只为读 content.xml（1-2 次条目定位 seek），保持文件路径不
+    // 整读——≤64MB 整读 Cursor 的优化在 rewrite_zip 内部做。
     let mut zip = open_zip(in_path)?;
     let xml = zip_read_str(&mut zip, "content.xml")?
         .ok_or_else(|| DocError::corrupt("missing content.xml（不是 ODT 包）"))?;
@@ -260,16 +262,16 @@ pub fn writeback_odt(
         edits.push(Edit::Insert(scanned.text_close, appendix));
     }
 
-    // D. 改写并重打包（其余条目透传；无命中 = content.xml 原样）
-    let new_xml = if edits.is_empty() {
-        xml
-    } else {
-        apply_edits(&xml, edits)
-    };
+    // D. 改写并重打包（其余条目透传）。产出 = 原串 + 编辑序列（Spans 流式
+    // 直写）——不再拼第二份完整 content.xml；空编辑 = 原串整体直写，与旧
+    // 「原样回写」字节等同。
     rewrite_zip(
         in_path,
         out,
-        &[("content.xml".to_string(), new_xml.into_bytes())],
+        &[(
+            "content.xml".to_string(),
+            EntryPayload::Spans { original: &xml, edits },
+        )],
     )?;
     Ok(report)
 }

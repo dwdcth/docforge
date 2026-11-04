@@ -104,7 +104,7 @@ use crate::error::{DocError, Result};
 use crate::model::SourceToken;
 use crate::plugin::FormatPlugin;
 
-use super::{escape_xml_text, open_zip, pair_map, rewrite_zip, WritebackReport};
+use super::{escape_xml_text, Edit, EntryPayload, open_zip, pair_map, rewrite_zip, WritebackReport};
 
 /// docx 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（块 `p{页}-b{块序}`、表格格
@@ -134,6 +134,8 @@ pub fn writeback_docx(
 
     // 第二遍：原 XML 字节照常另读（编辑拼装基底）；可翻译位由槽位表按单元
     // 信物解析（旧独立扫描器 scan_slots 已割接删除，见 slots_from_sidecar）。
+    // 这次 open_zip 只为读 document.xml（1-2 次条目定位 seek），保持文件
+    // 路径不整读——≤64MB 整读 Cursor 的优化在 rewrite_zip 内部做。
     let mut zip = open_zip(in_path)?;
     let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
@@ -141,8 +143,11 @@ pub fn writeback_docx(
     let body_close = docx_body_close(&xml);
 
     let mut report = WritebackReport::default();
-    let new_xml = match strategy {
-        BiStrategy::BilingualInline => apply_inline(&xml, &slots, &units, &map, &mut report),
+    // 编辑序列（流式拼接的原料）：写入时原串切片与替换块交替直写——不再
+    // 拼第二份完整 XML String。空编辑 = 原串整体直写，与旧「原样回写」字节
+    // 等同。
+    let edits = match strategy {
+        BiStrategy::BilingualInline => apply_inline(&slots, &units, &map, &mut report),
         BiStrategy::TranslationOnly => {
             apply_translation_only(&xml, &slots, &units, &map, &mut report)
         }
@@ -154,7 +159,10 @@ pub fn writeback_docx(
     rewrite_zip(
         in_path,
         out,
-        &[("word/document.xml".to_string(), new_xml.into_bytes())],
+        &[(
+            "word/document.xml".to_string(),
+            EntryPayload::Spans { original: &xml, edits },
+        )],
     )?;
     Ok(report)
 }
@@ -194,6 +202,8 @@ pub fn writeback_docx_alternating(
     let units = crate::emit::to_translation_units(&doc);
     let map = pair_map(pairs);
 
+    // 这次 open_zip 只为读 document.xml（1-2 次条目定位 seek），保持文件
+    // 路径不整读——≤64MB 整读 Cursor 的优化在 rewrite_zip 内部做。
     let mut zip = open_zip(in_path)?;
     let xml = crate::backends::office::zip_read_str(&mut zip, "word/document.xml")?
         .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
@@ -205,15 +215,18 @@ pub fn writeback_docx_alternating(
         return rewrite_zip(in_path, out, &[]).map(|_| report);
     }
 
-    // B. 分段（回写侧 XML 层的 body 顶层扫描）+ 逐段拼装：原文段字节不动，
-    //    有命中编辑的段后插译文段。
+    // B. 分段（回写侧 XML 层的 body 顶层扫描）+ 逐段装配：原文段字节不动
+    //    （原串透传），有命中编辑的段产出一条「段终点插入译文段」的编辑。
     let (content_start, blocks, tail_sectpr) = scan_body_blocks(&xml)?;
     let segs = segments_from_blocks(content_start, &blocks, tail_sectpr);
-    let new_xml = assemble_alternating(&xml, &segs, &edits);
+    let tr_edits = assemble_alternating(&xml, &segs, &edits);
     rewrite_zip(
         in_path,
         out,
-        &[("word/document.xml".to_string(), new_xml.into_bytes())],
+        &[(
+            "word/document.xml".to_string(),
+            EntryPayload::Spans { original: &xml, edits: tr_edits },
+        )],
     )?;
     Ok(report)
 }
@@ -424,23 +437,22 @@ fn matched_translations(
 /// 最小 rPr——仅 `w:sz`/`w:szCs` = 18 半点 = 9pt 的固定小字号，不复制原
 /// run 的 rPr，见模块头；含嵌套表的格 v1 不写，见模块头）。
 ///
+/// 返回编辑序列（流式拼接：原串 + 编辑由 [`EntryPayload::Spans`] 直写，整篇
+/// 的第二份 String 不再拼出）；无命中返回空序列（= 原样回写）。
+///
 /// 段落位 pPr 的唯一改写：剔除节符（[`strip_sectpr`]）。原段是节尾段（pPr
 /// 内含 `w:sectPr`，即其节的最后一块）时，verbatim 克隆会把节符复制进译文
 /// 段；节符即换页边界（默认 nextPage），双语段之间会多出一页空白（节交替
 /// 回写金测否决过的同款缺陷，见模块头「节保真」）。格位分支不剥：节符不落
 /// 表格内（`BodyBlock.has_sectpr` 同款口径）。
 fn apply_inline(
-    xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
     map: &HashMap<&str, (&str, Option<&str>)>,
     report: &mut WritebackReport,
-) -> String {
+) -> Vec<Edit> {
     let matched = matched_translations(slots, units, map, report);
-    if matched.is_empty() {
-        return xml.to_string();
-    }
-    let mut edits: Vec<(usize, String)> = Vec::new();
+    let mut edits: Vec<Edit> = Vec::with_capacity(matched.len());
     for (k, tr) in matched {
         match &slots[k] {
             Slot::Para(p) => {
@@ -448,7 +460,7 @@ fn apply_inline(
                 // 制节符 = 译文段自带换页边界，双语段间多一页空白（见
                 // strip_sectpr 与函数文档）。格位分支不剥：节符不落表格内。
                 let ppr = strip_sectpr(p.ppr.as_deref().unwrap_or_default());
-                edits.push((
+                edits.push(Edit::Insert(
                     p.end,
                     format!(
                         "<w:p>{ppr}<w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
@@ -477,7 +489,7 @@ fn apply_inline(
                 // 子元素即天然合法；固定值不解析 styles.xml 继承链，未来可
                 // 做样式感知（见模块头）。段落级 Inline 不带此 rPr（正文
                 // 整段宽度充足，无需缩字号）。
-                edits.push((
+                edits.push(Edit::Insert(
                     last.end,
                     format!(
                         "<w:p>{ppr}<w:r><w:rPr><w:sz w:val=\"18\"/><w:szCs w:val=\"18\"/></w:rPr>\
@@ -489,7 +501,7 @@ fn apply_inline(
             }
         }
     }
-    splice(xml, edits)
+    edits
 }
 
 /// pPr 内节符的字面量形态（[`strip_sectpr`] 剥离用；与 [`W_SECTPR`] 本地
@@ -539,14 +551,22 @@ fn strip_sectpr(ppr: &str) -> String {
 /// 清空嵌套表文本会在重解析留下 `,` 展平残留。
 /// 简化说明：不删 run 结构（保留书签/字段/格式），只清文本——重解析口径
 /// （位文本 = 译文）与「首 run 换文本其余 run 删」等价，但更不易损坏文档。
+///
+/// 返回编辑序列（流式拼接，见 [`apply_inline`]）：与节交替
+/// （[`translation_only_edits`]）共用同一编辑源，此处只做坐标元组的形态
+/// 转换，应用语义交由 [`EntryPayload::Spans`] 直写（与
+/// [`super::apply_edits`] 同款排序 / 守卫）。
 fn apply_translation_only(
     xml: &str,
     slots: &[Slot],
     units: &[crate::emit::TranslationUnit],
     map: &HashMap<&str, (&str, Option<&str>)>,
     report: &mut WritebackReport,
-) -> String {
-    splice_spans(xml, translation_only_edits(xml, slots, units, map, report))
+) -> Vec<Edit> {
+    translation_only_edits(xml, slots, units, map, report)
+        .into_iter()
+        .map(|(s, e, t)| Edit::Replace(s, e, t))
+        .collect()
 }
 
 /// TranslationOnly 的逐位置编辑（文档坐标字节区间）：段落位首 `w:t` 换译
@@ -560,9 +580,10 @@ fn apply_translation_only(
 /// trim 之前）首/尾带空白、且其开始标签未带 `xml:space` 属性时，额外产出
 /// 一个「改写开始标签补 ` xml:space="preserve"`」的编辑（判据与防御见
 /// [`preserve_space_tag_edit`]）——与合成段落的 preserve 口径对齐，防
-/// Word 吞空格；标签编辑与文本替换编辑区间相接不重叠，同批一次
-/// [`splice_spans`] 应用（节交替平移后同样成立：两个编辑同落一个 `w:t`，
-/// 永远被同一分段整体收录或整体丢弃）。
+/// Word 吞空格；标签编辑与文本替换编辑区间相接不重叠，同批一次应用
+/// （整篇路径 = [`EntryPayload::Spans`] 直写；节交替平移后同样成立：两个
+/// 编辑同落一个 `w:t`，永远被同一分段整体收录或整体丢弃，译文段内经
+/// [`splice_spans`] 应用）。
 fn translation_only_edits(
     xml: &str,
     slots: &[Slot],
@@ -677,7 +698,8 @@ fn w_t_start_tag_span(xml: &str, text_start: usize) -> Option<(usize, usize)> {
 
 /// OriginalPlusAppendix：正文不动，body 末尾追加「译文」标题段 + 译文段序列。
 /// 表格不进附录：格位照常参与配对（消费单元流保对齐），但不产出附录条目，
-/// 格文本原样不动。
+/// 格文本原样不动。返回编辑序列（流式拼接，见 [`apply_inline`]）：至多一条
+/// `</w:body>`（或尾 sectPr）前的插入编辑，无命中返回空序列（= 原样回写）。
 fn apply_appendix(
     xml: &str,
     slots: &[Slot],
@@ -685,7 +707,7 @@ fn apply_appendix(
     map: &HashMap<&str, (&str, Option<&str>)>,
     body_close: usize,
     report: &mut WritebackReport,
-) -> String {
+) -> Vec<Edit> {
     let matched = matched_translations(slots, units, map, report);
     let mut entries: Vec<String> = Vec::new();
     for (k, tr) in matched {
@@ -697,7 +719,7 @@ fn apply_appendix(
         }
     }
     if entries.is_empty() {
-        return xml.to_string();
+        return Vec::new();
     }
     report.written += entries.len();
     let mut appendix = String::from(
@@ -711,7 +733,7 @@ fn apply_appendix(
         ));
     }
     let pos = appendix_insert_pos(xml, body_close);
-    splice(xml, vec![(pos, appendix)])
+    vec![Edit::Insert(pos, appendix)]
 }
 
 /// 追加位置：body 末尾是 `<w:sectPr>`（尾块）时插在它之前，否则插在 `</w:body>` 前。
@@ -728,21 +750,9 @@ fn appendix_insert_pos(xml: &str, body_close: usize) -> usize {
     }
 }
 
-/// 按 (位置, 插入文本) 从后往前拼装（位置可乱序，先排序）。
-fn splice(xml: &str, mut edits: Vec<(usize, String)>) -> String {
-    edits.sort_by_key(|(pos, _)| *pos);
-    let mut out = String::with_capacity(xml.len() + edits.iter().map(|(_, s)| s.len()).sum::<usize>());
-    let mut cursor = 0usize;
-    for (pos, s) in edits {
-        out.push_str(&xml[cursor..pos]);
-        out.push_str(&s);
-        cursor = pos;
-    }
-    out.push_str(&xml[cursor..]);
-    out
-}
-
 /// 按 (起, 止, 替换文本) 从后往前拼装（按起偏移排序，区间互不重叠）。
+/// 流式改造后仅 [`assemble_alternating`] 的译文段局部拼接还在用（段级小件；
+/// 整篇的应用已收编进 [`EntryPayload::Spans`] 直写）。
 fn splice_spans(xml: &str, mut edits: Vec<(usize, usize, String)>) -> String {
     edits.sort_by_key(|(s, _, _)| *s);
     let mut out = String::with_capacity(xml.len());
@@ -929,18 +939,24 @@ fn segments_from_blocks(
     segs
 }
 
-/// 逐段拼装：原文段字节原样复制（只插入不修改），有命中编辑的段后插译文
-/// 段 = 该段 XML 子串平移套用同一套 TranslationOnly 编辑（未命中单元原样
-/// 保留，译文段是完整合法的正文拷贝）；无命中段不插（避免原样页翻两遍）。
-/// 编辑只落在单个块内、结构性不跨段；越界编辑保守丢弃。分页语义载体见模
-/// 块头与 [`Segment`] 字段文档。
-fn assemble_alternating(xml: &str, segs: &[Segment], edits: &[(usize, usize, String)]) -> String {
-    let mut out = String::with_capacity(xml.len() * 2);
-    let mut cursor = 0usize;
+/// 逐段装配：原文段字节原样透传（只插入不修改），有命中编辑的段产出一条
+/// 「段终点插入译文段」的编辑（返回序列由 [`EntryPayload::Spans`] 直写）；
+/// 无命中段不插（避免原样页翻两遍）。编辑只落在单个块内、结构性不跨段；
+/// 越界编辑保守丢弃。分页语义载体见模块头与 [`Segment`] 字段文档。
+///
+/// 与旧「整篇拼串」的逐字节等同性：分段在 `[content_start, tail_end)` 上
+/// 连续升序（[`segments_from_blocks`] 的装配规则保证），故「原串透传 + 按
+/// 段终点升序插入」复原出完全相同的字节序——段间隙与原文段来自原串切片、
+/// 插入段按段序排列（同点插入由稳定排序保持次序），尾部透传一致。译文段
+/// 本体仍是段级小件局部拼接（[`splice_spans`]：原段子串 + 平移后的编辑），
+/// 整篇长度的第二份 String 不再存在。
+fn assemble_alternating(
+    xml: &str,
+    segs: &[Segment],
+    edits: &[(usize, usize, String)],
+) -> Vec<Edit> {
+    let mut out: Vec<Edit> = Vec::new();
     for seg in segs {
-        out.push_str(&xml[cursor..seg.start]); // 段间隙（body 开标签后的零散节点等）
-        out.push_str(&xml[seg.start..seg.end]); // 原文段：字节不动
-        cursor = seg.end;
         // 本段的编辑平移到段内坐标
         let own: Vec<(usize, usize, String)> = edits
             .iter()
@@ -951,20 +967,19 @@ fn assemble_alternating(xml: &str, segs: &[Segment], edits: &[(usize, usize, Str
             continue; // 无命中段不插译文段
         }
         let tr = splice_spans(&xml[seg.start..seg.end], own);
-        if seg.closed_by_sectpr || seg.opens_with_page_break {
+        let payload = if seg.closed_by_sectpr || seg.opens_with_page_break {
             // 译文段是原段字节拷贝：段内自带的节符段落 / 段首分页段落提供
             // 换页与节属性保真，无需载体段（见模块头「节保真」两案取舍）
-            out.push_str(&tr);
+            tr
         } else {
             // 尾节/退化段：无自带分页可拷，译文段前插独立分页段新起一页；
             // 译文随下一节属性——body 裸 sectPr 的属性即本节原属性，保真等
             // 价（译文之后追加节符拷贝段会得到「原译同节连排 + 末尾空节」
             // 两个缺陷，见模块头）
-            out.push_str(PAGE_BREAK_P);
-            out.push_str(&tr);
-        }
+            format!("{PAGE_BREAK_P}{tr}")
+        };
+        out.push(Edit::Insert(seg.end, payload));
     }
-    out.push_str(&xml[cursor..]); // 尾部透传（裸 sectPr + body/document 收尾）
     out
 }
 

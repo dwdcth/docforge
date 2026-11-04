@@ -45,7 +45,7 @@ use crate::emit::BiStrategy;
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{apply_edits, Edit, escape_xml_text, pair_map, write_bytes_atomic};
+use super::{write_spans_atomic, Edit, escape_xml_text, pair_map};
 
 /// section 递归上限（与提取侧 [`crate::backends::fb2`] 同值：只防病态嵌套）。
 const MAX_SECTION_DEPTH: u8 = 32;
@@ -184,14 +184,10 @@ pub fn writeback_fb2(
         }
     }
 
-    // D. 改写并写回（无命中 = 原文原样）——原子落盘：同目录临时件 +
-    // rename，崩溃 / ENOSPC 不在目标路径留半残文件
-    let out_xml = if edits.is_empty() {
-        xml
-    } else {
-        apply_edits(&xml, edits)
-    };
-    write_bytes_atomic(out, &out_xml.into_bytes())?;
+    // D. 直写落盘（无命中 = 原文原样）——原字节切片 + 编辑替换交替直写
+    // 同目录临时件 + rename（排序/重叠守卫与 apply_edits 同语义，构造性
+    // 等同，成品不再整串驻留），崩溃 / ENOSPC 不在目标路径留半残文件
+    write_spans_atomic(out, &xml, edits)?;
     Ok(report)
 }
 
@@ -1326,6 +1322,53 @@ mod tests {
                 .map(|b| b.content.as_str())
                 .collect::<Vec<_>>(),
             ["第二章", "白日依山尽\n黄河入海流", "第二章尾段。", "Final paragraph."]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 直写路径字节等价（金测）：BilingualInline 的两处 `</p>` 后插入——
+    /// 同一扫描器取同一锚点，按实现同构规则手拼编辑序列，产物与旧构造
+    ///（`apply_edits(原 XML, 同序编辑)`）逐字节一致。
+    #[test]
+    fn spans_direct_write_matches_apply_edits_bytes() {
+        let dir = case_dir("spans-direct");
+        let in_path = dir.join("in.fb2");
+        std::fs::write(&in_path, book_xml()).unwrap();
+        let out_path = dir.join("out.fb2");
+        write(
+            &in_path,
+            &out_path,
+            &[
+                ("p第一章-b1", "First paragraph."),
+                ("p第二章-b2", "Final paragraph."),
+            ],
+            BiStrategy::BilingualInline,
+        );
+
+        // 页序 = 卷首(0) + 第一章(1) + 第二章(2)；b1 = 正文一段、b2 = 尾段
+        //（与金测 roundtrip 的 id 口径一致）；Inline 锚点 = 元素 End 后偏移
+        let xml = std::fs::read_to_string(&in_path).unwrap();
+        let scanned = scan_fb2(&xml).unwrap();
+        let inline_after = |slot: &Fb2Slot| match &slot.anchor {
+            Anchor::Inline { after, .. } => *after,
+            _ => panic!("测试槽位应为 Inline 锚点"),
+        };
+        let edits = vec![
+            Edit::Insert(
+                inline_after(&scanned.pages[1][1]),
+                "<p>First paragraph.</p>".to_string(),
+            ),
+            Edit::Insert(
+                inline_after(&scanned.pages[2][2]),
+                "<p>Final paragraph.</p>".to_string(),
+            ),
+        ];
+        let expected = crate::writeback::apply_edits(&xml, edits);
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            expected.into_bytes(),
+            "直写产物与旧整串拼接构造逐字节一致"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

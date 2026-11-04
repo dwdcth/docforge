@@ -99,7 +99,12 @@ pub(crate) fn escape_xml_text(s: &str) -> String {
     out
 }
 
-/// 一处回写编辑（xml / xhtml 单文件改写共用；txt 走行级重组不经此）。
+/// 一处回写编辑（xml / xhtml 单文件与 zip 条目改写共用；txt 行级重组在本波
+/// 也已等价直译为 span 编辑——见 writeback/txt.rs 的 rebuild_edits）。
+/// [`EntryPayload::Spans`] 的流式直写与本文件的 [`apply_edits`] 共用同一
+/// 应用语义（按起点稳定排序 + 重叠保守丢弃），故 Clone 供测试/调用点对同一
+/// 编辑集做两种载荷的逐字节对照。
+#[derive(Clone)]
 pub(crate) enum Edit {
     /// 在 `pos` 前插入。
     Insert(usize, String),
@@ -108,6 +113,12 @@ pub(crate) enum Edit {
 }
 
 /// 按 (起, 止, 文本) / (位置, 文本) 从后往前应用编辑（先排序；区间互不重叠）。
+///
+/// 流式改造后的角色：zip 条目与单文件直写已收编进 [`write_spans`] /
+/// [`write_spans_atomic`]（应用语义与本品逐字节一致），生产路径不再拼串；
+/// 本品保留为语义基准（参考实现）——各回写器的金测以它为 oracle 做逐字节
+/// 对照（「直写 = 拼接」的构造性等价证明）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_edits(xml: &str, edits: Vec<Edit>) -> String {
     let mut items: Vec<(usize, usize, String)> = edits
         .into_iter()
@@ -129,6 +140,112 @@ pub(crate) fn apply_edits(xml: &str, edits: Vec<Edit>) -> String {
     }
     out.push_str(&xml[cursor..]);
     out
+}
+
+/// 改写条目的载荷（zip 重打包器共用）：`Bytes` = 成品字节（附录等已拼好的
+/// 小件、xlsx 的附录部件群）；`Spans` = 原 XML 串 + 已排序可应用的编辑
+/// （span 替换 / 零长插入），写入时原串切片与替换块交替直写——不再拼第二份
+/// 完整 String（拼接产物整份驻留消失，回写峰值内存的主菜）。写出语义与
+/// [`apply_edits`] 逐字节一致（同编辑同序 → 流式直写 = 拼好再写）。
+pub(crate) enum EntryPayload<'a> {
+    Bytes(Vec<u8>),
+    Spans { original: &'a str, edits: Vec<Edit> },
+}
+
+/// [`EntryPayload::Spans`] / [`write_spans_atomic`] 共用的流式写出核心：
+/// 按起点稳定排序（Insert 以其位置为键），原串切片与替换块交替直写 `w`。
+/// 应用语义与 [`apply_edits`] 逐字节一致：同一排序键（Insert→pos、
+/// Replace→start）同一稳定序、同一「重叠区间保守丢弃后到者」守卫、同一
+/// 切片顺序——因此对同一编辑集，直写产物 = 拼接产物。
+fn write_spans<W: std::io::Write>(
+    w: &mut W,
+    original: &str,
+    edits: &[Edit],
+) -> std::io::Result<()> {
+    // W 的泛型界已带入 Write trait（write_all 直接可用），无需再 import。
+    let mut items: Vec<&Edit> = edits.iter().collect();
+    items.sort_by_key(|e| match e {
+        Edit::Insert(p, _) => *p,
+        Edit::Replace(s, _, _) => *s,
+    });
+    // 批冲缓冲：逐编辑两次 write_all 会在万级编辑量下产生显著的逐次调用
+    // 开销（下游是压缩器/文件流）；攒 64KB 一冲，内存 O(64KB)、写入次数
+    // 降三个量级——流式的内存收益与整写的吞吐兼得（实测对照见 BENCHMARK.md）。
+    const FLUSH: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(FLUSH * 2);
+    let mut flush = |buf: &mut Vec<u8>, w: &mut W| -> std::io::Result<()> {
+        if !buf.is_empty() {
+            w.write_all(buf)?;
+            buf.clear();
+        }
+        Ok(())
+    };
+    let mut cursor = 0usize;
+    for e in items {
+        let (s, end, txt) = match e {
+            Edit::Insert(p, t) => (*p, *p, t),
+            Edit::Replace(s, e, t) => (*s, *e, t),
+        };
+        if s < cursor {
+            continue; // 区间重叠（不应发生）：保守丢弃后到的——与 apply_edits 同款
+        }
+        buf.extend_from_slice(original.as_bytes().get(cursor..s).unwrap_or_default());
+        buf.extend_from_slice(txt.as_bytes());
+        cursor = end;
+        if buf.len() >= FLUSH {
+            flush(&mut buf, w)?;
+        }
+    }
+    buf.extend_from_slice(original.as_bytes().get(cursor..).unwrap_or(&[]));
+    flush(&mut buf, w)
+}
+
+/// 把一个 zip 条目的改写载荷直写 writer：`Bytes` 整块一次写；`Spans` 切片
+/// 交替直写（见 [`write_spans`]）。错误统一挂条目名（与既有
+/// 「ZIP 写 {name} 失败」文案同口径）。
+pub(crate) fn write_entry_payload<W: std::io::Write>(
+    w: &mut W,
+    name: &str,
+    payload: &EntryPayload<'_>,
+) -> crate::error::Result<()> {
+    // 同上：W: std::io::Write 泛型界已带入 trait。
+    match payload {
+        EntryPayload::Bytes(data) => w.write_all(data).map_err(|e| {
+            crate::error::DocError::corrupt(format!("ZIP 写 {name} 失败: {e}"))
+        }),
+        EntryPayload::Spans { original, edits } => write_spans(w, original, edits).map_err(|e| {
+            crate::error::DocError::corrupt(format!("ZIP 写 {name} 失败: {e}"))
+        }),
+    }
+}
+
+/// Spans 编辑序列的流式原子落盘（单文件直写变体，html / fb2 / txt 单文件
+/// 回写共用；zip 容器条目走 [`write_entry_payload`]，不经此）：原串切片与
+/// 替换块交替写同目录临时件，成功后 rename 到位（与 [`write_bytes_atomic`]
+/// 同款原子化——中途失败 / ENOSPC 不在目标路径留半残文件）。
+pub(crate) fn write_spans_atomic(
+    out: &Path,
+    original: &str,
+    edits: Vec<Edit>,
+) -> crate::error::Result<()> {
+    use std::io::Write as _;
+
+    let tmp = temp_sibling(out);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        write_spans(&mut f, original, &edits)?;
+        f.flush()
+    };
+    match write() {
+        Ok(()) => commit_temp(&tmp, out),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(crate::error::DocError::corrupt(format!(
+                "cannot create {}: {e}",
+                out.display()
+            )))
+        }
+    }
 }
 
 /// [`crate::emit::TranslationPair`] 的查找表：值 =（译文, ①侧源文本）。
@@ -198,7 +315,8 @@ pub(crate) fn commit_temp(tmp: &Path, out: &Path) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// 字节写出的原子化（txt / html / fb2 / md 单文件写出共用）：先写同目录
+/// 字节写出的原子化（stream.rs 的 md 写出现存唯一调用方；txt/html/fb2 已改走
+/// [`write_spans_atomic`]）：先写同目录
 /// 临时兄弟文件，成功后 [`commit_temp`] rename 到位。写出中途失败（崩溃 /
 /// ENOSPC）删除临时件——目标路径要么是完整的旧/新内容，要么不存在，
 /// 永远不留半残文件。
@@ -220,7 +338,7 @@ pub(crate) fn write_bytes_atomic(out: &Path, bytes: &[u8]) -> crate::error::Resu
 
 #[cfg(any(feature = "docx", feature = "epub", feature = "odt"))]
 mod zip_util {
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::path::Path;
 
     use crate::error::{DocError, Result};
@@ -231,25 +349,77 @@ mod zip_util {
         zip::ZipArchive::new(file).map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))
     }
 
-    /// 逐条目透传原包字节，`replaced` 中的条目换成新字节，重打包到 `out`。
-    ///
-    /// 未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]——原压缩流
-    /// 直拷（不解压不重压，CRC / 时间戳 / 权限 / 扩展字段原样），100MB 图多
-    /// 的容器回写从秒级降到毫秒级；命中条目照旧写新字节。EPUB 的 `mimetype`
-    /// 约定（首条目 + Stored）在此统一维护：mimetype 只有 20 字节级、不走
-    /// raw copy（raw copy 保留原压缩态，缺损包会带着非 Stored 的 mimetype
-    /// 进输出，违反 OCF 约定），照旧解出字节强制 Stored。
-    ///
-    /// 输出经 [`super::temp_sibling`] 的同目录临时文件落盘，`finish` 成功后
-    /// [`super::commit_temp`] rename 到位——中途失败 / ENOSPC 不在目标路径
-    /// 留半残 zip。重复的替换名按「后者胜」收敛（与旧 `apply` 语义一致）。
+    /// 输入侧整读内存的上限（字节）：包 ≤ 此值时 `fs::read` 整块读入 +
+    /// `ZipArchive<Cursor<&[u8]>>`——条目寻址退化为指针运算，消
+    /// `BufReader` 缓存失效引发的碎片 lseek 抖动；更大的包回退原文件路径。
+    const CURSOR_INPUT_MAX: u64 = 64 * 1024 * 1024;
+
+    /// 逐条目透传原包字节，`replaced` 中的条目换成新载荷，重打包到 `out`。
+    /// 无新增条目的 [`rewrite_zip_added`] 便捷形态。
     pub(crate) fn rewrite_zip(
         in_path: &Path,
         out_path: &Path,
-        replaced: &[(String, Vec<u8>)],
+        replaced: &[(String, super::EntryPayload<'_>)],
     ) -> Result<()> {
-        let mut zip = open_zip(in_path)?;
+        rewrite_zip_added(in_path, out_path, replaced, &[])
+    }
 
+    /// [`rewrite_zip`] 的带新增变体（epub alternating 专用）：`replaced` 换
+    /// 既有条目、`added` 追加新条目（EPUB 不约束条目物理序，追加在末尾）。
+    ///
+    /// 输入侧：包 ≤ 64MB 整读内存走 `Cursor`（寻址 = 指针运算，消碎片
+    /// seek），否则原文件路径——`ZipArchive` 泛型于 `Read + Seek`，
+    /// [`repack_zip`] 一份条目循环吃两个构造路径。规划期各回写器在调本函数
+    /// 之前的那次 `open_zip`（读 document.xml / content.xml / OPF，1-2 次
+    /// 条目定位 seek）保持文件路径不整读，见各调用点注释。
+    ///
+    /// 未被替换命中的条目走 [`zip::ZipWriter::raw_copy_file`]——原压缩流
+    /// 直拷（不解压不重压，CRC / 时间戳 / 权限 / 扩展字段原样）；命中条目
+    /// 照旧写新载荷（[`super::write_entry_payload`]：Bytes 整块 / Spans
+    /// 切片交替直写）。EPUB 的 `mimetype` 约定（首条目 + Stored）在此统一
+    /// 维护：mimetype 只有 20 字节级、不走 raw copy（raw copy 保留原压缩
+    /// 态，缺损包会带着非 Stored 的 mimetype 进输出，违反 OCF 约定），照旧
+    /// 解出字节强制 Stored。重复的替换名按「后者胜」收敛（与旧 `apply`
+    /// 语义一致）。
+    ///
+    /// 输出经 [`super::temp_sibling`] 的同目录临时文件落盘，`finish` 成功后
+    /// [`super::commit_temp`] rename 到位——中途失败 / ENOSPC 不在目标路径
+    /// 留半残 zip。
+    pub(crate) fn rewrite_zip_added(
+        in_path: &Path,
+        out_path: &Path,
+        replaced: &[(String, super::EntryPayload<'_>)],
+        added: &[(String, super::EntryPayload<'_>)],
+    ) -> Result<()> {
+        let len = std::fs::metadata(in_path)
+            .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", in_path.display())))?
+            .len();
+        if len <= CURSOR_INPUT_MAX {
+            let bytes = std::fs::read(in_path).map_err(|e| {
+                DocError::corrupt(format!("cannot open {}: {e}", in_path.display()))
+            })?;
+            let zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+                .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+            repack_zip(zip, out_path, replaced, added)
+        } else {
+            let file = std::fs::File::open(in_path).map_err(|e| {
+                DocError::corrupt(format!("cannot open {}: {e}", in_path.display()))
+            })?;
+            let zip = zip::ZipArchive::new(file)
+                .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+            repack_zip(zip, out_path, replaced, added)
+        }
+    }
+
+    /// 重打包的条目循环（`rewrite_zip` / `rewrite_zip_added` 共用，输入侧
+    /// 两种构造路径经由 `R: Read + Seek` 收敛到这一份）：raw copy 透传 /
+    /// replaced 载荷 / added 载荷 三路。
+    fn repack_zip<R: Read + Seek>(
+        mut zip: zip::ZipArchive<R>,
+        out_path: &Path,
+        replaced: &[(String, super::EntryPayload<'_>)],
+        added: &[(String, super::EntryPayload<'_>)],
+    ) -> Result<()> {
         // 预读条目名（目录条目照旧丢弃——输出不携带目录条目）；mimetype
         // 的字节顺手读出（20 字节级，强制 Stored 重写），其余条目不预读
         // 数据——未命中替换的条目稍后 raw copy 压缩流直拷。
@@ -298,15 +468,15 @@ mod zip_util {
                 if wrote_mimetype && name == "mimetype" {
                     continue;
                 }
-                if let Some((_, data)) =
+                if let Some((_, payload)) =
                     replaced.iter().rev().find(|(n, _)| n == name)
                 {
-                    // 命中替换：新字节照旧走 start_file（重压缩）
+                    // 命中替换：新载荷照旧走 start_file（重压缩），Spans
+                    // 载荷切片交替直写（不整份驻留）
                     let opts = zip::write::SimpleFileOptions::default();
                     zw.start_file(name.as_str(), opts)
                         .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-                    zw.write_all(data)
-                        .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                    super::write_entry_payload(zw, name, payload)?;
                 } else {
                     // 未触碰条目：压缩流直拷（不解压不重压）
                     let f = zip
@@ -315,6 +485,12 @@ mod zip_util {
                     zw.raw_copy_file(f)
                         .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
                 }
+            }
+            for (name, payload) in added {
+                let opts = zip::write::SimpleFileOptions::default();
+                zw.start_file(name.as_str(), opts)
+                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
+                super::write_entry_payload(zw, name, payload)?;
             }
             Ok(())
         };
@@ -335,7 +511,7 @@ mod zip_util {
 }
 
 #[cfg(any(feature = "docx", feature = "epub", feature = "odt"))]
-pub(crate) use zip_util::{open_zip, rewrite_zip};
+pub(crate) use zip_util::{open_zip, rewrite_zip, rewrite_zip_added};
 
 #[cfg(test)]
 pub(crate) mod tests_util {
@@ -437,6 +613,29 @@ mod atomic_write_tests {
         assert!(tmp_residue(&dir).is_empty(), "无临时件残留");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// write_spans_atomic（html / fb2 / txt 单文件直写共用）：Spans 编辑序列
+    /// 原子落盘，字节与 apply_edits 拼接产物一致；成功后目录无临时件残留。
+    #[test]
+    fn write_spans_atomic_matches_apply_edits() {
+        use super::{apply_edits, write_spans_atomic, Edit};
+
+        let dir = case_dir("spans_atomic");
+        let out = dir.join("out.xml");
+        let original = "<p>甲乙。</p>";
+        let mk_edits = || {
+            vec![
+                Edit::Insert(16, "<p class=\"docforge-tr\">tr</p>".to_string()),
+                Edit::Replace(6, 9, "乙一".to_string()),
+            ]
+        };
+        write_spans_atomic(&out, original, mk_edits()).unwrap();
+        let got = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(got, apply_edits(original, mk_edits()));
+        assert_eq!(got, "<p>甲乙一。</p><p class=\"docforge-tr\">tr</p>");
+        assert!(tmp_residue(&dir).is_empty(), "无临时件残留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// raw copy 直拷（共用 [`super::zip_util::rewrite_zip`]，docx / epub / odt
@@ -491,7 +690,10 @@ mod zip_raw_copy_tests {
         rewrite_zip(
             &in_path,
             &out_path,
-            &[("OEBPS/text.xml".to_string(), b"<p>replaced</p>".to_vec())],
+            &[(
+                "OEBPS/text.xml".to_string(),
+                super::EntryPayload::Bytes(b"<p>replaced</p>".to_vec()),
+            )],
         )
         .unwrap();
 
@@ -523,6 +725,88 @@ mod zip_raw_copy_tests {
             .filter(|n| n.contains(".tmp-"))
             .collect();
         assert!(residue.is_empty(), "{residue:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spans 与 Bytes 两种载荷对同一编辑集产出条目字节逐字节一致（流式拼接
+    /// 的构造性等价：同编辑同序 → 切片交替直写 = 拼好再写；金测「输出字节
+    /// 零变化」的直证）。编辑集乱序给出（写入前排序）、含替换 / 清空 /
+    /// 段间插入 / 尾插入，切点全落字符边界。
+    #[test]
+    fn spans_payload_bytes_match_bytes_payload_byte_for_byte() {
+        use super::{apply_edits, write_spans, Edit, EntryPayload};
+
+        let dir = case_dir("spans_vs_bytes");
+        let original = "<doc><p>甲乙丙丁。</p><p>戊 &amp; 己。</p></doc>";
+        let mk_edits = || {
+            vec![
+                Edit::Insert(27, "<p class=\"docforge-tr\">tr</p>".to_string()),
+                Edit::Replace(34, 39, String::new()),
+                Edit::Insert(56, "<p>尾</p>".to_string()),
+                Edit::Replace(11, 14, "yi".to_string()),
+            ]
+        };
+
+        // 直接核心对照：write_spans 直写 = apply_edits 拼接
+        let mut streamed = Vec::new();
+        write_spans(&mut streamed, original, &mk_edits()).unwrap();
+        assert_eq!(streamed, apply_edits(original, mk_edits()).into_bytes());
+
+        // 端到端：两种载荷走 rewrite_zip，重压缩后的条目字节一致
+        let build = |name: &str| {
+            let in_path = dir.join(format!("in-{name}.zip"));
+            {
+                let f = std::fs::File::create(&in_path).unwrap();
+                let mut zw = zip::ZipWriter::new(f);
+                let stored = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("mimetype", stored).unwrap();
+                zw.write_all(b"application/epub+zip").unwrap();
+                zw.start_file("a.xml", zip::write::SimpleFileOptions::default()).unwrap();
+                zw.write_all(original.as_bytes()).unwrap();
+                zw.finish().unwrap();
+            }
+            in_path
+        };
+        let in_a = build("bytes");
+        let in_b = build("spans");
+        let out_a = dir.join("out-bytes.zip");
+        let out_b = dir.join("out-spans.zip");
+        rewrite_zip(
+            &in_a,
+            &out_a,
+            &[(
+                "a.xml".to_string(),
+                EntryPayload::Bytes(apply_edits(original, mk_edits()).into_bytes()),
+            )],
+        )
+        .unwrap();
+        rewrite_zip(
+            &in_b,
+            &out_b,
+            &[(
+                "a.xml".to_string(),
+                EntryPayload::Spans { original, edits: mk_edits() },
+            )],
+        )
+        .unwrap();
+        let read_entry = |p: &Path| -> Vec<u8> {
+            let mut z = open_zip(p).unwrap();
+            let mut buf = Vec::new();
+            z.by_name("a.xml").unwrap().read_to_end(&mut buf).unwrap();
+            buf
+        };
+        assert_eq!(
+            read_entry(&out_a),
+            read_entry(&out_b),
+            "两种载荷的条目字节逐字节一致"
+        );
+        assert_eq!(
+            String::from_utf8(read_entry(&out_b)).unwrap(),
+            "<doc><p>甲yi丙丁。</p><p class=\"docforge-tr\">tr</p><p>戊  己。</p></doc><p>尾</p>",
+            "拼接语义不变（内容快照）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

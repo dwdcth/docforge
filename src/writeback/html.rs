@@ -63,7 +63,7 @@ use crate::plugins::html::{decode_entities, find_tag_end, heading_level, strip_c
 use crate::plugins::html::HtmlPlugin;
 use crate::plugins::text::WholeTextParseCapability;
 
-use super::{apply_edits, Edit, escape_xml_text, pair_map, write_bytes_atomic};
+use super::{write_spans_atomic, Edit, escape_xml_text, pair_map};
 
 /// 译文样式类（BilingualInline 插入段与表格格内分隔符统一挂它，便于下游
 /// 识别；epub 同值）。
@@ -108,6 +108,13 @@ pub fn writeback_html(
     // D. 块 × 单元按序配对（同一过滤口径）+ 一致性守卫，逐策略产编辑
     let page = &doc.pages[0];
     let mut edits: Vec<Edit> = Vec::new();
+    // BOM 补回 = 0 号位零长插入（U+FEFF 的 UTF-8 编码 = EF BB BF，与旧的
+    // 字节前缀逐字节一致）。必须**最先入队**——直写与 apply_edits 同为
+    //「稳定排序 + 重叠守卫」，后到的 0 号位编辑（无标签件的全文 Replace）
+    // 会被先行者卡 cursor 丢弃。
+    if bom {
+        edits.push(Edit::Insert(0, "\u{FEFF}".to_string()));
+    }
     let mut matched: Vec<String> = Vec::new();
     let mut cursor = 0usize;
     for (b_idx, b) in page.blocks.iter().enumerate() {
@@ -246,19 +253,11 @@ pub fn writeback_html(
         edits.push(Edit::Insert(pos, appendix));
     }
 
-    // E. 改写并写回（无命中 = 原文原样；BOM 补回）——原子落盘：同目录
-    // 临时件 + rename，崩溃 / ENOSPC 不在目标路径留半残文件
-    let out_text = if edits.is_empty() {
-        text
-    } else {
-        apply_edits(&text, edits)
-    };
-    let mut out_bytes = Vec::with_capacity(out_text.len() + 3);
-    if bom {
-        out_bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-    }
-    out_bytes.extend_from_slice(out_text.as_bytes());
-    write_bytes_atomic(out, &out_bytes)?;
+    // E. 直写落盘（无命中 = 原文原样；BOM 补回 = 0 号位插入）——原字节
+    // 切片 + 编辑替换交替直写同目录临时件 + rename（排序/重叠守卫与
+    // apply_edits 同语义，构造性等同，成品不再整串驻留），崩溃 / ENOSPC
+    // 不在目标路径留半残文件
+    write_spans_atomic(out, &text, edits)?;
     Ok(report)
 }
 
@@ -1182,6 +1181,45 @@ mod tests {
         assert!(out.contains("<p>First paragraph.</p>"), "段落译文进附录");
         assert!(!out.contains("Cell A"), "格译文不落盘");
         assert!(!out.contains("bogus"), "未匹配 id 不落盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 直写路径字节等价（金测）：BOM 补回（0 号位插入）+ 无标签件的全文
+    /// 文本替换——Replace 与 BOM 插入同在 0 号位，直写的稳定排序下 BOM
+    /// 先入队先应用、互不卡位。产物与旧构造（BOM 字节前缀 +
+    /// `apply_edits(原文, 同序编辑)`）逐字节一致。
+    #[test]
+    fn spans_direct_write_matches_apply_edits_bytes() {
+        let dir = case_dir("spans-direct");
+        let plain = "甲乙句子 丙丁句子";
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(plain.as_bytes());
+        let in_path = dir.join("in.html");
+        std::fs::write(&in_path, &input).unwrap();
+
+        let out_path = dir.join("out.html");
+        write(
+            &in_path,
+            &out_path,
+            &[("p0-b0", "Normalized.")],
+            BiStrategy::TranslationOnly,
+        );
+
+        // 无标签件：解析与扫描同归一化成一段，文本 span = 剥 BOM 全文
+        //（0 号位起）→ 旧构造 = BOM 前缀 + apply_edits(plain, [(0, len, 译)])
+        let expected = format!(
+            "\u{FEFF}{}",
+            crate::writeback::apply_edits(
+                plain,
+                vec![Edit::Replace(0, plain.len(), "Normalized.".to_string())]
+            )
+        );
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            expected.as_bytes(),
+            "直写产物与旧整串拼接构造逐字节一致"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

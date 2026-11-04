@@ -295,6 +295,7 @@ fn extend_rids(rids: &mut Vec<String>, more: Vec<String>) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 测试包装（β 割接保留），生产路径走 parse_with_spans
 fn docx_raw_text(
     xml: &str,
     numbering: &Numbering,
@@ -411,7 +412,9 @@ struct ParaSpans {
 /// 一个「可翻译段落位」的字节级槽位（与回写侧 `ParaSlot` 消费面同构）。
 #[derive(Debug, Clone)]
 pub(crate) struct DocxParaSlot {
-    /// `<w:p` 起符字节偏移。
+    /// `<w:p` 起符字节偏移。当前回写消费 `end`/`ppr`/`text_spans`；`start`
+    /// 为未来嵌套表写入/段落级重排预留（β 设计的超集字段）。
+    #[allow(dead_code)]
     pub(crate) start: usize,
     /// `</w:p>` 之后的字节偏移（BilingualInline 段落插位）。
     pub(crate) end: usize,
@@ -426,9 +429,11 @@ pub(crate) struct DocxParaSlot {
 /// 一个「表格格位」的字节级槽位（与回写侧 `CellSlot` 消费面同构 + 格自身 span）。
 #[derive(Debug, Clone)]
 pub(crate) struct DocxCellSlot {
-    /// `<w:tc` 起符字节偏移。
+    /// `<w:tc` 起符字节偏移（β 设计的超集字段，预留未来消费点）。
+    #[allow(dead_code)]
     pub(crate) start: usize,
-    /// `</w:tc>` 之后的字节偏移。
+    /// `</w:tc>` 之后的字节偏移（同上预留）。
+    #[allow(dead_code)]
     pub(crate) end: usize,
     /// 格文本——解析侧 `extract_table_rows` 单格累积同口径：直接子级 `w:p`
     /// 的非空段（trim）按文档序 join `\n`，嵌套表展平串同位并入；整体 trim。
@@ -998,6 +1003,9 @@ fn heading_level_from_style(id: &str) -> Option<u8> {
     Some(n.clamp(1, 9))
 }
 
+/// `extract_table_rows` 的返回形态（clippy type_complexity 别名）。
+type TableRowsWithSlots = (Vec<Vec<String>>, Vec<String>, Vec<DocxCellSlot>);
+
 /// 提取 `<w:tbl>` 的行列结构，处理嵌套表；顺带记录本表**直接格**的候选格
 /// 槽位（trim 非空 `w:tc`，文档序——嵌套表的格由递归消费、就地丢弃，其段落
 /// 已按解析侧口径展平进所在格文本）。
@@ -1005,7 +1013,7 @@ fn heading_level_from_style(id: &str) -> Option<u8> {
 fn extract_table_rows<R: std::io::BufRead>(
     reader: &mut Reader<R>,
     styles: &HashMap<String, u8>,
-) -> Result<(Vec<Vec<String>>, Vec<String>, Vec<DocxCellSlot>)> {
+) -> Result<TableRowsWithSlots> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
     let mut current_cell = String::new();

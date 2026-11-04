@@ -71,7 +71,16 @@ use crate::model::{Block, BlockKind};
 use crate::plugin::{FormatPlugin, ParseCapability, RawDoc};
 
 use super::html::{scan_html_blocks, HtmlSlot, TR_CLASS};
-use super::{apply_edits, Edit, escape_xml_text, open_zip, pair_map, rewrite_zip, WritebackReport};
+use super::{
+    Edit,
+    EntryPayload,
+    escape_xml_text,
+    open_zip,
+    pair_map,
+    rewrite_zip,
+    rewrite_zip_added,
+    WritebackReport,
+};
 
 /// epub 双语回写：见模块级文档。`pairs` 的 id 与
 /// [`crate::emit::to_translation_units`] 同口径（`p{页}-b{块序}`，页名取
@@ -88,10 +97,11 @@ pub fn writeback_epub(
     let mut plan = plan_epub_edits(in_path, pairs, strategy)?;
     let mut report = std::mem::take(&mut plan.report);
 
-    // F. 改写并重打包（非 UTF-8 条目不改写，防编码声明失配）
-    let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
-    let parts_len = plan.parts.len(); // iter_mut 借用期内不再借用 plan.parts
-    for (i, part) in plan.parts.iter_mut().enumerate() {
+    // F. 改写并重打包（非 UTF-8 条目不改写，防编码声明失配）。部件产出 =
+    // 原串 + 编辑序列（Spans 流式直写）——不再拼第二份部件全量 String。
+    let mut replaced: Vec<(String, EntryPayload<'_>)> = Vec::new();
+    let parts_len = plan.parts.len(); // 迭代借用期内不再借用 plan.parts 其余字段
+    for (i, part) in plan.parts.iter().enumerate() {
         if plan.edits[i].is_empty() {
             continue;
         }
@@ -105,8 +115,11 @@ pub fn writeback_epub(
         if strategy == BiStrategy::OriginalPlusAppendix && i + 1 == parts_len {
             report.written += plan.appendix_entries;
         }
-        part.xhtml = apply_edits(&part.xhtml, std::mem::take(&mut plan.edits[i]));
-        replaced.push((part.name.clone(), part.xhtml.clone().into_bytes()));
+        let edits = std::mem::take(&mut plan.edits[i]);
+        replaced.push((
+            part.name.clone(),
+            EntryPayload::Spans { original: &part.xhtml, edits },
+        ));
     }
     rewrite_zip(in_path, out, &replaced)?;
     Ok(report)
@@ -141,13 +154,15 @@ pub fn writeback_epub_alternating(
     // itemref 之后（译文 itemref 原位插入，翻页序即 原/译交替）。
     let points = opf_insert_points(&opf_xml, &plan.parts)?;
 
-    let mut replaced: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut added: Vec<(String, Vec<u8>)> = Vec::new();
+    // 译文部件产出 = 原部件 + 编辑（Spans 流式直写，部件全量的第二份
+    // String 不再驻留）；OPF 产出同款。
+    let mut replaced: Vec<(String, EntryPayload<'_>)> = Vec::new();
+    let mut added: Vec<(String, EntryPayload<'_>)> = Vec::new();
     let mut opf_edits: Vec<Edit> = Vec::new();
     let mut manifest_items = String::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for (i, part) in plan.parts.iter_mut().enumerate() {
+    for (i, part) in plan.parts.iter().enumerate() {
         let edits = std::mem::take(&mut plan.edits[i]);
         if edits.is_empty() {
             continue; // 无命中单元（无实际编辑）→ 不插译文部件（防「相同页翻两遍」）
@@ -168,8 +183,7 @@ pub fn writeback_epub_alternating(
         }
         report.written += plan.part_units[i];
         let tr_id = tr_manifest_id(&part.id, &mut used_ids);
-        let tr_xhtml = apply_edits(&part.xhtml, edits);
-        added.push((tr_name, tr_xhtml.into_bytes()));
+        added.push((tr_name, EntryPayload::Spans { original: &part.xhtml, edits }));
         manifest_items.push_str(&format!(
             "<item id=\"{tr_id}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
             tr_part_href(&part.href),
@@ -185,7 +199,10 @@ pub fn writeback_epub_alternating(
         return rewrite_zip(in_path, out, &[]).map(|_| report);
     }
     opf_edits.push(Edit::Insert(points.manifest, manifest_items));
-    replaced.push((opf_name, apply_edits(&opf_xml, opf_edits).into_bytes()));
+    replaced.push((
+        opf_name,
+        EntryPayload::Spans { original: &opf_xml, edits: opf_edits },
+    ));
     rewrite_zip_added(in_path, out, &replaced, &added)?;
     Ok(report)
 }
@@ -805,109 +822,11 @@ fn opf_insert_points(opf_xml: &str, parts: &[SpinePart]) -> Result<OpfInsertPoin
     })
 }
 
-/// [`rewrite_zip`] 的带新增变体（alternating 专用）：`replaced` 换既有条目
-/// 字节、`added` 追加新条目。共用件的 replaced 机制按名匹配既有条目、天然
-/// 只换不加（包外名字静默丢弃），译文部件是新条目，故在本文件内镜像一份
-/// 加 `added` 参数——mimetype 首条目 + Stored、既有条目原序透传等约定与
-/// zip_util::rewrite_zip 一致；added 追加在末尾（EPUB 不约束条目物理序）。
-/// 未被替换命中的条目走 raw_copy_file 压缩流直拷（不解压不重压）；输出经
-/// 同目录临时文件落盘后 rename（原子替换，见 [`super::temp_sibling`]）。
-fn rewrite_zip_added(
-    in_path: &Path,
-    out_path: &Path,
-    replaced: &[(String, Vec<u8>)],
-    added: &[(String, Vec<u8>)],
-) -> Result<()> {
-    use std::io::{Read as _, Write as _};
-
-    let mut zip = open_zip(in_path)?;
-
-    // 预读条目名（目录条目照旧丢弃）；mimetype 的字节顺手读出（20 字节级，
-    // 强制 Stored 重写），其余条目不预读数据——未命中替换的稍后 raw copy
-    let mut entries: Vec<(usize, String)> = Vec::new();
-    let mut mimetype_data: Option<Vec<u8>> = None;
-    for i in 0..zip.len() {
-        let mut f = zip
-            .by_index(i)
-            .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {i} 失败: {e}")))?;
-        if f.is_dir() {
-            continue;
-        }
-        let name = f
-            .name()
-            .map_err(|e| DocError::corrupt(format!("ZIP 条目 {i} 名字损坏: {e}")))?
-            .into_owned();
-        if name == "mimetype" {
-            let mut data = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 读取 {name} 失败: {e}")))?;
-            mimetype_data = Some(data);
-        }
-        entries.push((i, name));
-    }
-
-    let tmp = super::temp_sibling(out_path);
-    let out_file = std::fs::File::create(&tmp).map_err(|e| {
-        DocError::corrupt(format!("cannot create {}: {e}", tmp.display()))
-    })?;
-    let mut zw = zip::ZipWriter::new(out_file);
-    // 写入段收进闭包：任一条目写失败直接返回 Err，外层统一删临时件
-    //（闭包内 by_index 可变借用 zip，需 FnMut 可变绑定）
-    let mut write = |zw: &mut zip::ZipWriter<std::fs::File>| -> Result<()> {
-        let mut wrote_mimetype = false;
-        // mimetype 必须是首条目且 Stored（EPUB OCF 约定）
-        if let Some(data) = &mimetype_data {
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zw.start_file("mimetype", opts)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-            zw.write_all(data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 mimetype 失败: {e}")))?;
-            wrote_mimetype = true;
-        }
-        for (idx, name) in &entries {
-            if wrote_mimetype && name == "mimetype" {
-                continue;
-            }
-            if let Some((_, data)) = replaced.iter().rev().find(|(n, _)| n == name) {
-                // 命中替换：新字节照旧走 start_file（重压缩）
-                let opts = zip::write::SimpleFileOptions::default();
-                zw.start_file(name.as_str(), opts)
-                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-                zw.write_all(data)
-                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-            } else {
-                // 未触碰条目：压缩流直拷（不解压不重压）
-                let f = zip
-                    .by_index(*idx)
-                    .map_err(|e| DocError::corrupt(format!("ZIP 读取条目 {idx} 失败: {e}")))?;
-                zw.raw_copy_file(f)
-                    .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-            }
-        }
-        for (name, data) in added {
-            let opts = zip::write::SimpleFileOptions::default();
-            zw.start_file(name.as_str(), opts)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-            zw.write_all(data)
-                .map_err(|e| DocError::corrupt(format!("ZIP 写 {name} 失败: {e}")))?;
-        }
-        Ok(())
-    };
-    match write(&mut zw) {
-        Ok(()) => match zw.finish() {
-            Ok(_) => super::commit_temp(&tmp, out_path),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(DocError::corrupt(format!("ZIP 收尾失败: {e}")))
-            }
-        },
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
+// [`rewrite_zip`] 的带新增变体已上收 writeback::zip_util（`rewrite_zip_added`）：
+// 本文件原先镜像一份是因共用件不支持 `added`，上收后 alternating 直接
+// `use super::rewrite_zip_added`（mimetype 首条目 + Stored、既有条目原序
+// 透传、added 追加在末尾、raw copy 直拷、Spans 载荷切片交替直写等约定
+// 全部只有一份实现）。
 
 // ---------------------------------------------------------------------------
 // XHTML 候选位扫描：已抽到 writeback::html 共用（本文件逐 spine 文档调用，

@@ -54,7 +54,7 @@ use crate::plugins::chapter::{split_chapters_with, ChapterRules, Subheading};
 use crate::plugins::text::{TextParseCapability, TextPlugin};
 use crate::plugin::{FormatPlugin, ParseCapability};
 
-use super::{pair_map, write_bytes_atomic};
+use super::{write_spans_atomic, Edit, pair_map};
 
 /// 附录分隔标记（OriginalPlusAppendix 文尾行）。
 const APPENDIX_MARK: &str = "【译文】";
@@ -140,32 +140,35 @@ pub fn writeback_txt(
         report.written += 1;
     }
 
-    // E. 按策略重组（Appendix 原文原样 + 文尾附录；Inline/Only 行级重组）
-    let out_text = match strategy {
+    // E. 按策略产编辑（Appendix = 原文原样 + 文尾零长插入；Inline/Only =
+    // 行级重组直译为 span 编辑）；BOM 补回 = 0 号位零长插入（U+FEFF 的
+    // UTF-8 = EF BB BF，与旧的字节前缀逐字节一致），必须**最先入队**——
+    // 直写与 apply_edits 同为「稳定排序 + 重叠守卫」，后到的 0 号位编辑
+    //（Only 首块的 Replace(0,…)）会被先行者卡 cursor 丢弃。
+    let mut edits: Vec<Edit> = Vec::new();
+    if bom {
+        edits.push(Edit::Insert(0, "\u{FEFF}".to_string()));
+    }
+    match strategy {
         BiStrategy::OriginalPlusAppendix => {
-            if matched.is_empty() {
-                text
-            } else {
-                let mut s = text;
-                s.push_str("\n\n");
-                s.push_str(APPENDIX_MARK);
-                s.push_str("\n\n");
+            if !matched.is_empty() {
+                // 文尾追加 = text.len() 处零长插入（拼好的尾部串直译为编辑）
+                let mut tail = String::from("\n\n");
+                tail.push_str(APPENDIX_MARK);
+                tail.push_str("\n\n");
                 let trs: Vec<&str> = matched.iter().map(|(_, t)| t.as_str()).collect();
-                s.push_str(&trs.join("\n\n"));
-                s
+                tail.push_str(&trs.join("\n\n"));
+                edits.push(Edit::Insert(text.len(), tail));
             }
         }
-        _ => rebuild(&text, &spans, &slots, &matched, strategy),
-    };
-
-    // F. 写出（UTF-8；BOM 补回）——原子落盘：同目录临时件 + rename，
-    // 崩溃 / ENOSPC 不在目标路径留半残文件
-    let mut out_bytes = Vec::with_capacity(out_text.len() + 3);
-    if bom {
-        out_bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        _ => rebuild_edits(&spans, &slots, &matched, strategy, &mut edits),
     }
-    out_bytes.extend_from_slice(out_text.as_bytes());
-    write_bytes_atomic(out, &out_bytes)?;
+
+    // F. 直写落盘（UTF-8）——原字节切片 + 编辑替换交替直写同目录临时件 +
+    // rename（排序/重叠守卫与 apply_edits 同语义，构造性等同；成品与
+    // out_bytes 副本不再整串驻留——wb-txt 的峰值大头在此消掉），崩溃 /
+    // ENOSPC 不在目标路径留半残文件
+    write_spans_atomic(out, &text, edits)?;
     Ok(report)
 }
 
@@ -290,19 +293,24 @@ fn flush(buf: &mut Vec<(usize, &str)>, slots: &mut Vec<TxtSlot>) {
     }
 }
 
-/// BilingualInline / TranslationOnly 的行级重组：
+/// BilingualInline / TranslationOnly 的行级重组 → span 编辑序列（供
+/// [`super::write_spans_atomic`] 交替直写；排序/重叠守卫交给它——与
+/// apply_edits 同语义，块行区间互不重叠、Inline 插位零长互不干扰）：
 ///
-/// * Inline：块末行后插入 `\n + 译文行`（行间分隔字节原样透传 → 译文紧贴
-///   原段、与下一段的分隔形态保持原样）；
-/// * TranslationOnly：块行区间整体替换为译文单行——区间内部换行丢弃，
-///   区间前后的分隔字节保留（空行结构不变）。
-fn rebuild(
-    text: &str,
+/// * Inline：`末行行号 → 译文`（同一行只会命中一个块——行区间互不重叠），
+///   译文行 = 该行内容终点（原换行字节起点）的 `Insert(pos, "\n" + 译文)`
+///   ——原分隔字节照旧跟在译文之后 → 译文紧贴原段、与下一段的分隔形态
+///   保持原样（与旧逐行拼接逐字节同构）；
+/// * TranslationOnly：块行区间 = `Replace(首行内容起点, 末行内容终点, 译文)`
+///   ——区间内部换行随替换丢弃，区间前后的分隔字节留在原串（空行结构
+///   不变）。
+fn rebuild_edits(
     spans: &[(usize, usize)],
     slots: &[TxtSlot],
     matched: &[(usize, String)],
     strategy: BiStrategy,
-) -> String {
+    edits: &mut Vec<Edit>,
+) {
     // Inline：末行行号 → 译文（同一行只会命中一个块——行区间互不重叠）
     let mut ins_after: BTreeMap<usize, &str> = BTreeMap::new();
     // Only：行区间替换（按起点排序；块区间互不重叠）
@@ -319,40 +327,20 @@ fn rebuild(
             BiStrategy::OriginalPlusAppendix => unreachable!("已在分支前提前返回"),
         }
     }
+    // Inline：译文插在行内容终点（换行字节之前）；BTreeMap 行号升序迭代
+    // 与旧逐行扫描的插入次序一致
+    for (li, tr) in ins_after {
+        edits.push(Edit::Insert(spans[li].1, format!("\n{tr}")));
+    }
+    // Only：区间替换按起点升序入队（write_spans_atomic 内部还会再稳定排序）
     skips.sort_by_key(|(s, _, _)| *s);
-
-    let mut out = String::with_capacity(text.len());
-    let mut skip_ptr = 0usize;
-    for li in 0..spans.len() {
-        let (s, e) = spans[li];
-        // 推进已越过的替换区间（区间互不重叠，逐个消费）
-        while skip_ptr < skips.len() && li >= skips[skip_ptr].1 {
-            skip_ptr += 1;
-        }
-        let active = skip_ptr < skips.len() && li >= skips[skip_ptr].0;
-        // 1. 行间分隔字节（含换行）：仅被替换区间内部（前行与本行同区间）丢弃
-        if li > 0 && !(active && li > skips[skip_ptr].0) {
-            out.push_str(&text[spans[li - 1].1..s]);
-        }
-        // 2. 行内容
-        if active {
-            if li == skips[skip_ptr].1 - 1 {
-                out.push_str(skips[skip_ptr].2); // 区间末行：译文替换整段
-                skip_ptr += 1;
-            }
-            continue;
-        }
-        out.push_str(&text[s..e]);
-        if let Some(tr) = ins_after.get(&li) {
-            out.push('\n');
-            out.push_str(tr);
-        }
+    for (start_line, end_line, tr) in skips {
+        edits.push(Edit::Replace(
+            spans[start_line].0,
+            spans[end_line - 1].1,
+            tr.to_string(),
+        ));
     }
-    // 尾部字节（末行换行符，如有）
-    if let Some(&(_, e)) = spans.last() {
-        out.push_str(&text[e..]);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +767,44 @@ mod tests {
         assert!(out.contains(APPENDIX_MARK));
         assert!(out.contains("The beginning.") && out.contains("The ending."));
         assert!(!out.contains("bogus"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 直写路径字节等价（金测）：BOM 补回（0 号位插入）+ Only 首块替换
+    ///（Replace 同从 0 号位起——直写的稳定排序下 BOM 先入队先应用、互不
+    /// 卡位）+ 区间坍缩单行（区间内换行丢弃、前后空行保留）+ 末行换行
+    /// 透传。期望串 = 旧行级重组（逐行拼接）的构造形态，逐字节对账。
+    #[test]
+    fn spans_direct_write_bytes_exact() {
+        let dir = case_dir("spans-direct");
+        let mut input = vec![0xEF, 0xBB, 0xBF];
+        input.extend_from_slice(
+            "第一章 起\n\n第一段第一行，\n第一段第二行。\n\n尾段完整句子。\n".as_bytes(),
+        );
+        let in_path = dir.join("in.txt");
+        std::fs::write(&in_path, &input).unwrap();
+
+        let out_path = dir.join("out.txt");
+        write(
+            &in_path,
+            &out_path,
+            &[
+                ("p0-b0", "The beginning."),
+                ("p0-b1", "First paragraph in one line."),
+                ("p0-b2", "The ending."),
+            ],
+            BiStrategy::TranslationOnly,
+        );
+
+        // TranslationOnly：第三块整块替换（原文不保留）；块间空行与末行
+        // 换行透传。BOM 与 0 号位 Replace（首块）同点的排序 hazard 见上注。
+        let expected = "\u{FEFF}The beginning.\n\nFirst paragraph in one line.\n\nThe ending.\n";
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            expected.as_bytes(),
+            "直写产物与旧行级重组逐字节一致"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
