@@ -15,8 +15,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-// `DocError`/`Result` 只被 docx/xlsx 共用的 zip 读取辅助用到；只剩 pptx 时会成为未用导入。
-#[cfg(any(feature = "docx", feature = "xlsx"))]
+// `DocError`/`Result` 被 docx/xlsx/pptx 共用的 zip 读取辅助用到（CI 首跑抓过
+#[cfg(any(feature = "docx", feature = "xlsx", feature = "pptx"))]
 use crate::error::{DocError, Result};
 use crate::plugin::{FormatPlugin, RawDoc, RawPage};
 use crate::registry::Registry;
@@ -693,7 +693,7 @@ pub(crate) fn zip_read_bytes(
 }
 
 /// 从 ZIP 中读取字符串条目（找不到返回 None）。
-#[cfg(any(feature = "docx", feature = "xlsx"))]
+#[cfg(any(feature = "docx", feature = "xlsx", feature = "pptx"))]
 /// 打开一个 OOXML 容器的 `ZipArchive`。
 ///
 /// 并行解析时每个工作块要开自己的一份（`ZipArchive` 读条目需要 `&mut`，
