@@ -22,6 +22,12 @@ learned incremental 状态、每小时自动 GC。门禁与日常开发**一律�
   但避免与 mbx restore/GC 叠加竞争）；
 - 一波并行改动接线完成后、跑全量门禁前，可预防性 `mbx cache remove
   <workspace>` 一次——成本仅本 crate 重编，换取门禁从干净一致的学习状态出发。
+- **门禁组合面**：常规固定组合（default / docx,epub,fb2,html,odt,xlsx /
+  --all-features / json）之外，**定期跑单 feature 扫描**
+  （`for f in <全部 feature>; do cargo test --no-default-features --features $f; done`）
+  ——历史审计实证两类漏网：cli_convert 曾因 json 单开缺文本族红（固定组合
+  恒含 default 文本族，三轮门禁没抓到）；office 门控 bug（xlsx 单开编译不进
+  解析栈）同属单开才暴露的类别。
 
 ## 工作流
 

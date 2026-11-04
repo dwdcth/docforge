@@ -160,10 +160,12 @@ name = "docforge-cli"
 path = "src/bin/docforge-cli.rs"
 required-features = ["json"]
 
+# cli 用例的 fixture 是 .md：json 单开（无文本族）时 CLI 无法解析 md——
+# 门控加上 md，该组合下测试整组跳过而不是红（历史审计发现的门控错配）
 [[test]]
 name = "cli_convert"
 path = "tests/cli_convert.rs"
-required-features = ["json"]
+required-features = ["json", "md"]
 
 # 解析吞吐/内存基准（harness=false：自带 main，不走 libtest；
 # 跑法与数字见 BENCHMARK.md）
