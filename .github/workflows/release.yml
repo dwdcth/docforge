@@ -66,21 +66,19 @@ jobs:
             smoke: true
 
           - target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.31
             os: ubuntu-24.04
             archive: tar.gz
             bin_name: docforge-cli
-            apt: gcc-aarch64-linux-gnu
-            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
-            linker: aarch64-linux-gnu-gcc
+            zigbuild: true
             smoke: false
 
           - target: loongarch64-unknown-linux-gnu
+            zig_target: loongarch64-unknown-linux-gnu.2.36
             os: ubuntu-24.04
             archive: tar.gz
             bin_name: docforge-cli
-            apt: gcc-loongarch64-linux-gnu
-            linker_env: CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER
-            linker: loongarch64-linux-gnu-gcc
+            zigbuild: true
             smoke: false
 
     steps:
@@ -97,19 +95,36 @@ jobs:
         with:
           key: cli-${{ matrix.target }}
 
-      - name: Install cross-compile linker (Linux)
+      - name: Install cross-compile linker (Linux apt)
         if: matrix.apt != ''
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+          sudo apt-get install -y ${{ matrix.apt }}
 
       - name: Export cross linker env
         if: matrix.linker_env != ''
         shell: bash
         run: echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
-      - name: Build docforge-cli (all formats via --features cli)
+      - name: Set up Zig (for Linux cross-compile)
+        if: matrix.zigbuild == true
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build docforge-cli (cargo build)
+        if: matrix.zigbuild != true
         run: cargo build --release --features cli --bin docforge-cli --target ${{ matrix.target }}
+
+      - name: Build docforge-cli (cargo zigbuild)
+        if: matrix.zigbuild == true
+        run: cargo zigbuild --release --features cli --bin docforge-cli --target ${{ matrix.zig_target }}
 
       - name: Smoke test native binary
         if: matrix.smoke == true
