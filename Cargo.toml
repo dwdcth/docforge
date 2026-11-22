@@ -35,6 +35,27 @@ lang-detect = ["dep:whatlang"]
 pdf = ["dep:pdf-inspector", "dep:image", "ocr"]
 # OCR 引擎抽象（trait + 类型）
 ocr = ["dep:image"]
+# 纯 Rust OCR 模型自动下载（IP 归属地探测 + 国内镜像加速 + SHA-256 校验，零 C 依赖）
+ocr-download = ["ocr", "dep:ureq", "dep:rustls", "dep:rustls-rustcrypto", "dep:sha2"]
+# 纯 Rust PP-OCRv6 引擎（qppocr 手写 AVX2/NEON/scalar 内核，直读官方 ONNX，零 C 依赖）
+ocr-ppocr = ["ocr", "ocr-download", "dep:qppocr"]
+# 纯 Rust Indra OCR 引擎（fusor-ai 算子 + 吸收 MIT indra-ocr 流水线，支持版面/纠偏/公式转 LaTeX，零 C 依赖）
+ocr-indra = [
+    "ocr",
+    "ocr-download",
+    "json",
+    "dep:fusor-ai-team",
+    "dep:fusor-ai-kernels",
+    "dep:fusor-ai-media",
+    "dep:fusor-ai-blocks",
+    "dep:fusor-ai-bundle",
+    "dep:fusor-ai-compile",
+    "dep:blake3",
+    "dep:regex",
+    "dep:unicode-bidi",
+    "dep:unicode-normalization",
+    "dep:unicode-properties",
+]
 # DOCX（docparser-office 吸收：zip + quick-xml 流式）
 docx = ["dep:zip", "dep:quick-xml", "dep:md-5", "dep:log"]
 # EPUB（docparser-epub 吸收：spine/OPF + HTML 块化，依赖 html 插件）
@@ -67,13 +88,14 @@ ppt = ["dep:cfb", "dep:encoding_rs", "dep:flate2", "dep:log"]
 xls = ["dep:cfb", "dep:encoding_rs", "dep:flate2", "dep:log"]
 xlsb = ["dep:zip", "dep:encoding_rs", "dep:log"]
 legacy-office = ["doc", "ppt", "xls", "xlsb"]
-# CLI 全格式能力包（纯 Rust 零 C 编译依赖，专注全格式转换 → GFM / Google OKF v0.3）
+# CLI 全格式能力包（纯 Rust 零 C 编译依赖，专注全格式转换 → GFM / Google OKF v0.3 + 双轻量化纯 Rust OCR）
 cli = [
     "md", "csv", "html", "rtf",
     "encoding", "lang-detect",
     "pdf", "docx", "xlsx", "pptx", "legacy-office", "odf",
     "epub", "fb2", "mobi", "chm", "cbz", "djvu",
     "archive", "image-files",
+    "ocr-ppocr", "ocr-indra",
 ]
 
 [dependencies.zip]
@@ -170,6 +192,81 @@ optional = true
 
 [dependencies.flate2]
 version = "1"
+optional = true
+
+[dependencies.ureq]
+version = "3"
+default-features = false
+features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"]
+optional = true
+
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["std", "tls12"]
+optional = true
+
+[dependencies.rustls-rustcrypto]
+version = "0.1.0-pre.0"
+optional = true
+
+[dependencies.sha2]
+version = "0.10"
+optional = true
+
+[dependencies.qppocr]
+version = "0.5"
+default-features = false
+features = ["std", "parallel"]
+optional = true
+
+[dependencies.fusor-ai-team]
+version = "0.1.5"
+features = ["threads"]
+optional = true
+
+[dependencies.fusor-ai-kernels]
+version = "0.1.5"
+optional = true
+
+[dependencies.fusor-ai-media]
+version = "0.1.5"
+optional = true
+
+[dependencies.fusor-ai-blocks]
+version = "0.1.5"
+optional = true
+
+[dependencies.fusor-ai-bundle]
+version = "0.1.5"
+optional = true
+
+[dependencies.fusor-ai-compile]
+version = "0.1.5"
+optional = true
+
+[dependencies.blake3]
+version = "1.8"
+default-features = false
+features = ["std", "pure"]
+optional = true
+
+[dependencies.regex]
+version = "1"
+optional = true
+
+[dependencies.unicode-bidi]
+version = "0.3"
+optional = true
+
+[dependencies.unicode-normalization]
+version = "0.1"
+optional = true
+
+[dependencies.unicode-properties]
+version = "0.1"
+default-features = false
+features = ["general-category"]
 optional = true
 
 [[example]]

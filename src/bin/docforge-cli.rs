@@ -1,4 +1,4 @@
-//! docforge-cli：全格式文档转换命令行（专注输出 GFM 或 Google OKF v0.3）。
+//! docforge-cli：全格式文档转换命令行（专注输出 GFM 或 Google OKF v0.3，内置双轻量化纯 Rust OCR）。
 //!
 //! # 用法
 //!
@@ -6,33 +6,38 @@
 //! docforge-cli <输入>... [选项]
 //! ```
 //!
-//! 输入为文件或目录（可多个混用）：目录递归收集支持格式的文件
-//!（扩展名白名单 `SUPPORTED_EXTENSIONS`；隐藏项（`.` 开头）与 `target/`、
-//! `node_modules/` 跳过；其余非隐藏文件按「不支持扩展名」计为失败并在
-//! stderr 报告，不静默丢文件）。显式给出的单个文件不受白名单过滤
-//!（router 按内容嗅探并兜底按纯文本解析）。
-//!
 //! 选项：
 //!
 //! ```text
-//!   -f, --format gfm|okf   输出格式（默认 gfm）
-//!       gfm                GitHub-Flavored Markdown（严格表格转义/动态代码围栏/LaTeX 公式/脚注）
-//!       okf                Google Open Knowledge Format v0.3（YAML 1.2 frontmatter + GFM +
-//!                          assets/ 去重图片资产 + 目录批量递归 index.md Knowledge Bundle）
-//!   --okf-type <类型>      OKF frontmatter 的 type 字段（默认 Document）
-//!   --okf-title <标题>     OKF 单文档标题或 Bundle 根标题
-//!   -o, --out <文件>       输出到文件（仅单输入；默认 stdout）
-//!   --out-dir <目录>       批量输出目录（多输入/目录时必需；单文件走 OKF 时亦会生成根目录 index.md）
-//!   --list-formats         打印支持的输入格式后退出
-//!   -h, --help             显示帮助信息
-//!   -V, --version          显示版本号
+//!   -f, --format gfm|okf         输出格式（默认 gfm）
+//!   --okf-type <类型>            OKF frontmatter 的 type 字段（默认 Document）
+//!   --okf-title <标题>           OKF 单文档标题或 Bundle 根标题
+//!   --ocr <模式>                 OCR 引擎选择（默认 ppocr，懒加载，纯数字文档零开销）：
+//!                                  ppocr        PP-OCRv6 Small（纯 Rust qppocr，默认）
+//!                                  ppocr-tiny   PP-OCRv6 Tiny（~6.3 MB 极轻）
+//!                                  ppocr-medium PP-OCRv6 Medium（高精度）
+//!                                  indra        Indra OCR（纯 Rust fusor-ai，支持版面/纠偏/数学公式 LaTeX）
+//!                                  off          关闭 OCR
+//!   --ocr-model-dir <目录>       指定离线/自定义 OCR 模型目录（默认平台缓存目录，首次按需自动下载）
+//!   --ocr-mirror auto|cn|global  模型下载镜像策略（默认 auto：探测本机 IP 中国大陆/境外自动选源）
+//!   --ocr-images                 同时对 DOCX/EPUB/CHM/FB2 内的嵌图执行 OCR
+//!   --ocr-no-math                关闭 Indra OCR 的数学公式 → LaTeX 识别（提速）
+//!   -o, --out <文件>             单文件输出路径（默认 stdout）
+//!   --out-dir <目录>             批量输出目录（多输入/目录时必需；OKF 模式自动生成 index.md 与 assets/）
+//!   --list-formats               打印支持的输入格式与 OCR 引擎后退出
+//!   -h, --help                   显示帮助信息
+//!   -V, --version                显示版本号
 //! ```
-//!
-//! 退出码：0 = 全部成功；1 = 参数错误或全部失败；2 = 部分失败。
 
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use docforge::ocr::download::MirrorPolicy;
+use docforge::ocr::indra::{IndraConfig, IndraOcrEngine};
+use docforge::ocr::ppocr::{PpOcrConfig, PpOcrEngine, PpOcrTier};
+use docforge::ocr::OcrEngine;
 
 /// 目录递归收集的扩展名白名单（小写、不含点，由 `cli` feature 保证全格式已编译）。
 const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -56,22 +61,49 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrChoice {
+    Off,
+    PpOcr(PpOcrTier),
+    Indra,
+}
+
+impl OcrChoice {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" | "0" => Some(Self::Off),
+            "ppocr" | "ppocr-small" | "ppocrv6" | "auto" | "on" => {
+                Some(Self::PpOcr(PpOcrTier::Small))
+            }
+            "ppocr-tiny" => Some(Self::PpOcr(PpOcrTier::Tiny)),
+            "ppocr-medium" => Some(Self::PpOcr(PpOcrTier::Medium)),
+            "indra" | "indra-ocr" => Some(Self::Indra),
+            _ => None,
+        }
+    }
+}
+
 fn help_text() -> &'static str {
-    "用法：docforge-cli <输入>... [选项]\n\
-\n\
-将任意支持的文档转换为标准 GitHub-Flavored Markdown (GFM) 或 Google Open Knowledge Format (OKF v0.3)。\n\
-\n\
-选项：\n\
-  -f, --format gfm|okf   输出格式（默认 gfm）\n\
-  --okf-type <类型>      OKF frontmatter 的 type 字段（默认 Document）\n\
-  --okf-title <标题>     OKF 单文档标题或 Bundle 根标题\n\
-  -o, --out <文件>       单文件输出路径（默认 stdout）\n\
-  --out-dir <目录>       输出目录（多输入或目录批量时必需；OKF 模式自动生成 index.md 与 assets/）\n\
-  --list-formats         列出支持的所有输入格式\n\
-  -h, --help             显示本帮助\n\
-  -V, --version          显示版本号\n\
-\n\
-退出码：0=全部成功  1=参数错误或全部失败  2=部分失败"
+    concat!(
+        "用法：docforge-cli <输入>... [选项]\n\n",
+        "将任意支持的文档转换为标准 GitHub-Flavored Markdown (GFM) 或 Google Open Knowledge Format (OKF v0.3)。\n",
+        "内置双轻量化纯 Rust OCR（PP-OCRv6 与 Indra OCR），首次遇到扫描件/图片时按 IP 归属地自动选镜像下载模型。\n\n",
+        "选项：\n",
+        "  -f, --format gfm|okf         输出格式（默认 gfm）\n",
+        "  --okf-type <类型>            OKF frontmatter 的 type 字段（默认 Document）\n",
+        "  --okf-title <标题>           OKF 单文档标题或 Bundle 根标题\n",
+        "  --ocr <模式>                 OCR 引擎：ppocr（默认）| ppocr-tiny | ppocr-medium | indra | off\n",
+        "  --ocr-model-dir <目录>       指定离线/自定义模型目录（也可用 DOCFORGE_OCR_MODEL_DIR）\n",
+        "  --ocr-mirror auto|cn|global  下载镜像策略（默认 auto：探测 IP 中国大陆走镜像加速，境外走官方源）\n",
+        "  --ocr-images                 同时对 DOCX/EPUB/CHM/FB2 内嵌图片执行 OCR\n",
+        "  --ocr-no-math                关闭 Indra OCR 的数学公式 → LaTeX 识别\n",
+        "  -o, --out <文件>             单文件输出路径（默认 stdout）\n",
+        "  --out-dir <目录>             输出目录（多输入或目录批量时必需；OKF 模式自动生成 index.md 与 assets/）\n",
+        "  --list-formats               列出支持的所有输入格式与 OCR 引擎\n",
+        "  -h, --help                   显示本帮助\n",
+        "  -V, --version                显示版本号\n\n",
+        "退出码：0=全部成功  1=参数错误或全部失败  2=部分失败"
+    )
 }
 
 fn usage_err() -> ! {
@@ -79,7 +111,6 @@ fn usage_err() -> ! {
     std::process::exit(1);
 }
 
-/// 批量作业：一个待转换文件 + 其在 `--out-dir` 里的相对落点信息。
 struct Job {
     input: PathBuf,
     rel_dir: PathBuf,
@@ -88,7 +119,10 @@ struct Job {
 }
 
 fn print_formats() {
-    println!("docforge-cli {} 支持的输入格式（全格式已启用）：\n", env!("CARGO_PKG_VERSION"));
+    println!(
+        "docforge-cli {} 支持的输入格式与 OCR 引擎（全格式已启用）：\n",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("[文本与标记]");
     println!("  txt                       纯文本（含自动中文编码探测与章节切分）");
     println!("  md markdown               Markdown（GFM + frontmatter）");
@@ -106,22 +140,52 @@ fn print_formats() {
     println!("  xlsb                      Excel 二进制工作簿");
     println!("  odt ods odp               OpenDocument（含 MathML → LaTeX）");
     println!("\n[PDF / 电子书 / 容器 / 图像]");
-    println!("  pdf                       PDF 文字层直提");
+    println!("  pdf                       PDF 页级混合路由（文字层直提 + 扫描页 OCR）");
     println!("  epub                      EPUB 电子书（含内嵌图片资产）");
     println!("  fb2 (+fb2.zip)            FictionBook 电子书");
     println!("  mobi prc azw3             Kindle MOBI7 / KF8 电子书");
     println!("  chm                       Microsoft CHM 帮助文档");
-    println!("  djvu                      DjVu 文字层");
+    println!("  djvu                      DjVu（文字层 + 扫描页 OCR）");
     println!("  cbz                       漫画压缩包");
     println!("  zip rar 7z                压缩包容器（内层文档多页合并）");
-    println!("  png jpg jpeg webp bmp tif tiff  图像文件");
-    println!("\n[输出格式]");
+    println!("  png jpg jpeg webp bmp tif tiff  图像直读 + OCR");
+    println!("\n[内置轻量化纯 Rust OCR 引擎（--ocr）]");
+    println!("  ppocr（默认）             PP-OCRv6 Small（qppocr 纯 Rust 内核，~31 MB 按需下载，Apache-2.0 权重）");
+    println!("  ppocr-tiny / ppocr-medium PP-OCRv6 Tiny（~6.3 MB）/ Medium（~139 MB）");
+    println!("  indra                     Indra OCR（fusor-ai 纯 Rust，纠偏/版面/公式转 LaTeX，~92 MB 按需下载）");
+    println!("  off                       关闭 OCR");
+    println!("\n[输出格式（--format）]");
     println!("  gfm                       GitHub-Flavored Markdown（默认）");
     println!("  okf                       Google Open Knowledge Format v0.3（frontmatter + assets/ + index.md）");
 }
 
-/// 装配全格式引擎：`extract_images` 开启时（OKF 落盘模式）保留内嵌图片字节用于写出 `assets/`。
-fn build_engine(extract_images: bool) -> docforge::DocumentEngine {
+fn make_ocr_engine(
+    choice: OcrChoice,
+    model_dir: Option<PathBuf>,
+    mirror: MirrorPolicy,
+    indra_math: bool,
+) -> Option<Arc<dyn OcrEngine>> {
+    match choice {
+        OcrChoice::Off => None,
+        OcrChoice::PpOcr(tier) => Some(PpOcrEngine::shared(PpOcrConfig {
+            tier,
+            model_dir,
+            mirror,
+        })),
+        OcrChoice::Indra => Some(IndraOcrEngine::shared(IndraConfig {
+            model_dir,
+            mirror,
+            math: indra_math,
+        })),
+    }
+}
+
+/// 装配全格式引擎：`extract_images` 开启时保留内嵌图片字节（用于 OKF 落盘或 `--ocr-images`）；
+/// `ocr_engine` 存在时注册 `ocr-images` 能力并注入 PDF/DjVu（懒加载，纯数字文档零开销）。
+fn build_engine(
+    extract_images: bool,
+    ocr_engine: Option<Arc<dyn OcrEngine>>,
+) -> docforge::DocumentEngine {
     let mut registry = docforge::Registry::new();
     docforge::plugins::text::register_defaults(&mut registry);
 
@@ -137,15 +201,26 @@ fn build_engine(extract_images: bool) -> docforge::DocumentEngine {
     docforge::backends::image_files::register_defaults(&mut registry);
     docforge::backends::fb2::register_with_ocr_images(&mut registry, extract_images);
     docforge::backends::mobi::register_defaults(&mut registry);
+
+    if let Some(ref eng) = ocr_engine {
+        docforge::ocr::images::register(&mut registry, Arc::clone(eng));
+    }
+
     docforge::backends::djvu::register(
         &mut registry,
-        docforge::backends::djvu::DjVuOptions { engine: None },
+        docforge::backends::djvu::DjVuOptions {
+            engine: ocr_engine.clone(),
+        },
     );
     docforge::backends::pdf::register(
         &mut registry,
         docforge::backends::pdf::PdfOptions {
-            mode: docforge::backends::pdf::OcrMode::Off,
-            engine: None,
+            mode: if ocr_engine.is_some() {
+                docforge::backends::pdf::OcrMode::Auto
+            } else {
+                docforge::backends::pdf::OcrMode::Off
+            },
+            engine: ocr_engine,
             ..Default::default()
         },
     );
@@ -153,7 +228,6 @@ fn build_engine(extract_images: bool) -> docforge::DocumentEngine {
     docforge::DocumentEngine::new(registry)
 }
 
-/// OKF 单文件转换：解析 → 生成 OKF Concept（含图片资产）→ 落盘或 stdout。
 fn convert_one_okf(
     engine: &docforge::DocumentEngine,
     input: &Path,
@@ -169,6 +243,11 @@ fn convert_one_okf(
             return None;
         }
     };
+    if let Some(w) = doc.meta.extra.get("warnings") {
+        if !w.trim().is_empty() {
+            eprintln!("{}: 警告：{w}", input.display());
+        }
+    }
     let source_last_modified = std::fs::metadata(input)
         .and_then(|m| m.modified())
         .ok()
@@ -238,7 +317,6 @@ fn convert_one_okf(
     })
 }
 
-/// GFM 单文件转换：解析 → `emit::to_gfm` → 写 `out_path`（None = stdout）。
 fn convert_one_gfm(
     engine: &docforge::DocumentEngine,
     input: &Path,
@@ -251,6 +329,11 @@ fn convert_one_gfm(
             return false;
         }
     };
+    if let Some(w) = doc.meta.extra.get("warnings") {
+        if !w.trim().is_empty() {
+            eprintln!("{}: 警告：{w}", input.display());
+        }
+    }
     let output = docforge::emit::to_gfm(&doc);
     match out_path {
         Some(p) => match std::fs::write(p, &output) {
@@ -268,7 +351,6 @@ fn convert_one_gfm(
     }
 }
 
-/// 计算唯一输出文件名：默认 `stem.md`；同 stem 冲突时拼接原扩展去重，仍冲突加数字后缀。
 fn unique_target(
     claimed: &mut HashSet<String>,
     rel_dir: &Path,
@@ -295,8 +377,6 @@ fn unique_target(
     }
 }
 
-/// 递归收集目录下白名单扩展名的文件。隐藏项与 `target/`、`node_modules/` 跳过；
-/// 目录符号链接不跟随；其余非隐藏文件记入 `pre_failed`（不静默丢文件）。
 fn collect_dir(
     root: &Path,
     dir: &Path,
@@ -368,6 +448,11 @@ fn main() {
     let mut format = "gfm".to_string();
     let mut okf_type = "Document".to_string();
     let mut okf_title: Option<String> = None;
+    let mut ocr_choice = OcrChoice::PpOcr(PpOcrTier::Small);
+    let mut ocr_model_dir: Option<PathBuf> = None;
+    let mut ocr_mirror = MirrorPolicy::Auto;
+    let mut ocr_images = false;
+    let mut ocr_math = true;
     let mut out_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut list_formats = false;
@@ -406,6 +491,46 @@ fn main() {
                         .unwrap_or_else(|| usage_err()),
                 );
             }
+            "--ocr" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| usage_err());
+                ocr_choice = match OcrChoice::parse(&raw) {
+                    Some(c) => c,
+                    None => {
+                        eprintln!(
+                            "未知 --ocr 模式：{raw}（支持 ppocr | ppocr-tiny | ppocr-medium | indra | off）"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--ocr-model-dir" => {
+                i += 1;
+                ocr_model_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| usage_err()),
+                );
+            }
+            "--ocr-mirror" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| usage_err());
+                ocr_mirror = match MirrorPolicy::parse(&raw) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!("未知 --ocr-mirror 策略：{raw}（支持 auto | cn | global）");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--ocr-images" => ocr_images = true,
+            "--ocr-no-math" => ocr_math = false,
             "--out" | "-o" => {
                 i += 1;
                 out_path = Some(
@@ -491,8 +616,9 @@ fn main() {
     }
 
     let is_okf = format == "okf";
-    let extract_images = is_okf && (out_dir.is_some() || out_path.is_some());
-    let engine = build_engine(extract_images);
+    let extract_images = (is_okf && (out_dir.is_some() || out_path.is_some())) || ocr_images;
+    let ocr_engine = make_ocr_engine(ocr_choice, ocr_model_dir, ocr_mirror, ocr_math);
+    let engine = build_engine(extract_images, ocr_engine);
 
     let mut ok = 0usize;
     let mut bad = pre_failed.len();

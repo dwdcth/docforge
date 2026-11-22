@@ -17,6 +17,7 @@ docforge 吸收了下表 crate 的源码（吸收文件头部均有标注）。�
 | ebook-rs | 0.18.0 | MIT | https://static.crates.io/crates/ebook-rs/ebook-rs-0.18.0.crate | PalmDoc LZ77 解压例程 decompress_palmdoc（azw3 增强，src/backends/mobi/kf8.rs，含 256 MiB 输出上界，原样吸收）；md frontmatter 思路（设计参考） | 其 AZW3/KF8 支持经核实不存在（描述夸大）；方向为电子书引擎，非同类 |
 | mobi（KindleUnpack 家族） | 0.4.1（PyPI；上游 kevinhendricks/KindleUnpack） | GPL-3.0 | https://files.pythonhosted.org/packages/7f/fc/efbab42351ebdd594e23f069934bff882f1c15129f61cbff13d1990243b5/mobi-0.4.1.tar.gz | （未吸收代码）KF8 记录语义参考：EXTH 121 boundary、trailing entry 编码、SKEL/FRAG INDX/TAGX、FDST、skeleton/fragment 装配（azw3，src/backends/mobi/kf8.rs 独立实现） | GPL 一票否决吸收（djvu 0.1.0 先例）；仅格式事实参考，代码零复制 |
 | anydoc | 0.2.5 | MIT | https://github.com/firecrawl/anydoc | Wave 1：安全限额（src/limits.rs）、内容嗅探（src/router.rs）、确定性变异测试（tests/robustness.rs）；Wave 2：OMML/MathML 转 LaTeX（src/math/{tex,omml,mathml}.rs）与 docx styles 继承链参考（src/backends/office/docx.rs）；Wave 4：老式二进制 Office 后端（src/backends/legacy_office/，含 doc/ppt/xls/xlsb + numfmt + 内部模型/共享辅助） | 上游为单 crate 无 feature 裁剪，按 MIT 条款按需模块吸收并保留细粒度 feature 与极简依赖面（仅新增纯 Rust `cfb`） |
+| fusor-ai（`models/indra-ocr`） | 0.1.5 | MIT | https://github.com/fusor-rs/fusor-ai | 纯 Rust Indra OCR 推理流水线与 checkpoint 编译器（src/ocr/indra/{engine,compiler.rs}，feature `ocr-indra`） | 仅源码 MIT 吸收；Datalab Indra OCR 模型权重遵循 modified OpenRAIL-M、Baidu PP-OCRv6 权重遵循 Apache-2.0，均不随仓库/二进制分发，由用户在启用 `--ocr` 时按需下载 |
 
 其余依赖（serde 及后续 pdf-inspector / oar-ocr / encoding_rs 等）按各自许可
 正常依赖，随 cargo metadata 自动携带。

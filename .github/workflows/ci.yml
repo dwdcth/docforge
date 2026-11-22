@@ -41,6 +41,7 @@ jobs:
       fail-fast: false
       matrix:
         feature: [md, csv, html, rtf, encoding, json, lang-detect, pdf, ocr,
+                  ocr-download, ocr-ppocr, ocr-indra,
                   docx, xlsx, pptx, doc, ppt, xls, xlsb, legacy-office,
                   epub, fb2, mobi, chm, djvu, cbz,
                   archive, image-files, odt, ods, odp, odf, cli]

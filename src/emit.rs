@@ -217,6 +217,9 @@ pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) ->
         let mut prev_list: Option<bool> = None;
         let assets = page_assets.get(p_idx).map(|v| v.as_slice()).unwrap_or(&[]);
         let mut asset_cursor = 0usize;
+        let mut image_cursor = 0usize;
+        let single_image_page =
+            page.blocks.len() == 1 && page.blocks[0].kind == BlockKind::Image;
 
         for b in page
             .blocks
@@ -283,22 +286,41 @@ pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) ->
                             _ => None,
                         })
                         .unwrap_or("");
+                    let img_ocr = page
+                        .images
+                        .get(image_cursor)
+                        .and_then(|im| im.ocr_text.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    image_cursor += 1;
+                    let ocr_body = if !b.content.trim().is_empty() {
+                        Some(b.content.trim())
+                    } else {
+                        img_ocr
+                    };
+
                     if let Some(asset_path) = assets.get(asset_cursor) {
                         asset_cursor += 1;
                         let label = if alt.is_empty() { "image" } else { alt };
                         let encoded = crate::okf::encode_uri_component(asset_path);
                         let img_md = format!("![{label}]({encoded})");
-                        if b.content.trim().is_empty() {
-                            img_md
-                        } else {
-                            format!("{img_md}\n\n> {}", b.content.trim().replace('\n', "\n> "))
+                        match ocr_body {
+                            None => img_md,
+                            Some(txt) if single_image_page => format!("{img_md}\n\n{txt}"),
+                            Some(txt) => {
+                                format!("{img_md}\n\n> {}", txt.replace('\n', "\n> "))
+                            }
                         }
-                    } else if !alt.is_empty() && !b.content.trim().is_empty() {
-                        format!("[image: {alt}] {}", b.content.trim())
+                    } else if let Some(txt) = ocr_body {
+                        if single_image_page && alt.is_empty() {
+                            txt.to_string()
+                        } else if !alt.is_empty() {
+                            format!("[image: {alt}] {txt}")
+                        } else {
+                            format!("[image] {txt}")
+                        }
                     } else if !alt.is_empty() {
                         format!("[image: {alt}]")
-                    } else if !b.content.trim().is_empty() {
-                        format!("[image] {}", b.content.trim())
                     } else {
                         "[image]".to_string()
                     }

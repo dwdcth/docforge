@@ -69,17 +69,28 @@ println!("{}", okf_concept.markdown);
 
 ## CLI 用法（`docforge-cli`）
 
-`docforge-cli` 默认通过 `cli` feature 开启全部纯 Rust 格式后端（`docx`/`xlsx`/`pptx`/`doc`/`ppt`/`xls`/`xlsb`/`odt`/`ods`/`odp`/`pdf`/`epub`/`fb2`/`mobi`/`azw3`/`chm`/`cbz`/`djvu`/`zip`/`rar`/`7z`/`txt`/`md`/`csv`/`html`/`rtf`/字幕/图像），专注文档格式转换，仅输出 **`gfm`**（默认）或 **`okf`**（Google Open Knowledge Format v0.3）；Agent 技能说明见 [skills/docforge/SKILL.md](skills/docforge/SKILL.md)：
+`docforge-cli` 默认通过 `cli` feature 开启全部纯 Rust 格式后端与**双轻量化纯 Rust OCR 引擎**（PP-OCRv6 `qppocr` + Indra OCR `fusor-ai`，零 C/C++ 编译依赖），专注文档格式转换，仅输出 **`gfm`**（默认）或 **`okf`**（Google Open Knowledge Format v0.3）；Agent 技能说明见 [skills/docforge/SKILL.md](skills/docforge/SKILL.md)：
 
 ```bash
-# 从源码构建全格式 CLI
+# 从源码构建全格式 + 双纯 Rust OCR CLI
 cargo build --release --features cli --bin docforge-cli
 
-# 查看已支持的全部输入格式
+# 查看已支持的全部输入格式与 OCR 引擎
 docforge-cli --list-formats
 
 # 转为标准 GitHub-Flavored Markdown（默认格式，含 OMML/MathML → LaTeX 公式）
 docforge-cli report.docx -o report.md
+
+# 扫描件/图片 OCR：默认使用 PP-OCRv6（自动探测 IP，中国大陆自动走 ModelScope/hf-mirror 镜像加速）
+docforge-cli scan.png -o scan.md
+docforge-cli scan.pdf --ocr ppocr-tiny -o scan.md     # 极轻 ~6.3 MB 模型
+
+# 切换 Indra OCR（自带 ±45° 纠偏、朝向检测、版面阅读顺序与数学公式转 LaTeX）
+docforge-cli paper_scan.png --ocr indra -o paper.md
+
+# 离线指定模型目录或手动指定镜像
+docforge-cli scan.png --ocr ppocr --ocr-model-dir ./my_models
+docforge-cli scan.png --ocr indra --ocr-mirror cn
 
 # 转为 Google Open Knowledge Format (OKF v0.3)：
 # 生成带 YAML 1.2 frontmatter 的文档 + assets/ 去重图片资产 + 根目录 index.md

@@ -101,6 +101,8 @@ fn meta_flags_work() {
     let (code, stdout, stderr) = run_cli(&["--help"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("gfm|okf"), "{stdout}");
+    assert!(stdout.contains("--ocr"), "{stdout}");
+    assert!(stdout.contains("--ocr-mirror"), "{stdout}");
 
     let (code, stdout, stderr) = run_cli(&["--version"]);
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -108,9 +110,46 @@ fn meta_flags_work() {
 
     let (code, stdout, stderr) = run_cli(&["--list-formats"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    for expected in ["docx", "doc", "ppt", "xls", "xlsb", "odt", "pdf", "epub", "gfm", "okf"] {
+    for expected in [
+        "docx", "doc", "ppt", "xls", "xlsb", "odt", "pdf", "epub", "ppocr", "indra", "gfm", "okf",
+    ] {
         assert!(stdout.contains(expected), "缺少 {expected}: {stdout}");
     }
+}
+
+/// 非法 --ocr / --ocr-mirror 值返回退出码 1；数字文档搭配 --ocr ppocr/indra 不触发模型下载。
+#[test]
+fn ocr_flags_validation_and_lazy_digital_docs() {
+    let dir = tmp_dir("ocr_flags");
+    let file = dir.join("note.md");
+    std::fs::write(&file, "# 标题\n\n纯数字正文。\n").unwrap();
+    let path = file.to_str().unwrap().to_string();
+
+    let (code, _stdout, stderr) = run_cli(&[&path, "--ocr", "unknown-engine"]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("ppocr"), "{stderr}");
+
+    let (code, _stdout, stderr) = run_cli(&[&path, "--ocr-mirror", "mars"]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("auto | cn | global"), "{stderr}");
+
+    // 懒加载验证：纯数字文档即便显式指定 --ocr ppocr / --ocr indra + 不存在的离线目录也零开销成功
+    let fake_models = dir.join("nonexistent_models");
+    for mode in ["ppocr", "ppocr-tiny", "indra", "off"] {
+        let (code, stdout, stderr) = run_cli(&[
+            &path,
+            "--ocr",
+            mode,
+            "--ocr-model-dir",
+            fake_models.to_str().unwrap(),
+            "--ocr-mirror",
+            "cn",
+        ]);
+        assert_eq!(code, 0, "mode={mode} stderr: {stderr}");
+        assert!(stdout.contains("纯数字正文"), "mode={mode} stdout: {stdout}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// --format okf 目录批量：生成标准 OKF v0.3 Bundle（根 index.md 含 okf_version，
@@ -174,6 +213,8 @@ fn okf_extracts_image_assets_to_disk() {
         img.to_str().unwrap(),
         "--format",
         "okf",
+        "--ocr",
+        "off",
         "--out-dir",
         out.to_str().unwrap(),
     ]);

@@ -13,6 +13,15 @@
 
 pub mod images;
 
+#[cfg(feature = "ocr-download")]
+pub mod download;
+
+#[cfg(feature = "ocr-ppocr")]
+pub mod ppocr;
+
+#[cfg(feature = "ocr-indra")]
+pub mod indra;
+
 #[cfg(feature = "ocr-oar")]
 pub mod oar;
 

@@ -26,9 +26,28 @@ docforge-cli ./docs --format okf --okf-type Reference --okf-title "Project Docs"
 # Batch-convert a directory into GFM files preserving directory layout
 docforge-cli ./docs --format gfm --out-dir ./out_md
 
-# Inspect all supported input formats
+# OCR an image or scanned PDF (defaults to pure-Rust PP-OCRv6 with auto China/Global mirror)
+docforge-cli scan.png -o scan.md
+docforge-cli paper_scan.png --ocr indra -o paper.md        # Indra OCR (layout + math → LaTeX)
+docforge-cli scan.png --ocr ppocr-tiny --ocr-mirror cn     # Tiny ~6.3MB model via China mirror
+docforge-cli scan.png --ocr ppocr --ocr-model-dir ./models # Offline local model directory
+docforge-cli report.docx --ocr off -o report.md            # Explicitly disable OCR
+
+# Inspect all supported input formats and OCR engines
 docforge-cli --list-formats
 ```
+
+## OCR Engines & Model Management
+
+`docforge-cli` bundles **two 100% pure-Rust CPU OCR engines** (lazy-loaded: zero overhead and zero network calls for digital documents):
+
+- **`--ocr ppocr` (default)**: **PP-OCRv6 Small** via `qppocr` (~31 MB, Apache-2.0 weights; also `ppocr-tiny` ~6.3 MB and `ppocr-medium` ~139 MB). Strongest for Chinese/English dense text.
+- **`--ocr indra`**: **Indra OCR** via `fusor-ai` (~92 MB checkpoint compiled locally on first run, modified OpenRAIL-M weights). Adds auto deskew (±45°), orientation detection, reading order, and **math formula → LaTeX** recognition. Pass `--ocr-no-math` to skip math recognition.
+- **`--ocr off`**: Disables OCR completely.
+- **Auto mirror acceleration (`--ocr-mirror auto|cn|global`)**: On first download, probes IP geolocation; Mainland China automatically accelerates via ModelScope / `hf-mirror.com`, overseas fetches directly from HuggingFace, with SHA-256 verification and local caching.
+- **Offline models (`--ocr-model-dir <dir>` or `DOCFORGE_OCR_MODEL_DIR`)**: Point to a local model folder to run 100% offline.
+- **Embedded images (`--ocr-images`)**: Additionally run OCR on images embedded inside DOCX/EPUB/CHM/FB2.
+- **Scanned PDFs**: Text-layer PDF pages extract directly with zero external tools; scanned PDF pages require `pdftoppm` (`poppler-utils`) in `PATH` to rasterize before OCR.
 
 ## Supported Input Formats
 
