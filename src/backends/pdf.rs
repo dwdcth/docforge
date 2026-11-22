@@ -3,7 +3,7 @@
 // 页级路由流程**参考 rumi-ocr `ocr/src/pdf_route.rs` 的设计重新实现**
 //（docparse-plan §12：rumi 为 MulanPSL-2.0，仅设计参考，不复制源码）：
 // pdf-inspector 逐页分类 → 文字层页直提（TextLayer 块）→ 扫描页按连续区间
-// pdftoppm 渲染 + OcrEngine 识别（Ocr 块带 confidence）。
+// hayro 纯 Rust 进程内光栅化 + OcrEngine 识别（Ocr 块带 confidence，零外部工具）。
 //
 // # 坐标系契约
 //
@@ -65,8 +65,7 @@
 // 已产出页保留，余页空占位（页号对齐），warnings 记中止页（Ok 语义）。
 
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
 
 use pdf_inspector::extractor::{group_into_lines_preserving_all_text, ItemType};
@@ -827,92 +826,85 @@ fn merge_by_reading_order(mut a: Vec<RawTextItem>, mut b: Vec<RawTextItem>) -> V
     a
 }
 
-/// `pdftoppm -png -r {dpi} -f {first} -l {last}` 渲染闭区间页（1 起始）。
+/// 纯 Rust `hayro` 渲染闭区间页（1 起始），零 `pdftoppm` / `poppler-utils` 外部依赖。
 ///
-/// 系统依赖 poppler-utils；临时目录用后即删。返回页序与区间一致。
+/// 白底合成（`bg_color = WHITE`）直接产出 RGBA8，并对单边像素设置 16384 上界防畸形大页 OOM。
 fn render_pages(
     path: &Path,
     first: u32,
     last: u32,
     dpi: u32,
 ) -> Result<Vec<image::RgbaImage>> {
-    let dir = std::env::temp_dir().join(format!(
-        "docforge-pdf-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).map_err(io_to_docerror)?;
-    let result = render_via_pdftoppm(path, first, last, dpi, &dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
-}
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
-fn render_via_pdftoppm(
-    path: &Path,
-    first: u32,
-    last: u32,
-    dpi: u32,
-    dir: &Path,
-) -> Result<Vec<image::RgbaImage>> {
-    let prefix = dir.join("page");
-    let out = Command::new("pdftoppm")
-        .arg("-png")
-        .arg("-r")
-        .arg(dpi.to_string())
-        .arg("-f")
-        .arg(first.to_string())
-        .arg("-l")
-        .arg(last.to_string())
-        .arg(path)
-        .arg(&prefix)
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => DocError {
-                code: ErrorCode::Unknown,
-                message: "找不到 pdftoppm（需安装 poppler-utils）".to_string(),
-                attempts: vec![],
-            },
-            _ => io_to_docerror(e),
-        })?;
-    if !out.status.success() {
+    const MAX_RENDER_SIDE: f32 = 16384.0;
+
+    let bytes = std::fs::read(path).map_err(io_to_docerror)?;
+    let pdf = Pdf::new(bytes).map_err(|e| DocError {
+        code: ErrorCode::Corrupt,
+        message: format!("hayro 打开 PDF 失败（{}）：{e:?}", path.display()),
+        attempts: vec![],
+    })?;
+    let pages = pdf.pages();
+    if first == 0 || last < first || (last as usize) > pages.len() {
         return Err(DocError {
             code: ErrorCode::Corrupt,
-            message: format!("pdftoppm 失败：{}", String::from_utf8_lossy(&out.stderr).trim()),
+            message: format!(
+                "PDF 渲染页区间越界：{first}..={last}（总页数 {}）",
+                pages.len()
+            ),
             attempts: vec![],
         });
     }
-    // pdftoppm 输出名 page-N.png（总页数 ≥10 时补零 page-01.png）：
-    // 收集目录内产物，按解析出的页码数字排序保证页序
-    let mut numbered: Vec<(u32, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(io_to_docerror)? {
-        let entry = entry.map_err(io_to_docerror)?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(no) = name
-            .strip_prefix("page-")
-            .and_then(|s| s.strip_suffix(".png"))
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
+
+    let base_scale = (dpi.max(1) as f32) / 72.0;
+    let cache = RenderCache::new();
+    let interpreter_settings = InterpreterSettings::default();
+    let render_settings = RenderSettings::default();
+
+    let mut out = Vec::with_capacity((last - first + 1) as usize);
+    for page_no in first..=last {
+        let page = &pages[(page_no - 1) as usize];
+        let (pw, ph) = page.render_dimensions();
+        let max_dim = pw.max(ph).max(1.0);
+        let scale = if max_dim * base_scale > MAX_RENDER_SIDE {
+            MAX_RENDER_SIDE / max_dim
+        } else {
+            base_scale
         };
-        numbered.push((no, entry.path()));
+        let pixmap_settings = PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+        };
+        let pixmap = hayro::render(
+            page,
+            &cache,
+            &interpreter_settings,
+            &render_settings,
+            &pixmap_settings,
+        );
+        let w = u32::from(pixmap.width());
+        let h = u32::from(pixmap.height());
+        if w == 0 || h == 0 {
+            return Err(DocError {
+                code: ErrorCode::Corrupt,
+                message: format!("hayro 渲染第 {page_no} 页尺寸为空（{w}x{h}）"),
+                attempts: vec![],
+            });
+        }
+        let raw = pixmap.data_as_u8_slice().to_vec();
+        let img = image::RgbaImage::from_raw(w, h, raw).ok_or_else(|| DocError {
+            code: ErrorCode::Corrupt,
+            message: format!("hayro 渲染第 {page_no} 页像素缓冲长度异常（{w}x{h}）"),
+            attempts: vec![],
+        })?;
+        out.push(img);
     }
-    numbered.sort_by_key(|(no, _)| *no);
-    numbered
-        .into_iter()
-        .map(|(_, p)| {
-            image::open(&p)
-                .map(|img| img.to_rgba8())
-                .map_err(|e| DocError {
-                    code: ErrorCode::Corrupt,
-                    message: format!("渲染图装载失败（{}）：{e}", p.display()),
-                    attempts: vec![],
-                })
-        })
-        .collect()
+    Ok(out)
 }
 
 fn io_to_docerror(e: std::io::Error) -> DocError {
@@ -1331,6 +1323,7 @@ pub(crate) mod sample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::model::BlockSource;
 
     /// 样例输出统一放 target/ 下，目录随进程隔离避免并行互踩。
@@ -1342,60 +1335,12 @@ mod tests {
         dir
     }
 
-    /// pdftoppm 依赖用例的串行闸：PATH 操纵是进程级全局态，且子进程按 PATH
-    /// 解析，并行跑会互踩（M4 页内分治用例也渲染，与其共享此闸）。
+    /// 渲染用例兼容锁（hayro 纯 Rust 进程内光栅化后已不依赖外部 pdftoppm/PATH）。
     static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// pdftoppm 是否可用（缺 poppler-utils 的环境可用 ghostscript 顶替，
-    /// 见 prepare_renderer；对齐字体缺失的 skip 策略）。须持 PATH_LOCK 后调用。
-    fn pdftoppm_available() -> bool {
-        Command::new("pdftoppm").arg("-v").output().is_ok()
-    }
-
-    /// 无真 pdftoppm 时用 ghostscript 顶替（仅测试）：render_pages 只依赖
-    /// `pdftoppm -png -r DPI -f F -l L INPUT PREFIX` 的命令面与 `PREFIX-页码.png`
-    /// 产物命名，shim 脚本按同参数面调 gs 产出同名 PNG。有真 pdftoppm 优先
-    /// 用真的（返回 None）；两者皆无时返回 Err 由调用方 skip。
-    /// 限制：gs `%d` 对输出序编号，多页区间渲染的产物名会偏离页码——本套件
-    /// 仅 cancel_midway_stops_remaining_ocr 渲染多页区间，且区间自页 1 起
-    ///（-f 1 -l 2，%d 序号恰与页码重合），不受影响；其余用例全部单页渲染
-    ///（-f N -l N）。
+    /// 纯 Rust `hayro` 进程内渲染恒可用，无需外部 `pdftoppm` / `ghostscript`。
     fn prepare_renderer() -> std::result::Result<Option<PathBuf>, &'static str> {
-        if pdftoppm_available() {
-            return Ok(None);
-        }
-        const GS_SHIM: &str = r#"#!/bin/sh
-# docforge 测试 shim：pdftoppm 命令面 → ghostscript 单页渲染
-dpi=72; first=1; last=1; rest=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -png) ;;
-    -r) shift; dpi=$1 ;;
-    -f) shift; first=$1 ;;
-    -l) shift; last=$1 ;;
-    *) rest="$rest $1" ;;
-  esac
-  shift
-done
-set -- $rest
-gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
-  -dFirstPage="$first" -dLastPage="$last" \
-  -sOutputFile="$2-%d.png" "$1" >/dev/null 2>&1
-"#;
-        if Command::new("gs").arg("--version").output().is_err() {
-            return Err("缺 pdftoppm（poppler-utils）且缺 ghostscript，渲染依赖用例不跑");
-        }
-        let dir = std::env::temp_dir().join(format!("docforge-gs-shim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|_| "gs shim 目录创建失败")?;
-        let script = dir.join("pdftoppm");
-        std::fs::write(&script, GS_SHIM).map_err(|_| "gs shim 写入失败")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .map_err(|_| "gs shim 加执行位失败")?;
-        }
-        Ok(Some(dir))
+        Ok(None)
     }
 
     /// 回归：assemble 曾漏赋 Page.blocks（M4 DjVu 工人发现），Document 层
@@ -1660,44 +1605,15 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         assert!(err.message.contains("文件不存在"), "实际：{}", err.message);
     }
 
-    /// PATH 操纵使 pdftoppm 不可见：验证友好错误（NotFound 分支）。
-    /// 本用例会临时改写进程 PATH——依赖子进程的用例（含 M4 页内分治）经
-    /// PATH_LOCK 与其互斥，无并行互踩。
+    /// 损坏 PDF 送 `hayro` 渲染应返回 `ErrorCode::Corrupt` 而非 panic。
     #[test]
-    fn pdftoppm_missing_has_friendly_error() {
-        let _guard = PATH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = probe_dir("noppm");
-        let pdf = dir.join("mixed.pdf");
-        if sample::generate_mixed_pdf(&pdf).is_none() {
-            eprintln!("skip：无覆盖样例字符的 CJK 系统字体");
-            return;
-        }
-        struct NoopEngine;
-        impl crate::ocr::OcrEngine for NoopEngine {
-            fn name(&self) -> &str {
-                "noop"
-            }
-            fn recognize(
-                &self,
-                _image: &image::RgbaImage,
-            ) -> std::result::Result<Vec<crate::ocr::RecognizedLine>, String> {
-                Ok(Vec::new())
-            }
-        }
-        let opts = PdfOptions {
-            mode: OcrMode::Auto,
-            engine: Some(std::sync::Arc::new(NoopEngine)),
-            ..Default::default()
-        };
-        let old = std::env::var_os("PATH");
-        std::env::set_var("PATH", "");
-        let result = parse_pdf(&pdf, &opts);
-        match old {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        let err = result.expect_err("pdftoppm 不可见应报错");
-        assert!(err.message.contains("找不到 pdftoppm"), "实际：{}", err.message);
+    fn hayro_renders_corrupt_pdf_with_corrupt_error() {
+        let dir = probe_dir("corrupt-hayro");
+        let bad_pdf = dir.join("bad.pdf");
+        std::fs::write(&bad_pdf, b"%PDF-1.7\nnot a valid pdf body").unwrap();
+        let err = render_pages(&bad_pdf, 1, 1, 150).expect_err("损坏 PDF 渲染应报错");
+        assert_eq!(err.code, ErrorCode::Corrupt);
+        assert!(err.message.contains("hayro"), "实际：{}", err.message);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

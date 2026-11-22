@@ -47,7 +47,7 @@ docforge-cli --list-formats
 - **Auto mirror acceleration (`--ocr-mirror auto|cn|global`)**: On first download, probes IP geolocation; Mainland China automatically accelerates via ModelScope / `hf-mirror.com`, overseas fetches directly from HuggingFace, with SHA-256 verification and local caching.
 - **Offline models (`--ocr-model-dir <dir>` or `DOCFORGE_OCR_MODEL_DIR`)**: Point to a local model folder to run 100% offline.
 - **Embedded images (`--ocr-images`)**: Additionally run OCR on images embedded inside DOCX/EPUB/CHM/FB2.
-- **Scanned PDFs**: Text-layer PDF pages extract directly with zero external tools; scanned PDF pages require `pdftoppm` (`poppler-utils`) in `PATH` to rasterize before OCR.
+- **Scanned PDFs**: Text-layer PDF pages extract directly; scanned PDF pages are rasterized in-process using pure-Rust **`hayro`** (zero `pdftoppm` / `poppler-utils` required) and routed to the selected OCR engine automatically.
 
 ## Supported Input Formats
 

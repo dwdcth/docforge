@@ -24,8 +24,7 @@ OCR、翻译四类消费者。独立项目，与 rumi-ocr 无依赖关系。
 | PDF 翻译优化 | **docx 节交替**（`writeback_docx_alternating`：分节符/分页符切段，PageAlt 在 Word 的近似，节属性逐字节保真）、**跨页重复块标记**（`running-detect` 处理链：同文本每页同位置 → `meta["running"]` + header/footer 区域，`TranslationUnit.running` 携带、附录默认跳过——页眉页脚不再翻 N 遍灌满附录） | ✅ |
 | 知识库与老式 Office 轮 | **统一资源安全护栏**（`limits` 防 ZIP/XML 炸弹 + `router::sniff` 有界头探测与 OLE/ZIP 内容嗅探 + 确定性变异鲁棒测试）、**数学公式转 LaTeX**（零依赖 `math` 模块，OMML/MathML → `$...$`/`$$...$$`，覆盖 docx/odt/html/epub；docx `styles.xml` `basedOn`/`outlineLvl` 继承链）、**GFM & Google OKF v0.3 输出**（`emit::to_gfm` + `okf` 模块，含 YAML 1.2 frontmatter / 图片去重落盘 `assets/` / 递归 `index.md`）、**老式二进制 Office**（吸收 `firecrawl/anydoc` 0.2.5：`doc`/`ppt`/`xls`/`xlsb` 4 细粒度 + `legacy-office` 聚合）、**7 平台 CLI CI 发布** | ✅ |
 
-环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
-ghostscript shim；详见 docs/开发记录.md）。
+环境说明：PDF 扫描页光栅化已切换为纯 Rust **`hayro`**（零 `pdftoppm` / `poppler-utils` 外部依赖）；详见 docs/开发记录.md。
 
 ## 快速上手
 

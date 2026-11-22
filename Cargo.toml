@@ -30,9 +30,9 @@ encoding = ["dep:encoding_rs", "dep:chardetng"]
 json = ["dep:serde_json"]
 # 语言检测处理能力（whatlang，翻译管线源语言）
 lang-detect = ["dep:whatlang"]
-# pdf 页级路由（pdf-inspector default 面 = 纯 Rust：lopdf，无 ort/pyo3/pdfium；
+# pdf 页级路由（pdf-inspector 文字层提取 + hayro 纯 Rust 光栅化，零 pdftoppm / poppler 外部依赖；
 # Auto/On 模式的引擎注入需要 ocr trait，image 依赖与 ocr 重叠）
-pdf = ["dep:pdf-inspector", "dep:image", "ocr"]
+pdf = ["dep:pdf-inspector", "dep:hayro", "dep:image", "ocr"]
 # OCR 引擎抽象（trait + 类型）
 ocr = ["dep:image"]
 # 纯 Rust OCR 模型自动下载（IP 归属地探测 + 国内镜像加速 + SHA-256 校验，零 C 依赖）
@@ -176,6 +176,10 @@ optional = true
 [dependencies.pdf-inspector]
 version = "1"
 default-features = false
+optional = true
+
+[dependencies.hayro]
+version = "0.9"
 optional = true
 
 [dependencies.image]
