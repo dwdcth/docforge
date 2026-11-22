@@ -44,7 +44,7 @@
 //! EPUB 的 spine 部件天然是章/页边界——每个**有命中译文**的 spine 部件后
 //! 插入「该部件的纯译文部件」，阅读器里即 真·逐部件交替（三策略里的
 //! OriginalPlusAppendix 对这个体验只是退化形态）。与 [`writeback_epub`]
-//! 共用同一套解析/重块化/provenance/编辑管线（[`plan_epub_edits`]，策略
+//! 共用同一套解析/重块化/provenance/编辑管线（`plan_epub_edits`，策略
 //! 固定 TranslationOnly），差异只在收尾：
 //!
 //! * 译文部件内容 = 该部件全部命中单元的 TranslationOnly 渲染；部件是完整

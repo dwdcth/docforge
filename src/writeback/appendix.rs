@@ -9,8 +9,8 @@
 //! 分工——
 //!
 //! * docforge（本模块）：把命中的译文按 [`crate::emit::TranslationUnit`]
-//!   锚点整理成 [`AppendixPage`] 序列（结构化消费主形态）或人读 Markdown
-//!   （[`to_appendix_markdown`]，调试 / 快照用）；
+//!   锚点整理成 [`crate::writeback::appendix::AppendixPage`] 序列（结构化消费主形态）或人读 Markdown
+//!   （[`crate::writeback::appendix::to_appendix_markdown`]，调试 / 快照用）；
 //! * 消费者（rumi）：拿序列渲染追加 PDF 页——一页对一页，或按内容高度
 //!   自适应再分页（消费者自由）。
 //!
@@ -22,7 +22,7 @@
 //! # 对齐契约（与回写侧同口径）
 //!
 //! * 译文查找语义与 writeback 一致：id 精确匹配、重复 id 后者胜（HashMap）、
-//!   空白译文视为未提供（复用 [`super::pair_map`]）；
+//!   空白译文视为未提供（复用 `super::pair_map`）；
 //! * 消费侧自洽校验：译文对携带的①侧源文本（[`crate::emit::TranslationPair`]
 //!   的 `source`，`Some` 时）与本单元文本（trim 后）不一致 → 该条不收——
 //!   对照与原文对不上说明译文不是依据本单元文本产生（提取后文件已变），

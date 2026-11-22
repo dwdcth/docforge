@@ -219,6 +219,7 @@ pub(crate) fn rid_of_image_node(e: &quick_xml::events::BytesStart<'_>) -> Option
 /// 整段 XML 里的图片引用 id（文档序、**同一元素内去重**）：
 /// 用于 drawing 部件这种「一次读完、不需要与文本交错」的场景
 /// （对齐 Python `_blip_rids(el)` 的 `v not in rids` 语义）。
+#[cfg(any(feature = "xlsx", test))]
 pub(crate) fn blip_rids(xml: &str) -> Vec<String> {
     use quick_xml::events::Event;
 

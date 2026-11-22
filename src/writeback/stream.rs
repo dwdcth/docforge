@@ -1,6 +1,6 @@
 // docforge 新增（翻译闭环②写侧）：流式回写会话 WritebackSession。
-//! 流式回写会话：译文按翻译单元流式喂入（[`WritebackSession::push`]）、
-//! spill 临时文件落盘不驻留 RAM、[`WritebackSession::finish`] 回放并分发到
+//! 流式回写会话：译文按翻译单元流式喂入（[`crate::writeback::stream::WritebackSession::push`]）、
+//! spill 临时文件落盘不驻留 RAM、[`crate::writeback::stream::WritebackSession::finish`] 回放并分发到
 //! 对应回写器——补齐「解析→翻→写」流式闭环的最后一环。
 //!
 //! # 管线形态（与全量回写 API 的分工）
@@ -56,13 +56,13 @@
 //! 临时文件 `temp_dir()/docforge-wb-{pid}-{unix纳秒}.spill`；每条记录 =
 //! **三帧** `(u32 LE 字节数 + UTF-8 字节)` 依次为 id、①侧源文本（空串 =
 //! 不校验，即 [`crate::emit::TranslationPair::source`] 为 `None`）、译文。
-//! 单帧上限 [`MAX_FRAME_BYTES`]：写侧超限当场拒绝，读侧超限 / 截断 /
+//! 单帧上限 `MAX_FRAME_BYTES`：写侧超限当场拒绝，读侧超限 / 截断 /
 //! 非 UTF-8 报 `corrupt`——防损坏文件的长度头炸内存。`Drop` 兜底删除
 //! spill；`finish` 成败路径都删（Drop 对已删文件静默）。
 //!
 //! # 契约
 //!
-//! * 空白译文（trim 后为空）静默忽略——与 [`super::translation_map`] 的
+//! * 空白译文（trim 后为空）静默忽略——与 `super::translation_map` 的
 //!   「空白视为未提供」同口径；`push` 返回**已接受总条数**（含重复 id）供
 //!   管线统计；
 //! * 重复 id：回放保持投递序，交由回写器侧 `translation_map` 的 HashMap
@@ -75,7 +75,7 @@
 //!
 //! # 覆盖格式与门控
 //!
-//! [`WritebackFormat`] 八种：Txt 恒开（零依赖）；Docx/Epub/Html/Fb2/Odt/Xlsx
+//! [`crate::writeback::stream::WritebackFormat`] 八种：Txt 恒开（零依赖）；Docx/Epub/Html/Fb2/Odt/Xlsx
 //! 各随同名 feature（finish 分发到对应 `writeback_*`，见 writeback 模块
 //! 级文档）；Markdown 恒在但解析侧随 feature `md`（默认开，回写 =
 //! 重解析 + [`crate::emit::to_bilingual_markdown_with`] 纯文本重组写文件）。

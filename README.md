@@ -71,7 +71,10 @@ println!("{}", okf_concept.markdown);
 `docforge-cli` 默认通过 `cli` feature 开启全部纯 Rust 格式后端与**双轻量化纯 Rust OCR 引擎**（PP-OCRv6 `qppocr` + Indra OCR `fusor-ai`，零 C/C++ 编译依赖），专注文档格式转换，仅输出 **`gfm`**（默认）或 **`okf`**（Google Open Knowledge Format v0.3）；Agent 技能说明见 [skills/docforge/SKILL.md](skills/docforge/SKILL.md)：
 
 ```bash
-# 从源码构建全格式 + 双纯 Rust OCR CLI
+# 通过 crates.io 安装全格式 + 双纯 Rust OCR CLI
+cargo install docforge --features cli
+
+# 或从源码构建
 cargo build --release --features cli --bin docforge-cli
 
 # 查看已支持的全部输入格式与 OCR 引擎
@@ -162,7 +165,7 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
   - xlsx：附录模式数值/日期格译文排除改为记 WritebackReport（现静默，W3 交付时留的口径）。
   - 小众格式回写器（mobi/azw3、djvu、chm）："有真实场景再加"——PalmDOC 记录改写量级
     独立立项。
-- crates.io 发布：依赖面已收敛（oar-ocr 移出发布面），待维护者邮箱验证。
+- crates.io 发布：已接入 GitHub Actions（推送 `v*` tag 自动发布 7 平台 CLI Release 与 crates.io）。
 
 ## 许可
 

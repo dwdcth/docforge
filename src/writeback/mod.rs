@@ -86,6 +86,7 @@ pub use xlsx::writeback_xlsx;
 
 /// XML / XHTML 文本节点的最小转义：`&` `<` `>`（属性场景不经过此函数——
 /// 本模块只写固定属性值）。译文与追加段统一走这里。
+#[allow(dead_code)]
 pub(crate) fn escape_xml_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -147,6 +148,8 @@ pub(crate) fn apply_edits(xml: &str, edits: Vec<Edit>) -> String {
 /// （span 替换 / 零长插入），写入时原串切片与替换块交替直写——不再拼第二份
 /// 完整 String（拼接产物整份驻留消失，回写峰值内存的主菜）。写出语义与
 /// [`apply_edits`] 逐字节一致（同编辑同序 → 流式直写 = 拼好再写）。
+#[cfg(any(feature = "docx", feature = "epub", feature = "odt", feature = "xlsx", test))]
+#[allow(dead_code)]
 pub(crate) enum EntryPayload<'a> {
     Bytes(Vec<u8>),
     Spans { original: &'a str, edits: Vec<Edit> },
@@ -203,6 +206,7 @@ fn write_spans<W: std::io::Write>(
 /// 把一个 zip 条目的改写载荷直写 writer：`Bytes` 整块一次写；`Spans` 切片
 /// 交替直写（见 [`write_spans`]）。错误统一挂条目名（与既有
 /// 「ZIP 写 {name} 失败」文案同口径）。
+#[cfg(any(feature = "docx", feature = "epub", feature = "odt", feature = "xlsx"))]
 pub(crate) fn write_entry_payload<W: std::io::Write>(
     w: &mut W,
     name: &str,
@@ -320,6 +324,7 @@ pub(crate) fn commit_temp(tmp: &Path, out: &Path) -> crate::error::Result<()> {
 /// 临时兄弟文件，成功后 [`commit_temp`] rename 到位。写出中途失败（崩溃 /
 /// ENOSPC）删除临时件——目标路径要么是完整的旧/新内容，要么不存在，
 /// 永远不留半残文件。
+#[allow(dead_code)]
 pub(crate) fn write_bytes_atomic(out: &Path, bytes: &[u8]) -> crate::error::Result<()> {
     let tmp = temp_sibling(out);
     if let Err(e) = std::fs::write(&tmp, bytes) {
@@ -511,7 +516,9 @@ mod zip_util {
 }
 
 #[cfg(any(feature = "docx", feature = "epub", feature = "odt"))]
-pub(crate) use zip_util::{open_zip, rewrite_zip, rewrite_zip_added};
+pub(crate) use zip_util::{open_zip, rewrite_zip};
+#[cfg(feature = "epub")]
+pub(crate) use zip_util::rewrite_zip_added;
 
 #[cfg(test)]
 pub(crate) mod tests_util {

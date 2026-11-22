@@ -28,6 +28,7 @@ pub mod pptx;
 #[cfg(feature = "xlsx")]
 pub mod xlsx;
 pub(crate) mod image;
+#[cfg(any(feature = "xlsx", feature = "pptx", test))]
 pub(crate) mod parallel;
 
 pub mod structure;
@@ -542,7 +543,7 @@ pub(crate) fn attr_by(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Opti
 
 /// 部件的 `.rels` 路径：`xl/worksheets/sheet1.xml` → `xl/worksheets/_rels/sheet1.xml.rels`
 /// （对齐 Python `_rels_path`；根级部件则落在 `_rels/xxx.rels`）。
-#[cfg(any(feature = "docx", feature = "xlsx", feature = "pptx"))]
+#[cfg(any(feature = "xlsx", test))]
 pub(crate) fn part_rels_path(part: &str) -> String {
     match part.rsplit_once('/') {
         Some((dir, base)) => format!("{dir}/_rels/{base}.rels"),
@@ -613,7 +614,7 @@ pub(crate) fn resolve_part(dir: &str, target: &str) -> String {
 }
 
 /// 部件所在目录（`xl/worksheets/sheet1.xml` → `xl/worksheets`）。
-#[cfg(any(feature = "docx", feature = "xlsx", feature = "pptx"))]
+#[cfg(any(feature = "xlsx", test))]
 pub(crate) fn part_dir(part: &str) -> &str {
     part.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }

@@ -136,6 +136,7 @@ pub struct SourceToken {
 impl SourceToken {
     /// 合并相邻信物（多个位合入同一块时用）：`next` 必须紧接 `self` 的区间。
     /// 连续性仅 debug 断言（发号器天然连续）；release 下由调用方保证。
+    #[cfg(feature = "docx")]
     pub(crate) fn merge(&mut self, next: SourceToken) {
         debug_assert_eq!(
             self.first_slot + u32::from(self.slot_count),
