@@ -426,6 +426,11 @@ fn collapse_ws(s: &str, max_chars: usize) -> String {
     out.trim().to_string()
 }
 
+/// 从文档提取去重后的图片资产及每页相对路径列表（供 OKF 与 GFM 落盘模式共用）。
+pub fn extract_document_assets(doc: &Document, raw_prefix: &str) -> (Vec<OkfAsset>, Vec<Vec<String>>) {
+    extract_assets(doc, raw_prefix)
+}
+
 fn extract_assets(doc: &Document, raw_prefix: &str) -> (Vec<OkfAsset>, Vec<Vec<String>>) {
     let prefix = sanitize_filename(raw_prefix);
     let mut assets: Vec<OkfAsset> = Vec::new();
@@ -612,7 +617,7 @@ mod tests {
             .contains("generated: { by: \"docforge/"));
         assert!(concept
             .markdown
-            .contains("![架构图](assets/arch-p1-img1.png)"));
+            .contains("![架构图](./assets/arch-p1-img1.png)"));
     }
 
     #[test]

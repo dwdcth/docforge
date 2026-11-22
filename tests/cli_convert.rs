@@ -227,11 +227,54 @@ fn okf_extracts_image_assets_to_disk() {
 
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(asset_ok, "图片资产应原样落盘到 assets/");
-    assert!(md.contains("assets/diagram-p1-img1.png"), "正文应链接图片资产: {md}");
+    assert!(
+        md.contains("./assets/diagram-p1-img1.png"),
+        "正文应使用显式相对路径链接图片资产: {md}"
+    );
     assert!(md.contains("x-docforge-assets: 1"), "frontmatter 应记录资产数: {md}");
     assert!(
         stderr.contains("纯扫描版") && stderr.contains("--ocr ppocr"),
         "关闭 OCR 处理纯图文档应在 stderr 提示启用 OCR: {stderr}"
+    );
+}
+
+/// --format gfm 落盘输出（-o）同样自动提取图片资产到相对 assets/ 并用 `./assets/...` 链接。
+#[test]
+fn gfm_to_file_extracts_relative_image_assets() {
+    let dir = tmp_dir("gfm_img_in");
+    let out = tmp_dir("gfm_img_out");
+    let png_bytes: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let img = dir.join("chart.png");
+    std::fs::write(&img, png_bytes).unwrap();
+    let out_md = out.join("chart.md");
+
+    let (code, _stdout, stderr) = run_cli(&[
+        img.to_str().unwrap(),
+        "--format",
+        "gfm",
+        "--ocr",
+        "off",
+        "-o",
+        out_md.to_str().unwrap(),
+    ]);
+
+    let md = std::fs::read_to_string(&out_md).unwrap_or_default();
+    let asset = out.join("assets/chart-p1-img1.png");
+    let asset_ok = std::fs::read(&asset).map(|b| b == png_bytes).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(asset_ok, "GFM 落盘模式也应将图片写入相对 assets/");
+    assert!(
+        md.contains("![image](./assets/chart-p1-img1.png)"),
+        "GFM 正文应使用 ./assets/... 相对路径链接图片: {md}"
     );
 }
 

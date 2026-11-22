@@ -294,6 +294,38 @@ fn emit_ocr_hints(input: &Path, doc: &docforge::Document, ocr: OcrRunState) {
     }
 }
 
+fn write_assets_beside(input: &Path, md_out: &Path, assets: &[docforge::okf::OkfAsset]) -> bool {
+    if assets.is_empty() {
+        return true;
+    }
+    let base_dir = md_out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for asset in assets {
+        let asset_target = base_dir.join(&asset.rel_path);
+        if let Some(parent) = asset_target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "{}: 创建资产目录失败（{}）：{e}",
+                    input.display(),
+                    parent.display()
+                );
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::write(&asset_target, &asset.data) {
+            eprintln!(
+                "{}: 写出资产失败（{}）：{e}",
+                input.display(),
+                asset_target.display()
+            );
+            return false;
+        }
+    }
+    true
+}
+
 fn convert_one_okf(
     engine: &docforge::DocumentEngine,
     input: &Path,
@@ -341,29 +373,8 @@ fn convert_one_okf(
                 eprintln!("{}: 写出失败（{}）：{e}", input.display(), p.display());
                 return None;
             }
-            if !concept.assets.is_empty() {
-                let base_dir = p.parent().unwrap_or(Path::new("."));
-                for asset in &concept.assets {
-                    let asset_target = base_dir.join(&asset.rel_path);
-                    if let Some(parent) = asset_target.parent() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!(
-                                "{}: 创建资产目录失败（{}）：{e}",
-                                input.display(),
-                                parent.display()
-                            );
-                            return None;
-                        }
-                    }
-                    if let Err(e) = std::fs::write(&asset_target, &asset.data) {
-                        eprintln!(
-                            "{}: 写出资产失败（{}）：{e}",
-                            input.display(),
-                            asset_target.display()
-                        );
-                        return None;
-                    }
-                }
+            if !write_assets_beside(input, p, &concept.assets) {
+                return None;
             }
         }
         None => {
@@ -394,16 +405,23 @@ fn convert_one_gfm(
         }
     };
     emit_ocr_hints(input, &doc, ocr);
-    let output = docforge::emit::to_gfm(&doc);
     match out_path {
-        Some(p) => match std::fs::write(p, &output) {
-            Ok(()) => true,
-            Err(e) => {
+        Some(p) => {
+            let asset_prefix = input
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "doc".to_string());
+            let (assets, per_page_links) =
+                docforge::okf::extract_document_assets(&doc, &asset_prefix);
+            let output = docforge::emit::to_gfm_with_assets(&doc, &per_page_links);
+            if let Err(e) = std::fs::write(p, &output) {
                 eprintln!("{}: 写出失败（{}）：{e}", input.display(), p.display());
-                false
+                return false;
             }
-        },
+            write_assets_beside(input, p, &assets)
+        }
         None => {
+            let output = docforge::emit::to_gfm(&doc);
             let mut stdout = std::io::stdout().lock();
             let _ = writeln!(stdout, "{output}");
             true
@@ -676,7 +694,7 @@ fn main() {
     }
 
     let is_okf = format == "okf";
-    let extract_images = (is_okf && (out_dir.is_some() || out_path.is_some())) || ocr_images;
+    let extract_images = out_dir.is_some() || out_path.is_some() || ocr_images;
     let ocr_state = OcrRunState {
         choice: ocr_choice,
         images: ocr_images,

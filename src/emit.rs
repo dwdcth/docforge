@@ -207,9 +207,23 @@ fn gfm_display_math(s: &str) -> Option<String> {
     None
 }
 
-/// 供 [`to_gfm`] 与 [`crate::okf::to_okf_concept`] 共用的 GFM 渲染核心。
-/// `page_assets[p]` 为第 `p` 页提取出的相对图片资产路径列表（空切片表示无落盘资产）。
-pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) -> String {
+fn gfm_asset_href(asset_path: &str) -> String {
+    let encoded = crate::okf::encode_uri_component(asset_path);
+    if encoded.starts_with("./")
+        || encoded.starts_with("../")
+        || encoded.starts_with('/')
+        || encoded.contains("://")
+    {
+        encoded
+    } else {
+        format!("./{encoded}")
+    }
+}
+
+/// 供 [`to_gfm`]、CLI 落盘与 [`crate::okf::to_okf_concept`] 共用的 GFM 渲染核心。
+/// `page_assets[p]` 为第 `p` 页提取出的相对图片资产路径列表（空切片表示无落盘资产；
+/// 正文渲染自动规范为显式相对路径 `./assets/...`，兼容普通 Markdown 编辑器与 OKF v0.3 §6）。
+pub fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut footnotes: Vec<String> = Vec::new();
 
@@ -302,8 +316,8 @@ pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) ->
                     if let Some(asset_path) = assets.get(asset_cursor) {
                         asset_cursor += 1;
                         let label = if alt.is_empty() { "image" } else { alt };
-                        let encoded = crate::okf::encode_uri_component(asset_path);
-                        let img_md = format!("![{label}]({encoded})");
+                        let href = gfm_asset_href(asset_path);
+                        let img_md = format!("![{label}]({href})");
                         match ocr_body {
                             None => img_md,
                             Some(txt) if single_image_page => format!("{img_md}\n\n{txt}"),
@@ -353,9 +367,9 @@ pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) ->
         // 本页未对应到 Image 块的剩余落盘图片（如 PDF keep_raster_pages / FB2 / XLSX 图）
         while asset_cursor < assets.len() {
             let asset_path = &assets[asset_cursor];
-            let encoded = crate::okf::encode_uri_component(asset_path);
+            let href = gfm_asset_href(asset_path);
             out.push(format!(
-                "![Page {} image {}]({encoded})",
+                "![Page {} image {}]({href})",
                 p_idx + 1,
                 asset_cursor + 1
             ));
