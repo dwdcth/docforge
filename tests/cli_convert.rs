@@ -229,4 +229,35 @@ fn okf_extracts_image_assets_to_disk() {
     assert!(asset_ok, "图片资产应原样落盘到 assets/");
     assert!(md.contains("assets/diagram-p1-img1.png"), "正文应链接图片资产: {md}");
     assert!(md.contains("x-docforge-assets: 1"), "frontmatter 应记录资产数: {md}");
+    assert!(
+        stderr.contains("纯扫描版") && stderr.contains("--ocr ppocr"),
+        "关闭 OCR 处理纯图文档应在 stderr 提示启用 OCR: {stderr}"
+    );
+}
+
+/// 纯扫描版 PDF 在 `--ocr off` 下应在 stderr 明确提示启用 OCR，纯文本文件不误报。
+#[test]
+fn scanned_pdf_with_ocr_off_hints_enabling_ocr() {
+    let dir = tmp_dir("scanned_pdf_hint");
+    let pdf_path = dir.join("scan_only.pdf");
+    let mut doc = oxidize_pdf::Document::new();
+    let page = oxidize_pdf::Page::a4();
+    doc.add_page(page);
+    doc.save(&pdf_path).unwrap();
+
+    let (code, _stdout, stderr) = run_cli(&[pdf_path.to_str().unwrap(), "--ocr", "off"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("纯扫描版") && stderr.contains("--ocr ppocr") && stderr.contains("--ocr indra"),
+        "纯扫描版 PDF 应在 stderr 提示启用 OCR: {stderr}"
+    );
+
+    // 正常文本文件关闭 OCR 不应误报扫描版提示
+    let md_path = dir.join("normal.md");
+    std::fs::write(&md_path, "# 正常文档\n\n含文字层正文。\n").unwrap();
+    let (code2, _stdout2, stderr2) = run_cli(&[md_path.to_str().unwrap(), "--ocr", "off"]);
+    assert_eq!(code2, 0, "stderr: {stderr2}");
+    assert!(!stderr2.contains("纯扫描版"), "正常文档不应误报: {stderr2}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

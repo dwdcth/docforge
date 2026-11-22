@@ -228,6 +228,72 @@ fn build_engine(
     docforge::DocumentEngine::new(registry)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OcrRunState {
+    choice: OcrChoice,
+    images: bool,
+}
+
+fn emit_ocr_hints(input: &Path, doc: &docforge::Document, ocr: OcrRunState) {
+    let warnings = doc
+        .meta
+        .extra
+        .get("warnings")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !warnings.trim().is_empty() {
+        eprintln!("{}: 警告：{warnings}", input.display());
+    }
+
+    let has_text = doc.blocks().any(|b| {
+        if b.kind == docforge::BlockKind::Image {
+            return !b.content.trim().is_empty();
+        }
+        !b.content.trim().is_empty()
+            || b.table
+                .as_ref()
+                .is_some_and(|t| t.rows.iter().flatten().any(|c| !c.trim().is_empty()))
+    }) || doc
+        .pages
+        .iter()
+        .flat_map(|p| p.images.iter())
+        .any(|im| im.ocr_text.as_deref().is_some_and(|s| !s.trim().is_empty()));
+
+    let has_image_content = doc.meta.image_count > 0
+        || doc.pages.iter().any(|p| !p.images.is_empty())
+        || doc.blocks().any(|b| b.kind == docforge::BlockKind::Image);
+
+    let fmt = doc.meta.file_type.as_str();
+    let pdf_scan_skipped = warnings.contains("扫描页未 OCR");
+    let is_scan_format = matches!(
+        fmt,
+        "pdf" | "djvu" | "cbz" | "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff"
+    );
+
+    if ocr.choice == OcrChoice::Off {
+        if !has_text
+            && (pdf_scan_skipped
+                || has_image_content
+                || (is_scan_format && !doc.pages.is_empty()))
+        {
+            eprintln!(
+                "{}: 提示：检测到纯扫描版/纯图片文档（无可用文字层），请启用 OCR 识别文字：--ocr ppocr 或 --ocr indra",
+                input.display()
+            );
+        } else if pdf_scan_skipped {
+            eprintln!(
+                "{}: 提示：检测到部分页面为扫描页且未识别，可启用 OCR 补全全文：--ocr ppocr 或 --ocr indra",
+                input.display()
+            );
+        }
+    } else if !ocr.images && !has_text && has_image_content && !is_scan_format {
+        eprintln!(
+            "{}: 提示：检测到文档仅含内嵌图片、无正文文字层，可追加 --ocr-images 启用内嵌图 OCR",
+            input.display()
+        );
+    }
+}
+
 fn convert_one_okf(
     engine: &docforge::DocumentEngine,
     input: &Path,
@@ -235,6 +301,7 @@ fn convert_one_okf(
     rel_out_path: Option<String>,
     okf_type: &str,
     title_override: Option<&str>,
+    ocr: OcrRunState,
 ) -> Option<docforge::okf::OkfIndexEntry> {
     let doc = match engine.parse(input) {
         Ok(d) => d,
@@ -243,11 +310,7 @@ fn convert_one_okf(
             return None;
         }
     };
-    if let Some(w) = doc.meta.extra.get("warnings") {
-        if !w.trim().is_empty() {
-            eprintln!("{}: 警告：{w}", input.display());
-        }
-    }
+    emit_ocr_hints(input, &doc, ocr);
     let source_last_modified = std::fs::metadata(input)
         .and_then(|m| m.modified())
         .ok()
@@ -321,6 +384,7 @@ fn convert_one_gfm(
     engine: &docforge::DocumentEngine,
     input: &Path,
     out_path: Option<&Path>,
+    ocr: OcrRunState,
 ) -> bool {
     let doc = match engine.parse(input) {
         Ok(d) => d,
@@ -329,11 +393,7 @@ fn convert_one_gfm(
             return false;
         }
     };
-    if let Some(w) = doc.meta.extra.get("warnings") {
-        if !w.trim().is_empty() {
-            eprintln!("{}: 警告：{w}", input.display());
-        }
-    }
+    emit_ocr_hints(input, &doc, ocr);
     let output = docforge::emit::to_gfm(&doc);
     match out_path {
         Some(p) => match std::fs::write(p, &output) {
@@ -617,6 +677,10 @@ fn main() {
 
     let is_okf = format == "okf";
     let extract_images = (is_okf && (out_dir.is_some() || out_path.is_some())) || ocr_images;
+    let ocr_state = OcrRunState {
+        choice: ocr_choice,
+        images: ocr_images,
+    };
     let ocr_engine = make_ocr_engine(ocr_choice, ocr_model_dir, ocr_mirror, ocr_math);
     let engine = build_engine(extract_images, ocr_engine);
 
@@ -668,6 +732,7 @@ fn main() {
                     Some(rel_posix),
                     &okf_type,
                     None,
+                    ocr_state,
                 ) {
                     Some(entry) => {
                         okf_entries.push(entry);
@@ -675,7 +740,7 @@ fn main() {
                     }
                     None => bad += 1,
                 }
-            } else if convert_one_gfm(&engine, &job.input, Some(&target)) {
+            } else if convert_one_gfm(&engine, &job.input, Some(&target), ocr_state) {
                 ok += 1;
             } else {
                 bad += 1;
@@ -741,6 +806,7 @@ fn main() {
                 rel_posix,
                 &okf_type,
                 okf_title.as_deref(),
+                ocr_state,
             ) {
                 Some(entry) => {
                     if let Some(root) = out_dir.as_ref() {
@@ -761,7 +827,7 @@ fn main() {
                 }
                 None => bad += 1,
             }
-        } else if convert_one_gfm(&engine, &job.input, target.as_deref()) {
+        } else if convert_one_gfm(&engine, &job.input, target.as_deref(), ocr_state) {
             ok += 1;
         } else {
             bad += 1;
