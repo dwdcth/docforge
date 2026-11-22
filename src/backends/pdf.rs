@@ -2706,10 +2706,10 @@ gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r"$dpi" \
         assert_eq!(raw.pages.len(), 7);
         assert!(!raw.pages[0].items.is_empty(), "页 1 已产出保留");
         assert!(!raw.pages[1].items.is_empty(), "页 2（中止页）已产出保留");
-        for i in 2..7 {
-            assert!(raw.pages[i].items.is_empty(), "页 {} 应为空占位", i + 1);
+        for (i, page) in raw.pages.iter().enumerate().take(7).skip(2) {
+            assert!(page.items.is_empty(), "页 {} 应为空占位", i + 1);
             let expected = (i + 1).to_string();
-            assert_eq!(raw.pages[i].name.as_deref(), Some(expected.as_str()), "页号对齐");
+            assert_eq!(page.name.as_deref(), Some(expected.as_str()), "页号对齐");
         }
         let w = raw.meta.get("warnings").expect("应有中止告警");
         assert!(w.contains("用户中止于第 2 页"), "实际告警：{w}");
