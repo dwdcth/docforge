@@ -706,7 +706,7 @@ mod adapter_tests {
         let okf = crate::okf::to_okf_concept(&doc_flow, &crate::okf::OkfOptions::default());
         assert_eq!(okf.assets.len(), 1);
         assert!(okf.markdown.contains("Formula $x^2$"), "{}", okf.markdown);
-        assert!(okf.markdown.contains("![chart](assets/"), "{}", okf.markdown);
+        assert!(okf.markdown.contains("![chart](./assets/"), "{}", okf.markdown);
         assert!(okf.markdown.contains("[^1]: [footnote] Note body"), "{}", okf.markdown);
     }
 
