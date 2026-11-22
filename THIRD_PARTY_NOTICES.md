@@ -16,6 +16,7 @@ docforge 吸收了下表 crate 的源码（吸收文件头部均有标注）。�
 | document-parser | 0.1.0-alpha.18 | MIT OR Apache-2.0 | https://static.crates.io/crates/document-parser/document-parser-0.1.0-alpha.18.crate | TXT 分章算法骨架/EPUB 五件套（M2）、md pulldown 事件映射参考（增强轮）、FB2/DjVu 页级分治模式（M5/M4）、MOBI 参考 | 上游 LiiChar/document-parse 活跃；其 DOCX 因中文内容丢失级缺陷不采（docparse-plan §2.4） |
 | ebook-rs | 0.18.0 | MIT | https://static.crates.io/crates/ebook-rs/ebook-rs-0.18.0.crate | PalmDoc LZ77 解压例程 decompress_palmdoc（azw3 增强，src/backends/mobi/kf8.rs，含 256 MiB 输出上界，原样吸收）；md frontmatter 思路（设计参考） | 其 AZW3/KF8 支持经核实不存在（描述夸大）；方向为电子书引擎，非同类 |
 | mobi（KindleUnpack 家族） | 0.4.1（PyPI；上游 kevinhendricks/KindleUnpack） | GPL-3.0 | https://files.pythonhosted.org/packages/7f/fc/efbab42351ebdd594e23f069934bff882f1c15129f61cbff13d1990243b5/mobi-0.4.1.tar.gz | （未吸收代码）KF8 记录语义参考：EXTH 121 boundary、trailing entry 编码、SKEL/FRAG INDX/TAGX、FDST、skeleton/fragment 装配（azw3，src/backends/mobi/kf8.rs 独立实现） | GPL 一票否决吸收（djvu 0.1.0 先例）；仅格式事实参考，代码零复制 |
+| anydoc | 0.2.5 | MIT | https://github.com/firecrawl/anydoc | Wave 1：安全限额（src/limits.rs）、内容嗅探（src/router.rs）、确定性变异测试（tests/robustness.rs）；Wave 2：OMML/MathML 转 LaTeX（src/math/{tex,omml,mathml}.rs）与 docx styles 继承链参考（src/backends/office/docx.rs）；Wave 4：老式二进制 Office 后端（src/backends/legacy_office/，含 doc/ppt/xls/xlsb + numfmt + 内部模型/共享辅助） | 上游为单 crate 无 feature 裁剪，按 MIT 条款按需模块吸收并保留细粒度 feature 与极简依赖面（仅新增纯 Rust `cfb`） |
 
 其余依赖（serde 及后续 pdf-inspector / oar-ocr / encoding_rs 等）按各自许可
 正常依赖，随 cargo metadata 自动携带。

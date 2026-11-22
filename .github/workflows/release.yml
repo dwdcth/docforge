@@ -1,0 +1,192 @@
+# docforge-cli 跨平台构建与 Release 发布（7 个目标平台）
+# 触发方式：
+#   1. 推送 v* 标签（如 v0.1.0）：自动构建 7 平台产物并创建 GitHub Release + SHA256SUMS.txt
+#   2. GitHub Actions 页面手动触发 workflow_dispatch：构建 7 平台产物并上传为 Workflow Artifacts
+name: release-cli
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '可选产物版本号后缀（仅影响包文件名，留空默认使用 git short sha）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin_name: docforge-cli.exe
+            smoke: true
+
+          - target: x86_64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            bin_name: docforge-cli
+            smoke: false
+
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+            bin_name: docforge-cli
+            smoke: true
+
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            bin_name: docforge-cli
+            smoke: true
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tar.gz
+            bin_name: docforge-cli
+            apt: musl-tools
+            linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+            linker: musl-gcc
+            smoke: true
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            bin_name: docforge-cli
+            apt: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+            smoke: false
+
+          - target: loongarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+            bin_name: docforge-cli
+            apt: gcc-loongarch64-linux-gnu
+            linker_env: CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: loongarch64-linux-gnu-gcc
+            smoke: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Install cross-compile linker (Linux)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - name: Export cross linker env
+        if: matrix.linker_env != ''
+        shell: bash
+        run: echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Build docforge-cli (all formats via --features cli)
+        run: cargo build --release --features cli --bin docforge-cli --target ${{ matrix.target }}
+
+      - name: Smoke test native binary
+        if: matrix.smoke == true
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          "$BIN" --version
+          "$BIN" --help
+          "$BIN" --list-formats
+
+      - name: Determine release label
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VER="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            VER="${{ inputs.tag }}"
+          else
+            VER="${GITHUB_SHA::7}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=docforge-cli-${VER}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Unix tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          PKG="${{ steps.meta.outputs.pkg_name }}"
+          mkdir -p "dist/${PKG}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "dist/${PKG}/"
+          cp README.md THIRD_PARTY_NOTICES.md skills/docforge/SKILL.md "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          rm -rf "dist/${PKG}"
+
+      - name: Package (Windows zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $pkg = "${{ steps.meta.outputs.pkg_name }}"
+          $dir = "dist/$pkg"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$dir/"
+          Copy-Item "README.md", "THIRD_PARTY_NOTICES.md", "skills/docforge/SKILL.md" "$dir/"
+          Compress-Archive -Path "$dir" -DestinationPath "dist/$pkg.zip" -Force
+          Remove-Item -Recurse -Force "$dir"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docforge-cli-${{ matrix.target }}
+          path: dist/docforge-cli-*
+          if-no-files-found: error
+
+  release:
+    name: publish github release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum docforge-cli-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/docforge-cli-*
+            dist/SHA256SUMS.txt

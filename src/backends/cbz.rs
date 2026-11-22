@@ -103,6 +103,7 @@ impl ParseCapability for CbzRawBackend {
         })?;
         let mut zip = zip::ZipArchive::new(file)
             .map_err(|e| DocError::corrupt(format!("CBZ 打开失败（非 ZIP）: {e}")))?;
+        crate::limits::check_entry_count(zip.len(), "CBZ ZIP")?;
         // 收集图片条目（目录跳过；扩展名白名单）。file_names 的条目是
         // ZipResult<Cow<str>>（UTF-8 标志位异常的条目跳过即可）
         let mut names: Vec<String> = zip
@@ -118,13 +119,12 @@ impl ParseCapability for CbzRawBackend {
         names.sort_by(|a, b| natural_cmp(a, b));
 
         let mut pages = Vec::with_capacity(names.len());
+        let mut budget = crate::limits::ByteBudget::archive_default();
         for name in &names {
-            let mut f = zip
+            let f = zip
                 .by_name(name)
                 .map_err(|e| DocError::corrupt(format!("CBZ 读取 {name} 失败: {e}")))?;
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut f, &mut data)
-                .map_err(|e| DocError::corrupt(format!("CBZ 读取 {name} 失败: {e}")))?;
+            let data = budget.read_entry(f, name)?;
             let ext = name
                 .rsplit_once('.')
                 .map(|(_, e)| e.to_ascii_lowercase())

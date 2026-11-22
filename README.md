@@ -1,9 +1,10 @@
 # docforge
 
-通用文档解析 crate：docparser 式统一块级 IR + 格式路由（magic 嗅探 + 后端回退链）
-+ **PDF 页级混合路由**（逐页判定"文字层直提 vs 渲染+OCR"，设计参考 rumi-ocr 的
-pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译友好分段，
-服务解析转换、OCR、翻译三类消费者。独立项目，与 rumi-ocr 无依赖关系。
+通用文档解析 crate 与 CLI：docparser 式统一块级 IR + 格式路由（有界 magic 嗅探 +
+后端回退链）+ **PDF 页级混合路由**（逐页判定"文字层直提 vs 渲染+OCR"，设计参考
+rumi-ocr 的 pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / GFM /
+Google OKF v0.3（含图片资产与目录索引）/ 翻译友好分段，服务解析转换、知识库构建、
+OCR、翻译四类消费者。独立项目，与 rumi-ocr 无依赖关系。
 
 ## 状态
 
@@ -21,29 +22,30 @@ pdf_route）。OCR 置信度与块来源进 IR；输出 JSON / Markdown / 翻译
 | 痛点收口轮 | **表格进翻译流**（单元格级单元 + docx/html/epub/odt 格内回写替换）、极简 docx 产行块、块级语言检测（`lang_detect_per_block`）、流式回写会话（`WritebackSession`）、PDF 附录载荷、公开 benchmark（[BENCHMARK.md](BENCHMARK.md)）、非 UTF-8 路径全链路（`AsRef<Path>` + CLI `args_os`） | ✅ |
 | rumi 接入轮 | **xlsx 回写器**（格单元 inlineStr 改写 + 译文 sheet 附录，翻译闭环第八格式）、**EPUB 部件交替**（`writeback_epub_alternating`：spine 每部件后插纯译文部件，真·一页原文一页译文）、防幻觉事实谓词（`has_translatable_text`：纯数字/单位/版本号单元不送引擎，策略归消费者）、docx 表格译段小字号（9pt） | ✅ |
 | PDF 翻译优化 | **docx 节交替**（`writeback_docx_alternating`：分节符/分页符切段，PageAlt 在 Word 的近似，节属性逐字节保真）、**跨页重复块标记**（`running-detect` 处理链：同文本每页同位置 → `meta["running"]` + header/footer 区域，`TranslationUnit.running` 携带、附录默认跳过——页眉页脚不再翻 N 遍灌满附录） | ✅ |
+| 知识库与老式 Office 轮 | **统一资源安全护栏**（`limits` 防 ZIP/XML 炸弹 + `router::sniff` 有界头探测与 OLE/ZIP 内容嗅探 + 确定性变异鲁棒测试）、**数学公式转 LaTeX**（零依赖 `math` 模块，OMML/MathML → `$...$`/`$$...$$`，覆盖 docx/odt/html/epub；docx `styles.xml` `basedOn`/`outlineLvl` 继承链）、**GFM & Google OKF v0.3 输出**（`emit::to_gfm` + `okf` 模块，含 YAML 1.2 frontmatter / 图片去重落盘 `assets/` / 递归 `index.md`）、**老式二进制 Office**（吸收 `firecrawl/anydoc` 0.2.5：`doc`/`ppt`/`xls`/`xlsb` 4 细粒度 + `legacy-office` 聚合）、**7 平台 CLI CI 发布** | ✅ |
 
 环境限制（OCR 运行时验证需 pdftoppm + 模型缓存，本机金测用 mock 引擎 +
 ghostscript shim；详见 docs/开发记录.md）。
 
 ## 快速上手
 
-按场景三行依赖声明（文本族随 `default` 自带，见节末说明）：
+按场景依赖声明（文本族随 `default` 自带，见节末说明）：
 
 ```toml
 # 翻译管线：TXT 中文编码链 + 源语言检测 + docx / epub / pdf 文字层
 docforge = { version = "0.1", default-features = false, features = ["encoding", "lang-detect", "docx", "epub", "pdf"] }
 
-# OCR 扫描件：pdf 页级路由 + oar OCR 引擎（ocr-oar 已含 pdf 与 ocr，开箱即用）
-docforge = { version = "0.1", features = ["ocr-oar"] }
+# 老式 Office 按需开启（4 细粒度 doc / ppt / xls / xlsb，或一键 legacy-office）
+docforge = { version = "0.1", features = ["legacy-office"] }
 
-# 全格式解析转换
-docforge = { version = "0.1", features = ["docx", "xlsx", "pptx", "odf", "epub", "fb2", "mobi", "chm", "cbz", "djvu", "pdf", "ocr-oar", "archive", "image-files", "encoding", "lang-detect", "json"] }
+# 全格式解析转换（纯 Rust 零 C 编译依赖）
+docforge = { version = "0.1", features = ["docx", "xlsx", "pptx", "legacy-office", "odf", "epub", "fb2", "mobi", "chm", "cbz", "djvu", "pdf", "archive", "image-files", "encoding", "lang-detect", "json"] }
 ```
 
-三个场景的 parse + emit：
+典型场景的 parse + emit：
 
 ```rust
-use docforge::{emit, parse, BlockSource};
+use docforge::{emit, okf, parse, BlockSource};
 
 // 翻译：解析 → 翻译单元（id 即译后回写锚点，chapter 供术语一致性）
 let doc = parse("book.epub")?;
@@ -57,11 +59,40 @@ for b in doc.blocks().filter(|b| b.source == BlockSource::Ocr) {
     println!("[置信度 {:?}] {}", b.confidence, b.content);
 }
 
-// 全格式转换：任意件 → JSON / Markdown
+// 全格式转换：任意件 → JSON / Markdown / GFM / Google OKF v0.3
 let doc = parse("report.docx")?;
 println!("{}", emit::to_json_pretty(&doc));
-println!("{}", emit::to_markdown(&doc));
+println!("{}", emit::to_gfm(&doc));
+let okf_concept = okf::to_okf_concept(&doc, &okf::OkfOptions::default());
+println!("{}", okf_concept.markdown);
 ```
+
+## CLI 用法（`docforge-cli`）
+
+`docforge-cli` 默认通过 `cli` feature 开启全部纯 Rust 格式后端（`docx`/`xlsx`/`pptx`/`doc`/`ppt`/`xls`/`xlsb`/`odt`/`ods`/`odp`/`pdf`/`epub`/`fb2`/`mobi`/`azw3`/`chm`/`cbz`/`djvu`/`zip`/`rar`/`7z`/`txt`/`md`/`csv`/`html`/`rtf`/字幕/图像），专注文档格式转换，仅输出 **`gfm`**（默认）或 **`okf`**（Google Open Knowledge Format v0.3）；Agent 技能说明见 [skills/docforge/SKILL.md](skills/docforge/SKILL.md)：
+
+```bash
+# 从源码构建全格式 CLI
+cargo build --release --features cli --bin docforge-cli
+
+# 查看已支持的全部输入格式
+docforge-cli --list-formats
+
+# 转为标准 GitHub-Flavored Markdown（默认格式，含 OMML/MathML → LaTeX 公式）
+docforge-cli report.docx -o report.md
+
+# 转为 Google Open Knowledge Format (OKF v0.3)：
+# 生成带 YAML 1.2 frontmatter 的文档 + assets/ 去重图片资产 + 根目录 index.md
+docforge-cli report.docx --format okf --out-dir ./kb
+
+# 批量目录转换（保持目录树并递归生成各级 index.md 成为完整 Knowledge Bundle）
+docforge-cli ./docs_dir --format okf --okf-type Reference --out-dir ./kb
+```
+
+GitHub Releases 提供 7 个平台的预编译静态/原生 CLI 包（见 `.github/workflows/release.yml`）：
+- Windows: `x86_64-pc-windows-msvc`
+- macOS: `x86_64-apple-darwin`, `aarch64-apple-darwin`
+- Linux: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `loongarch64-unknown-linux-gnu`
 
 翻译闭环（提取 → 翻译 → 回写，表格按单元格进流，锚点 `p{页}-b{块}-r{行}c{列}`）：
 
@@ -125,6 +156,5 @@ writeback::writeback_docx("spec.docx", &translated, BiStrategy::TranslationOnly,
 
 ## 许可
 
-MIT OR Apache-2.0。吸收自 docparser 家族与 document-parser 的源码见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)（源码以 crates.io 存档为准，
-随库于 `vendor/*.crate`）。
+MIT OR Apache-2.0。吸收自 docparser 家族、document-parser 与 firecrawl/anydoc（0.2.5，MIT）的源码见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

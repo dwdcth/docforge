@@ -160,6 +160,246 @@ pub fn to_markdown(doc: &Document) -> String {
     out.join("\n\n")
 }
 
+/// GitHub-Flavored Markdown（GFM）渲染：比基础 [`to_markdown`] 更严谨，面向 LLM/RAG 与 OKF。
+///
+/// 增强点：
+/// - 表格单元格转义 `|` 并将内部换行转为 `<br>`（防止多行单元格撕裂 GFM 表）；
+/// - 代码块围栏按内容内最大反引号连续长度动态升高（防嵌套 ```` ``` ```` 破坏代码块）；
+/// - 独立显示公式（`$$...$$`）按 GFM 块级公式规范换行输出；
+/// - `BlockKind::Note`（脚注/批注/备注）收集为文末 GFM 脚注 `[^n]`，不打断正文阅读流；
+/// - `BlockKind::Image` 携带 `meta["alt"]` 与 OCR 文本（在 OKF 模式下由 [`to_gfm_with_assets`]
+///   自动挂接相对 `assets/` 图片链接）。
+pub fn to_gfm(doc: &Document) -> String {
+    to_gfm_with_assets(doc, &[])
+}
+
+fn escape_gfm_cell(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+}
+
+fn gfm_code_fence(lang: Option<&str>, content: &str) -> String {
+    let mut max_run = 0usize;
+    let mut cur = 0usize;
+    for b in content.bytes() {
+        if b == b'`' {
+            cur += 1;
+            max_run = max_run.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence = "`".repeat((max_run + 1).max(3));
+    let lang = lang.unwrap_or_default().trim();
+    format!("{fence}{lang}\n{content}\n{fence}")
+}
+
+fn gfm_display_math(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.len() > 4 && t.starts_with("$$") && t.ends_with("$$") {
+        let inner = t[2..t.len() - 2].trim();
+        if !inner.is_empty() && !inner.contains("$$") {
+            return Some(format!("$$\n{inner}\n$$"));
+        }
+    }
+    None
+}
+
+/// 供 [`to_gfm`] 与 [`crate::okf::to_okf_concept`] 共用的 GFM 渲染核心。
+/// `page_assets[p]` 为第 `p` 页提取出的相对图片资产路径列表（空切片表示无落盘资产）。
+pub(crate) fn to_gfm_with_assets(doc: &Document, page_assets: &[Vec<String>]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut footnotes: Vec<String> = Vec::new();
+
+    for (p_idx, page) in doc.pages.iter().enumerate() {
+        let mut prev_list: Option<bool> = None;
+        let assets = page_assets.get(p_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut asset_cursor = 0usize;
+
+        for b in page
+            .blocks
+            .iter()
+            .filter(|b| !b.content.is_empty() || b.table.is_some() || b.kind == BlockKind::Image)
+        {
+            if b.kind == BlockKind::Note {
+                prev_list = None;
+                let text = b.content.trim();
+                if !text.is_empty() {
+                    let region = b.meta.get("region").and_then(|v| match v {
+                        crate::model::MetaValue::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    });
+                    let idx = footnotes.len() + 1;
+                    let note_line = match region {
+                        Some(r) => format!("[^{idx}]: [{r}] {}", text.replace('\n', " ")),
+                        None => format!("[^{idx}]: {}", text.replace('\n', " ")),
+                    };
+                    footnotes.push(note_line);
+                }
+                continue;
+            }
+
+            let rendered = match b.kind {
+                BlockKind::Heading => {
+                    let lvl = (b.level.unwrap_or(1) as usize).clamp(1, 6);
+                    format!("{} {}", "#".repeat(lvl), b.content.trim())
+                }
+                BlockKind::List => {
+                    let prefix = if b.ordered.unwrap_or(false) { "1." } else { "-" };
+                    b.content
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| format!("{prefix} {}", l.trim()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+                BlockKind::Code => gfm_code_fence(b.lang.as_deref(), &b.content),
+                BlockKind::Table => b
+                    .table
+                    .as_ref()
+                    .map(|t| {
+                        let escaped: Vec<Vec<String>> = t
+                            .rows
+                            .iter()
+                            .map(|r| r.iter().map(|c| escape_gfm_cell(c)).collect())
+                            .collect();
+                        table_rows_md(&escaped)
+                    })
+                    .unwrap_or_default(),
+                BlockKind::Quote => b
+                    .content
+                    .lines()
+                    .map(|l| format!("> {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                BlockKind::Image => {
+                    let alt = b
+                        .meta
+                        .get("alt")
+                        .and_then(|v| match v {
+                            crate::model::MetaValue::Str(s) => Some(s.trim()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    if let Some(asset_path) = assets.get(asset_cursor) {
+                        asset_cursor += 1;
+                        let label = if alt.is_empty() { "image" } else { alt };
+                        let encoded = crate::okf::encode_uri_component(asset_path);
+                        let img_md = format!("![{label}]({encoded})");
+                        if b.content.trim().is_empty() {
+                            img_md
+                        } else {
+                            format!("{img_md}\n\n> {}", b.content.trim().replace('\n', "\n> "))
+                        }
+                    } else if !alt.is_empty() && !b.content.trim().is_empty() {
+                        format!("[image: {alt}] {}", b.content.trim())
+                    } else if !alt.is_empty() {
+                        format!("[image: {alt}]")
+                    } else if !b.content.trim().is_empty() {
+                        format!("[image] {}", b.content.trim())
+                    } else {
+                        "[image]".to_string()
+                    }
+                }
+                BlockKind::Paragraph => {
+                    gfm_display_math(&b.content).unwrap_or_else(|| b.content.clone())
+                }
+                _ => b.content.clone(),
+            };
+
+            if rendered.is_empty() {
+                continue;
+            }
+            if b.kind == BlockKind::List {
+                let ordered = b.ordered.unwrap_or(false);
+                if prev_list == Some(ordered) {
+                    if let Some(last) = out.last_mut() {
+                        last.push('\n');
+                        last.push_str(&rendered);
+                    }
+                    continue;
+                }
+                prev_list = Some(ordered);
+            } else {
+                prev_list = None;
+            }
+            out.push(rendered);
+        }
+
+        // 本页未对应到 Image 块的剩余落盘图片（如 PDF keep_raster_pages / FB2 / XLSX 图）
+        while asset_cursor < assets.len() {
+            let asset_path = &assets[asset_cursor];
+            let encoded = crate::okf::encode_uri_component(asset_path);
+            out.push(format!(
+                "![Page {} image {}]({encoded})",
+                p_idx + 1,
+                asset_cursor + 1
+            ));
+            asset_cursor += 1;
+        }
+    }
+
+    if !footnotes.is_empty() {
+        out.push(footnotes.join("\n"));
+    }
+    out.join("\n\n")
+}
+
+#[cfg(test)]
+mod gfm_tests {
+    use super::*;
+    use crate::model::{Block, MetaValue, Page, TableData};
+
+    #[test]
+    fn gfm_escapes_multiline_table_cells_and_raises_code_fence_and_renders_math_notes() {
+        let doc = Document {
+            pages: vec![Page {
+                blocks: vec![
+                    Block {
+                        kind: BlockKind::Table,
+                        table: Some(TableData {
+                            rows: vec![
+                                vec!["K".into(), "V".into()],
+                                vec!["a|b".into(), "line1\nline2".into()],
+                            ],
+                            header_rows: 1,
+                        }),
+                        ..Default::default()
+                    },
+                    Block {
+                        kind: BlockKind::Code,
+                        lang: Some("md".into()),
+                        content: "```rs\nfn x(){}\n```".into(),
+                        ..Default::default()
+                    },
+                    Block {
+                        kind: BlockKind::Paragraph,
+                        content: "$$E = mc^2$$".into(),
+                        ..Default::default()
+                    },
+                    Block {
+                        kind: BlockKind::Note,
+                        content: "页脚注释".into(),
+                        meta: [("region".into(), MetaValue::Str("footnote".into()))]
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gfm = to_gfm(&doc);
+        assert!(gfm.contains("| a\\|b | line1<br>line2 |"), "{gfm}");
+        assert!(gfm.contains("````md\n```rs\nfn x(){}\n```\n````"), "{gfm}");
+        assert!(gfm.contains("$$\nE = mc^2\n$$"), "{gfm}");
+        assert!(gfm.contains("[^1]: [footnote] 页脚注释"), "{gfm}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 翻译友好输出（docparse-plan §9）：段落级工作单元，带稳定 ID 与章节上下文
 // ---------------------------------------------------------------------------

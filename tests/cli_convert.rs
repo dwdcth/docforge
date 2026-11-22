@@ -1,28 +1,10 @@
-//! docforge-cli 集成测试：格式转换批处理语义（多输入 / 目录递归 / --out-dir / chunks / 格式清单）。
-//!
-//! bin `docforge-cli` 的 `required-features = ["json"]`，因此测试需在
-//! `--features json` 下运行：`cargo test --features json --test cli_convert`。
-//!
-//! Cargo.toml 增量（主管接线；加上后 default `cargo test` 会整体跳过本目标）：
-//!
-//! ```toml
-//! [[test]]
-//! name = "cli_convert"
-//! path = "tests/cli_convert.rs"
-//! required-features = ["json"]
-//! ```
-//!
-//! 本文件同时以 `#![cfg(feature = "json")]` 自门控：在 [[test]] 接线生效前的
-//! 过渡期，default `cargo test`（无 json feature）会把整个文件编译为空
-//!（env! CARGO_BIN_EXE 不会被求值），保持全绿；`--features json` 下照常运行。
-//! 临时文件放 temp_dir + pid 子目录，测试结束清理。
+//! docforge-cli 集成测试：全格式文档转换（仅输出 GFM 与 Google OKF v0.3）。
 
-#![cfg(feature = "json")]
+#![cfg(feature = "cli")]
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// 临时目录：temp_dir + pid 子目录（各测试互不干扰），先清同名残留。
 fn tmp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("docforge_cli_{}_{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -30,7 +12,6 @@ fn tmp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// 起子进程跑 CLI，返回 (退出码, stdout, stderr)。
 fn run_cli(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_docforge-cli"))
         .args(args)
@@ -43,27 +24,25 @@ fn run_cli(args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// 单文件 → md → stdout：退出 0，stdout 含 Markdown 标题。
+/// 默认输出格式为 GFM：单文件直接输出到 stdout，退出码 0。
 #[test]
-fn single_file_to_md_stdout() {
-    let dir = tmp_dir("single");
-    let file = dir.join("note.md");
-    std::fs::write(&file, "# 标题\n\n正文段落。\n").unwrap();
+fn single_file_defaults_to_gfm_stdout() {
+    let dir = tmp_dir("default_gfm");
+    let file = dir.join("spec.md");
+    std::fs::write(&file, "# 规格\n\n| 列A | 列B |\n|---|---|\n| 1 | 2 |\n").unwrap();
     let path = file.to_str().unwrap().to_string();
 
-    let (code, stdout, stderr) = run_cli(&[&path, "--format", "md"]);
-
+    let (code, stdout, stderr) = run_cli(&[&path]);
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(code, 0, "退出码应为 0，stderr: {stderr}");
-    assert!(stdout.contains("# "), "stdout 应含 Markdown 标题: {stdout}");
-    assert!(stdout.contains("标题"), "stdout 应含标题文本: {stdout}");
-    assert!(stdout.contains("正文段落"), "stdout 应含正文: {stdout}");
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("# 规格"), "{stdout}");
+    assert!(stdout.contains("| 列A | 列B |"), "{stdout}");
 }
 
-/// 目录批量 → --out-dir：3 文件含 1 个不支持扩展名 → out_dir 出现 2 个 .md，
-/// 退出码 2（部分失败），stderr 有失败行与汇总。
+/// 目录批量 → GFM `--out-dir`：3 文件含 1 个不支持扩展名 → 退出码 2（部分失败）。
 #[test]
-fn directory_batch_to_out_dir() {
+fn directory_batch_to_gfm_out_dir() {
     let dir = tmp_dir("batch");
     let out = tmp_dir("batch_out");
     std::fs::write(dir.join("a.md"), "# 甲\n\n第一段。\n").unwrap();
@@ -73,7 +52,7 @@ fn directory_batch_to_out_dir() {
     let (code, stdout, stderr) = run_cli(&[
         dir.to_str().unwrap(),
         "--format",
-        "md",
+        "gfm",
         "--out-dir",
         out.to_str().unwrap(),
     ]);
@@ -81,12 +60,7 @@ fn directory_batch_to_out_dir() {
     let md_count = std::fs::read_dir(&out)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "md")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
         .count();
     let a_ok = std::fs::read_to_string(out.join("a.md"))
         .map(|s| s.contains("甲"))
@@ -99,46 +73,119 @@ fn directory_batch_to_out_dir() {
 
     assert_eq!(code, 2, "部分失败应退出 2，stderr: {stderr}");
     assert_eq!(md_count, 2, "out_dir 应恰好有 2 个 .md");
-    assert!(a_ok && b_ok, "两个 md 输出内容应正确");
+    assert!(a_ok && b_ok, "两个 GFM 输出内容应正确");
     assert!(stderr.contains("c.xyz"), "stderr 应有不支持扩展名的失败行: {stderr}");
     assert!(stderr.contains("成功 2 / 失败 1"), "stderr 应有汇总: {stderr}");
     assert!(stdout.is_empty(), "批量模式不应写 stdout: {stdout}");
 }
 
-/// --format chunks：stdout 首行为 JSONL，含 block_ids 数组与 c0 锚点。
+/// 非 gfm/okf 输出格式应被拒绝（退出码 1）。
 #[test]
-fn chunks_format_jsonl() {
-    let dir = tmp_dir("chunks");
-    let file = dir.join("doc.md");
-    std::fs::write(&file, "# 第一章 夜行\n\n他提着灯走过长街。\n\n巷口的猫叫了一声。\n")
-        .unwrap();
+fn rejects_non_gfm_or_okf_format() {
+    let dir = tmp_dir("reject_fmt");
+    let file = dir.join("note.md");
+    std::fs::write(&file, "# 标题\n").unwrap();
     let path = file.to_str().unwrap().to_string();
 
-    let (code, stdout, stderr) = run_cli(&[&path, "--format", "chunks"]);
-
+    for fmt in ["json", "md", "text", "units", "chunks"] {
+        let (code, _stdout, stderr) = run_cli(&[&path, "--format", fmt]);
+        assert_eq!(code, 1, "格式 {fmt} 应拒绝，stderr: {stderr}");
+        assert!(stderr.contains("gfm | okf"), "stderr: {stderr}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(code, 0, "退出码应为 0，stderr: {stderr}");
-    let first = stdout.lines().next().unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(first)
-        .unwrap_or_else(|e| panic!("首行应为 JSON（JSONL）: {e}\n{stdout}"));
-    assert!(
-        v.get("block_ids").map(|x| x.is_array()).unwrap_or(false),
-        "首行应含 block_ids 数组: {v}"
-    );
-    assert_eq!(
-        v.get("id").and_then(|x| x.as_str()),
-        Some("c0"),
-        "首块锚点应为 c0: {v}"
-    );
-    assert!(v.get("text").is_some() && v.get("chapter").is_some(), "{v}");
 }
 
-/// --list-formats：退出 0，输出含默认组、feature 门控组与恒开的 txt。
+/// --help / --version / --list-formats 均以退出码 0 正常输出。
 #[test]
-fn list_formats_runs() {
+fn meta_flags_work() {
+    let (code, stdout, stderr) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("gfm|okf"), "{stdout}");
+
+    let (code, stdout, stderr) = run_cli(&["--version"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("docforge-cli "), "{stdout}");
+
     let (code, stdout, stderr) = run_cli(&["--list-formats"]);
-    assert_eq!(code, 0, "退出码应为 0，stderr: {stderr}");
-    assert!(stdout.contains("txt"), "应含恒开的 txt: {stdout}");
-    assert!(stdout.contains("[默认]"), "应含默认组标题: {stdout}");
-    assert!(stdout.contains("[feature 门控]"), "应含门控组标题: {stdout}");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for expected in ["docx", "doc", "ppt", "xls", "xlsb", "odt", "pdf", "epub", "gfm", "okf"] {
+        assert!(stdout.contains(expected), "缺少 {expected}: {stdout}");
+    }
+}
+
+/// --format okf 目录批量：生成标准 OKF v0.3 Bundle（根 index.md 含 okf_version，
+/// 子目录 index.md 无 frontmatter，保留名 index.md 自动避让为 index-doc.md）。
+#[test]
+fn directory_batch_to_okf_bundle() {
+    let dir = tmp_dir("okf_in");
+    let sub = dir.join("guides");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(dir.join("index.md"), "# 首页概览\n\n这是顶层说明文档。\n").unwrap();
+    std::fs::write(sub.join("deploy.md"), "# 部署手册\n\n按步骤完成服务上线。\n").unwrap();
+
+    let out = tmp_dir("okf_out");
+    let (code, _stdout, stderr) = run_cli(&[
+        dir.to_str().unwrap(),
+        "--format",
+        "okf",
+        "--okf-type",
+        "Playbook",
+        "--okf-title",
+        "Ops Knowledge",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+
+    let root_idx = std::fs::read_to_string(out.join("index.md")).unwrap_or_default();
+    let sub_idx = std::fs::read_to_string(out.join("guides/index.md")).unwrap_or_default();
+    let renamed = std::fs::read_to_string(out.join("index-doc.md")).unwrap_or_default();
+    let deploy = std::fs::read_to_string(out.join("guides/deploy.md")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(root_idx.starts_with("---\nokf_version: \"0.3\"\n"), "{root_idx}");
+    assert!(root_idx.contains("title: \"Ops Knowledge\""), "{root_idx}");
+    assert!(root_idx.contains("index-doc.md"), "{root_idx}");
+    assert!(root_idx.contains("guides/"), "{root_idx}");
+    assert!(!sub_idx.starts_with("---"), "子目录 index.md 不可带 frontmatter: {sub_idx}");
+    assert!(sub_idx.contains("deploy.md"), "{sub_idx}");
+    assert!(renamed.contains("type: \"Playbook\""), "{renamed}");
+    assert!(deploy.contains("type: \"Playbook\""), "{deploy}");
+    assert!(deploy.contains("generated: { by: \"docforge/"), "{deploy}");
+}
+
+/// --format okf 图片资产落盘：含图片时写出 assets/*.png 并在正文链接。
+#[test]
+fn okf_extracts_image_assets_to_disk() {
+    let dir = tmp_dir("okf_img_in");
+    let out = tmp_dir("okf_img_out");
+    let png_bytes: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    let img = dir.join("diagram.png");
+    std::fs::write(&img, png_bytes).unwrap();
+
+    let (code, _stdout, stderr) = run_cli(&[
+        img.to_str().unwrap(),
+        "--format",
+        "okf",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+
+    let md = std::fs::read_to_string(out.join("diagram.md")).unwrap_or_default();
+    let asset = out.join("assets/diagram-p1-img1.png");
+    let asset_ok = std::fs::read(&asset).map(|b| b == png_bytes).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(asset_ok, "图片资产应原样落盘到 assets/");
+    assert!(md.contains("assets/diagram-p1-img1.png"), "正文应链接图片资产: {md}");
+    assert!(md.contains("x-docforge-assets: 1"), "frontmatter 应记录资产数: {md}");
 }

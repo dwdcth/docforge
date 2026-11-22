@@ -148,6 +148,14 @@ mod tests {
     }
 
     #[test]
+    fn mathml_inside_paragraph_converts_to_latex() {
+        let p = page(
+            r#"<text:p>能量 <math xmlns="http://www.w3.org/1998/Math/MathML"><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></math> 成立</text:p>"#,
+        );
+        assert_eq!(p.items[0].text, "能量 $E=mc^{2}$ 成立");
+    }
+
+    #[test]
     fn table_with_repeated_cells() {
         let p = page(
             r#"<table:table table:name="T1"><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell><table:table-cell table:number-columns-repeated="2"><text:p>B</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell><text:p>1</text:p></table:table-cell><table:table-cell/><table:table-cell><text:p>3</text:p></table:table-cell></table:table-row></table:table>"#,

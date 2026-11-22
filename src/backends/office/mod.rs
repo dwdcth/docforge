@@ -701,7 +701,10 @@ pub(crate) fn zip_read_bytes(
 pub(crate) fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>> {
     let file = std::fs::File::open(path)
         .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
-    zip::ZipArchive::new(file).map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))
+    let zip =
+        zip::ZipArchive::new(file).map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+    crate::limits::check_entry_count(zip.len(), "OOXML ZIP")?;
+    Ok(zip)
 }
 
 pub(crate) fn zip_read_str(
@@ -709,10 +712,8 @@ pub(crate) fn zip_read_str(
     name: &str,
 ) -> Result<Option<String>> {
     match zip.by_name(name) {
-        Ok(mut f) => {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut f, &mut buf)
-                .map_err(|e| DocError::corrupt(format!("读取 {name} 失败: {e}")))?;
+        Ok(f) => {
+            let buf = crate::limits::read_bounded(f, crate::limits::MAX_ENTRY_BYTES, name)?;
             Ok(Some(String::from_utf8(buf).map_err(|e| {
                 DocError::corrupt(format!("{name} 不是 UTF-8: {e}"))
             })?))

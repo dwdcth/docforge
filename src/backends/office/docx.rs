@@ -97,10 +97,7 @@ impl DocxRawBackend {
     /// 替代独立的二次 XML 扫描（影子割接见 `writeback/docx.rs`）。crate 内用：
     /// 槽位表是 docx 回写专属契约，不进公共 API 面。
     pub(crate) fn parse_with_spans(&self, path: &Path) -> Result<(RawDoc, DocxSlotSidecar)> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
-        let mut zip = zip::ZipArchive::new(file)
-            .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+        let mut zip = super::open_zip(path)?;
 
         let xml = zip_read_str(&mut zip, "word/document.xml")?
             .ok_or_else(|| DocError::corrupt("missing word/document.xml"))?;
@@ -737,6 +734,28 @@ fn extract_para<R: std::io::BufRead>(
                     // 缺陷①：Fallback 是 Choice 的同内容 VML 镜像，整树跳过
                     // （Enter 置 1 / 配对清零由整树消费等价实现，主循环深度不增减）
                     TAG_FALLBACK => skip_subtree(reader)?,
+                    // Wave 2：OMML 公式转 LaTeX（整树捕获消费，主循环深度不增减；
+                    // 同步置 has_non_text_inline 保护回写侧走保真路径，不污染 wt_spans）
+                    "oMathPara" => {
+                        spans.has_non_text_inline = true;
+                        let elem = crate::math::xml::capture_from_quick_xml(reader, e)?;
+                        let lines = crate::math::omath_para_to_tex(&elem);
+                        if !lines.is_empty() {
+                            out.push_str("$$");
+                            out.push_str(&lines.join(" \\\\ "));
+                            out.push_str("$$");
+                        }
+                    }
+                    "oMath" => {
+                        spans.has_non_text_inline = true;
+                        let elem = crate::math::xml::capture_from_quick_xml(reader, e)?;
+                        let tex = crate::math::omath_to_tex(&elem);
+                        if !tex.is_empty() {
+                            out.push('$');
+                            out.push_str(&tex);
+                            out.push('$');
+                        }
+                    }
                     super::tags::W_T => {
                         in_t = true;
                         wt_open = Some(pos_before);
@@ -1186,44 +1205,99 @@ fn attr_val(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
     attr_by(e, super::tags::VAL)
 }
 
-/// `word/styles.xml` 的 styleId → 标题层级映射（docforge M2 收尾补丁）。
+/// `word/styles.xml` 的 styleId → 标题层级映射（含 `basedOn` 继承链与 `outlineLvl`）。
 ///
-/// zh-CN Word 常用**数字 styleId**（`<w:pStyle w:val="1"/>`，样式名才是
-/// `heading 1`）——只看 styleId 会漏判。此表以 `<w:name w:val>` 判定，
-/// 与 [`heading_level_from_style`] 同语义。解析失败按空表处理（不阻断）。
+/// 规则对齐 ECMA-376 与 `firecrawl/anydoc` `styles.rs`：
+/// 1. 样式自身 `<w:name w:val>` 命中 `heading N` / `标题 N` / `title` → 对应层级；
+/// 2. 样式自身 `<w:pPr><w:outlineLvl w:val="N"/>`：`N < 9` → `N + 1` 级，`N >= 9`（正文）
+///    显式终止继承（不继续向父样式查找）；
+/// 3. 否则沿 `<w:basedOn w:val>` 向上继承（环保护上限 32 层）。
+///
+/// 解析失败按空表处理（不阻断）。
 fn parse_styles_heading_map(xml: &str) -> HashMap<String, u8> {
-    let mut map = HashMap::new();
+    #[derive(Default)]
+    struct StyleDef {
+        name: Option<String>,
+        based_on: Option<String>,
+        outline_lvl: Option<u8>,
+    }
+
+    let mut defs: HashMap<String, StyleDef> = HashMap::new();
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
     let mut cur_id: Option<String> = None;
+    let mut cur = StyleDef::default();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local_name = e.name().local_name();
                 let local = local_name.as_ref();
-                if local == super::tags::W_PSTYLE || local == "style" {
-                    // style 声明元素（w:style）；pStyle 不会出现在 styles.xml 顶层，双保险跳过
-                    if let Some(id) = attr_by(e, "styleId") {
-                        if local == "style" {
+                match local {
+                    "style" => {
+                        if let Some(id) = attr_by(e, "styleId") {
                             cur_id = Some(id);
+                            cur = StyleDef::default();
                         }
                     }
-                } else if local == "name" {
-                    if let (Some(id), Some(name)) = (cur_id.clone(), attr_val(e)) {
-                        if let Some(level) = heading_level_from_style(&name) {
-                            map.insert(id, level);
+                    "name" if cur_id.is_some() => {
+                        if let Some(name) = attr_val(e) {
+                            cur.name = Some(name);
                         }
                     }
+                    "basedOn" if cur_id.is_some() => {
+                        if let Some(parent) = attr_val(e) {
+                            cur.based_on = Some(parent);
+                        }
+                    }
+                    super::tags::W_OUTLINE_LVL if cur_id.is_some() => {
+                        if let Some(v) = attr_val(e).and_then(|s| s.parse::<u8>().ok()) {
+                            cur.outline_lvl = Some(v);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(Event::End(ref e)) if e.name().local_name().as_ref() == "style" => {
-                cur_id = None;
+                if let Some(id) = cur_id.take() {
+                    defs.insert(id, std::mem::take(&mut cur));
+                }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
         }
         buf.clear();
+    }
+
+    let mut map = HashMap::new();
+    for start_id in defs.keys() {
+        let mut cursor: Option<&str> = Some(start_id.as_str());
+        let mut resolved: Option<u8> = None;
+        for _ in 0..32 {
+            let Some(id) = cursor else { break };
+            let Some(def) = defs.get(id) else { break };
+            if let Some(ref name) = def.name {
+                if let Some(lvl) = heading_level_from_style(name) {
+                    resolved = Some(lvl);
+                    break;
+                }
+                if name.eq_ignore_ascii_case("title") {
+                    resolved = Some(1);
+                    break;
+                }
+            }
+            if let Some(ol) = def.outline_lvl {
+                if ol < 9 {
+                    resolved = Some((ol + 1).clamp(1, 9));
+                }
+                // outlineLvl >= 9（正文）显式终止继承
+                break;
+            }
+            cursor = def.based_on.as_deref();
+        }
+        if let Some(lvl) = resolved {
+            map.insert(start_id.clone(), lvl);
+        }
     }
     map
 }
@@ -2570,5 +2644,61 @@ mod styles_map_tests {
     fn styles_map_corrupt_xml_yields_empty() {
         let map = parse_styles_heading_map("<w:styles 未闭合");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn styles_map_follows_based_on_and_outline_lvl_and_breaks_cycles() {
+        let xml = r#"
+<w:styles xmlns:w="urn:x">
+  <w:style w:styleId="H2"><w:name w:val="heading 2"/></w:style>
+  <w:style w:styleId="Mid"><w:name w:val="CustomMid"/><w:basedOn w:val="H2"/></w:style>
+  <w:style w:styleId="Leaf"><w:name w:val="CustomLeaf"/><w:basedOn w:val="Mid"/></w:style>
+  <w:style w:styleId="Reset"><w:name w:val="BodyLike"/><w:basedOn w:val="H2"/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>
+  <w:style w:styleId="ByOutline"><w:name w:val="SectionX"/><w:pPr><w:outlineLvl w:val="2"/></w:pPr></w:style>
+  <w:style w:styleId="DocTitle"><w:name w:val="Title"/></w:style>
+  <w:style w:styleId="CycA"><w:basedOn w:val="CycB"/></w:style>
+  <w:style w:styleId="CycB"><w:basedOn w:val="CycA"/></w:style>
+</w:styles>"#;
+        let map = parse_styles_heading_map(xml);
+        assert_eq!(map.get("Leaf"), Some(&2), "两跳 basedOn 继承 heading 2");
+        assert_eq!(map.get("Reset"), None, "outlineLvl=9 显式终止继承");
+        assert_eq!(map.get("ByOutline"), Some(&3), "outlineLvl=2 对应 3 级标题");
+        assert_eq!(map.get("DocTitle"), Some(&1), "Title 映射 1 级标题");
+        assert_eq!(map.get("CycA"), None, "循环继承安全退出");
+    }
+
+    #[test]
+    fn docx_omml_inline_and_display_convert_to_latex_preserving_writeback_flag() {
+        let doc = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><w:body>
+            <w:p><w:r><w:t>令 </w:t></w:r><m:oMath><m:f><m:num><m:r><m:t>a</m:t></m:r></m:num><m:den><m:r><m:t>b</m:t></m:r></m:den></m:f></m:oMath><w:r><w:t> 为真</w:t></w:r></w:p>
+            <w:p><m:oMathPara><m:oMath><m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:oMath></m:oMathPara></w:p>
+        </w:body></w:document>"#;
+        let (nodes, sidecar) =
+            docx_raw_text_with_slots(doc, &Numbering::default(), &HashMap::new()).unwrap();
+        let items: Vec<_> = nodes
+            .into_iter()
+            .filter_map(|n| match n {
+                DocxNode::Item(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, r"令 $\frac{a}{b}$ 为真");
+        assert_eq!(items[1].text, r"$$x^{2}$$");
+        // 回写保真守卫：含公式段落置 has_non_text_inline 且 m:t 不污染 wt_spans
+        match &sidecar.slots[0] {
+            DocxSlot::Para(sp) => {
+                assert!(sp.has_non_text_inline);
+                assert_eq!(sp.wt_spans.len(), 2, "只记 w:t，不收 m:t");
+            }
+            _ => panic!("expected Para slot"),
+        }
+        match &sidecar.slots[1] {
+            DocxSlot::Para(sp) => {
+                assert!(sp.has_non_text_inline);
+                assert!(sp.wt_spans.is_empty(), "纯公式段无 w:t 槽位");
+            }
+            _ => panic!("expected Para slot"),
+        }
     }
 }

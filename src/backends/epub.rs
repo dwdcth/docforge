@@ -17,7 +17,6 @@
 //! 图片/字体等资源不解包（只记录封面路径）。
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -444,7 +443,9 @@ pub(crate) fn resolve(base: &str, href: &str) -> String {
 fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>> {
     let f =
         std::fs::File::open(path).map_err(|e| DocError::corrupt(format!("EPUB 打不开: {e}")))?;
-    zip::ZipArchive::new(f).map_err(|e| DocError::corrupt(format!("EPUB 打不开: {e}")))
+    let zip = zip::ZipArchive::new(f).map_err(|e| DocError::corrupt(format!("EPUB 打不开: {e}")))?;
+    crate::limits::check_entry_count(zip.len(), "EPUB ZIP")?;
+    Ok(zip)
 }
 
 fn read_entry(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<Option<String>> {
@@ -460,10 +461,8 @@ fn read_entry_bytes(
     name: &str,
 ) -> Result<Option<Vec<u8>>> {
     match zip.by_name(name) {
-        Ok(mut f) => {
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)
-                .map_err(|e| DocError::corrupt(format!("读取 {name} 失败: {e}")))?;
+        Ok(f) => {
+            let buf = crate::limits::read_bounded(f, crate::limits::MAX_ENTRY_BYTES, name)?;
             Ok(Some(buf))
         }
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
@@ -887,7 +886,12 @@ impl EpubPlugin {
 
 /// 注册 EPUB 后端与插件。
 pub fn register_defaults(reg: &mut Registry) {
-    let _ = reg.register_parse(Arc::new(EpubRawBackend::default()), None);
+    register_with_ocr_images(reg, false);
+}
+
+/// 注册 EPUB 后端与插件（可选开启内嵌图片字节提取）。
+pub fn register_with_ocr_images(reg: &mut Registry, ocr_images: bool) {
+    let _ = reg.register_parse(Arc::new(EpubRawBackend { ocr_images }), None);
     reg.register_plugin(Arc::new(EpubPlugin));
 }
 

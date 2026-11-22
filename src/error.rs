@@ -7,11 +7,12 @@ use std::fmt;
 /// 全局统一错误码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
-    Encrypted,   // 加密 / 权限受限
-    Corrupt,     // 文件损坏 / 后端链耗尽
-    Unsupported, // 格式不支持 / 伪装
-    Timeout,     // 单文件 / 单页超时
-    NativeCrash, // 底层 native 崩溃
+    Encrypted,     // 加密 / 权限受限
+    Corrupt,       // 文件损坏 / 后端链耗尽
+    Unsupported,   // 格式不支持 / 伪装
+    ResourceLimit, // 触发资源安全限额（解压炸弹 / 嵌套过深 / 展开超限）
+    Timeout,       // 单文件 / 单页超时
+    NativeCrash,   // 底层 native 崩溃
     Unknown,
 }
 
@@ -21,6 +22,7 @@ impl ErrorCode {
             ErrorCode::Encrypted => "encrypted",
             ErrorCode::Corrupt => "corrupt",
             ErrorCode::Unsupported => "unsupported",
+            ErrorCode::ResourceLimit => "resource_limit",
             ErrorCode::Timeout => "timeout",
             ErrorCode::NativeCrash => "native_crash",
             ErrorCode::Unknown => "unknown",
@@ -58,6 +60,9 @@ impl DocError {
     }
     pub fn unsupported(m: impl Into<String>) -> Self {
         Self::new(ErrorCode::Unsupported, m)
+    }
+    pub fn resource_limit(m: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ResourceLimit, m)
     }
     pub fn timeout(m: impl Into<String>) -> Self {
         Self::new(ErrorCode::Timeout, m)

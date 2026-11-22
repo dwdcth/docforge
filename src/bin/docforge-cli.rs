@@ -1,4 +1,4 @@
-//! docforge-cli：通用文档解析与格式转换命令行（多输入 / 目录递归 / 批量转换）。
+//! docforge-cli：全格式文档转换命令行（专注输出 GFM 或 Google OKF v0.3）。
 //!
 //! # 用法
 //!
@@ -6,329 +6,242 @@
 //! docforge-cli <输入>... [选项]
 //! ```
 //!
-//! 输入为文件或目录（可多个混用）：目录递归收集当前构建支持格式的文件
+//! 输入为文件或目录（可多个混用）：目录递归收集支持格式的文件
 //!（扩展名白名单 `SUPPORTED_EXTENSIONS`；隐藏项（`.` 开头）与 `target/`、
 //! `node_modules/` 跳过；其余非隐藏文件按「不支持扩展名」计为失败并在
 //! stderr 报告，不静默丢文件）。显式给出的单个文件不受白名单过滤
-//!（router 兜底按纯文本解析，用户显式指定即用户意图）。
+//!（router 按内容嗅探并兜底按纯文本解析）。
 //!
 //! 选项：
 //!
 //! ```text
-//!   --format md|json|text|units|chunks   输出格式（默认 md）
-//!       md      Markdown（表格渲染为 Markdown 表）
-//!       json    完整 IR（缩进美化）
-//!       text    纯文本
-//!       units   翻译单元 JSONL（id/page/kind/text/source/confidence/lang/chapter/header/running）
-//!       chunks  RAG 检索块 JSONL（id/page/chapter/text/block_ids）
-//!   --ocr auto|on|off    PDF OCR 模式（默认 auto；需 pdf feature）
-//!   --out <文件>         输出到文件（仅单输入；默认 stdout）
-//!   --out-dir <目录>     批量输出目录（多输入/目录时必需）：
-//!                        保持相对各输入根的目录结构；输出扩展名随格式
-//!                       （md→.md json→.json text→.txt units/chunks→.jsonl）；
-//!                        同 stem 冲突时拼接原扩展去重（见 unique_target）
-//!   --list-formats       打印支持的输入格式（default / feature 门控两组）后退出
+//!   -f, --format gfm|okf   输出格式（默认 gfm）
+//!       gfm                GitHub-Flavored Markdown（严格表格转义/动态代码围栏/LaTeX 公式/脚注）
+//!       okf                Google Open Knowledge Format v0.3（YAML 1.2 frontmatter + GFM +
+//!                          assets/ 去重图片资产 + 目录批量递归 index.md Knowledge Bundle）
+//!   --okf-type <类型>      OKF frontmatter 的 type 字段（默认 Document）
+//!   --okf-title <标题>     OKF 单文档标题或 Bundle 根标题
+//!   -o, --out <文件>       输出到文件（仅单输入；默认 stdout）
+//!   --out-dir <目录>       批量输出目录（多输入/目录时必需；单文件走 OKF 时亦会生成根目录 index.md）
+//!   --list-formats         打印支持的输入格式后退出
+//!   -h, --help             显示帮助信息
+//!   -V, --version          显示版本号
 //! ```
 //!
-//! 批量语义：逐文件转换，单文件失败继续（stderr 记 `文件: 错误`），结束
-//! 汇总 `成功 N / 失败 M`；进度行打 stderr（`[3/12] xx.md`）。
 //! 退出码：0 = 全部成功；1 = 参数错误或全部失败；2 = 部分失败。
-//!
-//! # 示例
-//!
-//! ```text
-//! docforge-cli note.md --format md                    # 单文件 → stdout
-//! docforge-cli docs/ --format md --out-dir out/       # 目录递归批量转 md
-//! docforge-cli a.pdf b.docx --format chunks --out-dir out/   # 多输入转 RAG 块
-//! ```
-//!
-//! 编译能力随 crate feature：文本族默认；--features encoding 补中文编码；
-//! --features pdf,ocr-oar 补 PDF 页级路由与 OCR。手写参数解析（零依赖）。
 
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 目录递归收集的扩展名白名单（小写、不含点）。
-///
-/// 静态清单，与 crate 支持的输入格式同步维护——**新增格式后更新此处**
-///（router::sniff 按文件内容判格式，目录遍历只能按扩展名预筛）。
-/// 未列入的非隐藏文件在批量模式下按失败报告（不静默跳过，避免丢文件）。
-/// legacy OLE（doc/ppt/xls）当前无后端插件（router 可路由但无注册方），
-/// 不在清单内。
+/// 目录递归收集的扩展名白名单（小写、不含点，由 `cli` feature 保证全格式已编译）。
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    // 恒开：txt 底座 + 字幕（无第三方依赖，随 txt 始终注册）
-    "txt",
-    "srt",
-    "vtt",
-    "ass",
-    "ssa",
-    #[cfg(feature = "md")]
-    "md",
-    "markdown",
-    #[cfg(feature = "csv")]
-    "csv",
-    #[cfg(feature = "html")]
-    "html",
-    "htm",
-    #[cfg(feature = "rtf")]
-    "rtf",
-    #[cfg(feature = "pdf")]
+    // 文本与字幕
+    "txt", "srt", "vtt", "ass", "ssa", "md", "markdown", "csv", "html", "htm", "rtf",
+    // PDF
     "pdf",
-    #[cfg(feature = "docx")]
-    "docx",
-    #[cfg(feature = "xlsx")]
-    "xlsx",
-    #[cfg(feature = "pptx")]
-    "pptx",
-    #[cfg(feature = "epub")]
-    "epub",
-    // 通用压缩包走 archive；fb2.zip（内层单 .fb2）由 fb2 后端解包
-    #[cfg(any(feature = "archive", feature = "fb2"))]
-    "zip",
-    #[cfg(feature = "archive")]
-    "rar",
-    "7z",
-    #[cfg(feature = "chm")]
-    "chm",
-    #[cfg(feature = "cbz")]
-    "cbz",
-    #[cfg(feature = "image-files")]
-    "png",
-    "jpg",
-    "jpeg",
-    "webp",
-    "bmp",
-    "tif",
-    "tiff",
-    #[cfg(feature = "fb2")]
-    "fb2",
-    #[cfg(feature = "mobi")]
-    "mobi",
-    "prc",
-    "azw3",
-    #[cfg(feature = "djvu")]
-    "djvu",
-    #[cfg(feature = "odt")]
-    "odt",
-    #[cfg(feature = "ods")]
-    "ods",
-    #[cfg(feature = "odp")]
-    "odp",
+    // 现代 Office（OOXML + 含宏/模板变体）
+    "docx", "docm", "dotx", "dotm",
+    "xlsx", "xlsm", "xltx", "xltm",
+    "pptx", "pptm", "ppsx", "ppsm", "potx", "potm",
+    // 老式二进制 Office（OLE2 / XLSB）
+    "doc", "ppt", "pps", "pot", "xls", "xlsb",
+    // OpenDocument
+    "odt", "ods", "odp",
+    // 电子书与帮助文档
+    "epub", "fb2", "mobi", "prc", "azw3", "chm", "cbz", "djvu",
+    // 压缩包容器
+    "zip", "rar", "7z",
+    // 图像直读
+    "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff",
 ];
 
-fn usage() -> ! {
-    eprintln!(
-        "用法：docforge-cli <输入>... [--format md|json|text|units|chunks] [--ocr auto|on|off] \
-[--out <文件>] [--out-dir <目录>] [--list-formats]\n\
-         输入可为文件或目录（目录递归收集支持格式）；多输入/目录需 --out-dir\n\
-         退出码：0=全部成功 1=参数错误或全部失败 2=部分失败"
-    );
+fn help_text() -> &'static str {
+    "用法：docforge-cli <输入>... [选项]\n\
+\n\
+将任意支持的文档转换为标准 GitHub-Flavored Markdown (GFM) 或 Google Open Knowledge Format (OKF v0.3)。\n\
+\n\
+选项：\n\
+  -f, --format gfm|okf   输出格式（默认 gfm）\n\
+  --okf-type <类型>      OKF frontmatter 的 type 字段（默认 Document）\n\
+  --okf-title <标题>     OKF 单文档标题或 Bundle 根标题\n\
+  -o, --out <文件>       单文件输出路径（默认 stdout）\n\
+  --out-dir <目录>       输出目录（多输入或目录批量时必需；OKF 模式自动生成 index.md 与 assets/）\n\
+  --list-formats         列出支持的所有输入格式\n\
+  -h, --help             显示本帮助\n\
+  -V, --version          显示版本号\n\
+\n\
+退出码：0=全部成功  1=参数错误或全部失败  2=部分失败"
+}
+
+fn usage_err() -> ! {
+    eprintln!("{}", help_text());
     std::process::exit(1);
 }
 
 /// 批量作业：一个待转换文件 + 其在 `--out-dir` 里的相对落点信息。
 struct Job {
-    /// 输入路径（解析直传 + 进度/错误行显示用；PathBuf 保非 UTF-8 文件名）
     input: PathBuf,
-    /// 相对 --out-dir 的子目录（目录输入保持相对其根的子路径；单文件为空）
     rel_dir: PathBuf,
-    /// 输出名主体 = 输入文件名去扩展
     stem: String,
-    /// 原扩展（不含点；无扩展为空串）——同 stem 冲突时拼接去重用
     orig_ext: String,
 }
 
-/// --list-formats：按编译期 cfg 打印当前构建实际支持的输入格式。
-///
-/// 两组：默认（无需额外 feature）/ feature 门控（需 --features 显式开启）。
-/// 静态清单——**新增格式后更新此处**（与 [`SUPPORTED_EXTENSIONS`] 同步维护）。
 fn print_formats() {
-    println!("docforge-cli 支持的输入格式（按当前编译 feature）：\n");
-    println!("[默认]（无需额外 feature）：");
-    println!("  txt              纯文本（恒开，含中文章节切分）");
-    println!("  srt vtt ass ssa  字幕（恒开）");
-    #[cfg(feature = "md")]
-    println!("  md markdown      Markdown（feature md，default 已含）");
-    #[cfg(feature = "csv")]
-    println!("  csv              CSV 表格（feature csv，default 已含）");
-    #[cfg(feature = "html")]
-    println!("  html htm         HTML（feature html，default 已含）");
-    #[cfg(feature = "rtf")]
-    println!("  rtf              RTF（feature rtf，default 已含）");
-    println!("\n[feature 门控]（需 --features 显式开启）：");
-    #[cfg(feature = "pdf")]
-    println!("  pdf              PDF 页级混合路由（feature pdf；OCR 需 +ocr-oar，--ocr 控制模式）");
-    #[cfg(feature = "docx")]
-    println!("  docx             Word（feature docx）");
-    #[cfg(feature = "xlsx")]
-    println!("  xlsx             Excel（feature xlsx）");
-    #[cfg(feature = "pptx")]
-    println!("  pptx             PowerPoint（feature pptx）");
-    #[cfg(feature = "epub")]
-    println!("  epub             EPUB 电子书（feature epub）");
-    #[cfg(feature = "fb2")]
-    println!("  fb2 (+fb2.zip)   FictionBook 电子书（feature fb2）");
-    #[cfg(feature = "mobi")]
-    println!("  mobi prc azw3    Kindle/MOBI7 电子书（feature mobi）");
-    #[cfg(feature = "djvu")]
-    println!("  djvu             DjVu 扫描文档（feature djvu）");
-    #[cfg(feature = "archive")]
-    println!("  zip rar 7z       压缩包容器（feature archive；内层文本多页合并）");
-    #[cfg(all(feature = "fb2", not(feature = "archive")))]
-    println!("  zip（仅 .fb2.zip）压缩包内层 FB2（feature fb2）");
-    #[cfg(feature = "chm")]
-    println!("  chm              CHM 帮助文档（feature chm）");
-    #[cfg(feature = "cbz")]
-    println!("  cbz              漫画压缩包（feature cbz）");
-    #[cfg(feature = "image-files")]
-    println!("  png jpg jpeg webp bmp tif tiff  图像直读（feature image-files）");
-    #[cfg(feature = "odt")]
-    println!("  odt              ODF 文本（feature odt/odf）");
-    #[cfg(feature = "ods")]
-    println!("  ods              ODF 表格（feature ods/odf）");
-    #[cfg(feature = "odp")]
-    println!("  odp              ODF 演示（feature odp/odf）");
-    #[cfg(not(any(
-        feature = "pdf",
-        feature = "docx",
-        feature = "xlsx",
-        feature = "pptx",
-        feature = "epub",
-        feature = "fb2",
-        feature = "mobi",
-        feature = "djvu",
-        feature = "archive",
-        feature = "chm",
-        feature = "cbz",
-        feature = "image-files",
-        feature = "odt",
-        feature = "ods",
-        feature = "odp"
-    )))]
-    println!("  （本构建未启用任何门控格式）");
+    println!("docforge-cli {} 支持的输入格式（全格式已启用）：\n", env!("CARGO_PKG_VERSION"));
+    println!("[文本与标记]");
+    println!("  txt                       纯文本（含自动中文编码探测与章节切分）");
+    println!("  md markdown               Markdown（GFM + frontmatter）");
+    println!("  html htm                  HTML（含 MathML → LaTeX）");
+    println!("  csv                       CSV 表格");
+    println!("  rtf                       RTF（含中文 GBK/CP936）");
+    println!("  srt vtt ass ssa           字幕");
+    println!("\n[Office 文档]");
+    println!("  docx docm dotx dotm       Word OOXML（含 OMML → LaTeX 与样式继承）");
+    println!("  xlsx xlsm xltx xltm       Excel OOXML");
+    println!("  pptx pptm ppsx ppsm potx  PowerPoint OOXML");
+    println!("  doc                       Word 97-2003 二进制");
+    println!("  ppt pps pot               PowerPoint 97-2003 二进制");
+    println!("  xls                       Excel 97-2003 BIFF");
+    println!("  xlsb                      Excel 二进制工作簿");
+    println!("  odt ods odp               OpenDocument（含 MathML → LaTeX）");
+    println!("\n[PDF / 电子书 / 容器 / 图像]");
+    println!("  pdf                       PDF 文字层直提");
+    println!("  epub                      EPUB 电子书（含内嵌图片资产）");
+    println!("  fb2 (+fb2.zip)            FictionBook 电子书");
+    println!("  mobi prc azw3             Kindle MOBI7 / KF8 电子书");
+    println!("  chm                       Microsoft CHM 帮助文档");
+    println!("  djvu                      DjVu 文字层");
+    println!("  cbz                       漫画压缩包");
+    println!("  zip rar 7z                压缩包容器（内层文档多页合并）");
+    println!("  png jpg jpeg webp bmp tif tiff  图像文件");
+    println!("\n[输出格式]");
+    println!("  gfm                       GitHub-Flavored Markdown（默认）");
+    println!("  okf                       Google Open Knowledge Format v0.3（frontmatter + assets/ + index.md）");
 }
 
-/// 装配引擎：文本族恒注册 + 各 feature 后端。`ocr` 仅影响 PDF（需 pdf feature）。
-fn build_engine(ocr: &str) -> docforge::DocumentEngine {
-    #[cfg(not(feature = "pdf"))]
-    let _ = ocr;
+/// 装配全格式引擎：`extract_images` 开启时（OKF 落盘模式）保留内嵌图片字节用于写出 `assets/`。
+fn build_engine(extract_images: bool) -> docforge::DocumentEngine {
     let mut registry = docforge::Registry::new();
     docforge::plugins::text::register_defaults(&mut registry);
-    #[cfg(any(feature = "docx", feature = "pptx", feature = "xlsx"))]
-    docforge::backends::office::register_defaults(&mut registry);
-    #[cfg(feature = "epub")]
-    docforge::backends::epub::register_defaults(&mut registry);
-    #[cfg(feature = "archive")]
+
+    let office_opts = docforge::backends::office::OfficeOptions::new()
+        .with_ocr_images(extract_images);
+    docforge::backends::office::register_with(&mut registry, &office_opts);
+    docforge::backends::legacy_office::register_with_ocr_images(&mut registry, extract_images);
+    docforge::backends::odf::register_defaults(&mut registry);
+    docforge::backends::epub::register_with_ocr_images(&mut registry, extract_images);
     docforge::backends::archive::register_defaults(&mut registry);
-    #[cfg(feature = "chm")]
-    docforge::backends::chm::register_defaults(&mut registry);
-    #[cfg(feature = "cbz")]
+    docforge::backends::chm::register_with_ocr_images(&mut registry, extract_images);
     docforge::backends::cbz::register_defaults(&mut registry);
-    #[cfg(feature = "image-files")]
     docforge::backends::image_files::register_defaults(&mut registry);
-    #[cfg(feature = "fb2")]
-    docforge::backends::fb2::register_defaults(&mut registry);
-    #[cfg(feature = "mobi")]
+    docforge::backends::fb2::register_with_ocr_images(&mut registry, extract_images);
     docforge::backends::mobi::register_defaults(&mut registry);
-    #[cfg(feature = "djvu")]
     docforge::backends::djvu::register(
         &mut registry,
-        docforge::backends::djvu::DjVuOptions {
-            #[cfg(feature = "ocr-oar")]
-            engine: Some(docforge::ocr::oar::OarOcrEngine::shared()),
-            #[cfg(not(feature = "ocr-oar"))]
-            engine: None,
-        },
+        docforge::backends::djvu::DjVuOptions { engine: None },
     );
-    #[cfg(feature = "pdf")]
-    {
-        use docforge::backends::pdf::{OcrMode, PdfOptions};
-        let mode = match ocr {
-            "on" => OcrMode::On,
-            "off" => OcrMode::Off,
-            "auto" => OcrMode::Auto,
-            _ => usage(),
-        };
-        let opts = PdfOptions {
-            mode,
-            #[cfg(feature = "ocr-oar")]
-            engine: Some(docforge::ocr::oar::OarOcrEngine::shared()),
-            #[cfg(not(feature = "ocr-oar"))]
+    docforge::backends::pdf::register(
+        &mut registry,
+        docforge::backends::pdf::PdfOptions {
+            mode: docforge::backends::pdf::OcrMode::Off,
             engine: None,
             ..Default::default()
-        };
-        docforge::backends::pdf::register(&mut registry, opts);
-    }
+        },
+    );
+
     docforge::DocumentEngine::new(registry)
 }
 
-/// 输出扩展名映射：md→.md json→.json text→.txt units/chunks→.jsonl。
-fn format_ext(format: &str) -> &'static str {
-    match format {
-        "md" => "md",
-        "json" => "json",
-        "text" => "txt",
-        "units" | "chunks" => "jsonl",
-        _ => "md", // main 已校验，不可达；兜底不 panic
-    }
-}
+/// OKF 单文件转换：解析 → 生成 OKF Concept（含图片资产）→ 落盘或 stdout。
+fn convert_one_okf(
+    engine: &docforge::DocumentEngine,
+    input: &Path,
+    out_path: Option<&Path>,
+    rel_out_path: Option<String>,
+    okf_type: &str,
+    title_override: Option<&str>,
+) -> Option<docforge::okf::OkfIndexEntry> {
+    let doc = match engine.parse(input) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}: 解析失败：{e}", input.display());
+            return None;
+        }
+    };
+    let source_last_modified = std::fs::metadata(input)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(docforge::okf::format_rfc3339_utc);
+    let asset_prefix = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "doc".to_string());
+    let resource = input
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| input.display().to_string());
 
-/// Document → 目标格式文本。未知格式返回 None（main 已预先校验，双保险）。
-fn render(format: &str, doc: &docforge::Document) -> Option<String> {
-    Some(match format {
-        "md" => docforge::emit::to_markdown(doc),
-        "text" => docforge::emit::to_text(doc),
-        "json" => docforge::emit::to_json_pretty(doc),
-        "units" => {
-            // 翻译单元：每行一个 JSON（JSONL，翻译管线友好）
-            docforge::emit::to_translation_units(doc)
-                .iter()
-                .map(|u| {
-                    serde_json::json!({
-                        "id": u.id,
-                        "page": u.page,
-                        "kind": format!("{:?}", u.kind),
-                        "text": u.text,
-                        "source": format!("{:?}", u.source),
-                        "confidence": u.confidence,
-                        "lang": u.lang,
-                        "chapter": u.chapter,
-                        "header": u.header,
-                        "running": u.running,
-                    })
-                    .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+    let opts = docforge::okf::OkfOptions {
+        concept_type: okf_type.to_string(),
+        title: title_override.map(|s| s.to_string()),
+        resource: Some(resource),
+        asset_prefix: Some(asset_prefix),
+        include_assets: out_path.is_some(),
+        source_last_modified,
+        ..Default::default()
+    };
+    let concept = docforge::okf::to_okf_concept(&doc, &opts);
+
+    match out_path {
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, &concept.markdown) {
+                eprintln!("{}: 写出失败（{}）：{e}", input.display(), p.display());
+                return None;
+            }
+            if !concept.assets.is_empty() {
+                let base_dir = p.parent().unwrap_or(Path::new("."));
+                for asset in &concept.assets {
+                    let asset_target = base_dir.join(&asset.rel_path);
+                    if let Some(parent) = asset_target.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!(
+                                "{}: 创建资产目录失败（{}）：{e}",
+                                input.display(),
+                                parent.display()
+                            );
+                            return None;
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&asset_target, &asset.data) {
+                        eprintln!(
+                            "{}: 写出资产失败（{}）：{e}",
+                            input.display(),
+                            asset_target.display()
+                        );
+                        return None;
+                    }
+                }
+            }
         }
-        "chunks" => {
-            // RAG 检索块：每行一个 JSON（与 units 同形态，喂向量化/检索管线）
-            docforge::emit::to_rag_chunks(doc)
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "id": c.id,
-                        "page": c.page,
-                        "chapter": c.chapter,
-                        "text": c.text,
-                        "block_ids": c.block_ids,
-                    })
-                    .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(stdout, "{}", concept.markdown);
         }
-        _ => return None,
+    }
+
+    Some(docforge::okf::OkfIndexEntry {
+        rel_path: rel_out_path.unwrap_or_default(),
+        title: concept.title,
+        description: concept.description,
+        concept_type: concept.concept_type,
     })
 }
 
-/// 单文件转换：解析 → 按格式 emit → 写 `out_path`（None = stdout）。
-/// 返回是否成功；失败详情已打 stderr（`{input}: 解析失败：…` / `…：写出失败：…`）。
-fn convert_one(
+/// GFM 单文件转换：解析 → `emit::to_gfm` → 写 `out_path`（None = stdout）。
+fn convert_one_gfm(
     engine: &docforge::DocumentEngine,
     input: &Path,
-    format: &str,
     out_path: Option<&Path>,
 ) -> bool {
     let doc = match engine.parse(input) {
@@ -338,10 +251,7 @@ fn convert_one(
             return false;
         }
     };
-    let Some(output) = render(format, &doc) else {
-        eprintln!("{}: 未知格式：{format}（md|json|text|units|chunks）", input.display());
-        return false;
-    };
+    let output = docforge::emit::to_gfm(&doc);
     match out_path {
         Some(p) => match std::fs::write(p, &output) {
             Ok(()) => true,
@@ -358,16 +268,12 @@ fn convert_one(
     }
 }
 
-/// 计算唯一输出文件名：默认 `stem.{输出扩展}`；同 stem 已被本批占用时拼接
-/// 原扩展去重（如 a.md 与 a.txt 同转 md：先到者得 `a.md`，后者得 `a.txt.md`）；
-/// 连拼后仍冲突（如目录里同时有 a.md 与 a.txt.md）加数字后缀兜底。
-/// `claimed` 跨整批共享（键 = rel_dir/name），保证 out_dir 内不互相覆盖。
+/// 计算唯一输出文件名：默认 `stem.md`；同 stem 冲突时拼接原扩展去重，仍冲突加数字后缀。
 fn unique_target(
     claimed: &mut HashSet<String>,
     rel_dir: &Path,
     stem: &str,
     orig_ext: &str,
-    out_ext: &str,
 ) -> String {
     let orig = if orig_ext.is_empty() {
         String::new()
@@ -377,9 +283,9 @@ fn unique_target(
     let mut attempt = 0u32;
     loop {
         let name = match attempt {
-            0 => format!("{stem}.{out_ext}"),
-            1 => format!("{stem}{orig}.{out_ext}"),
-            n => format!("{stem}{orig}_{n}.{out_ext}"),
+            0 => format!("{stem}.md"),
+            1 => format!("{stem}{orig}.md"),
+            n => format!("{stem}{orig}_{n}.md"),
         };
         let key = rel_dir.join(&name).to_string_lossy().into_owned();
         if claimed.insert(key) {
@@ -389,11 +295,8 @@ fn unique_target(
     }
 }
 
-/// 递归收集目录下白名单扩展名的文件。隐藏项（`.` 开头）与 `target/`、
-/// `node_modules/` 跳过；目录符号链接不跟随（`file_type()` 不解引用，
-/// 无限递归免疫）。其余非隐藏文件记入 `pre_failed`（不支持的扩展名，
-/// 批量语义下计为失败而非静默跳过，避免丢文件）。已见路径（跨输入去重）
-/// 记入 `seen`（canonical 路径）。
+/// 递归收集目录下白名单扩展名的文件。隐藏项与 `target/`、`node_modules/` 跳过；
+/// 目录符号链接不跟随；其余非隐藏文件记入 `pre_failed`（不静默丢文件）。
 fn collect_dir(
     root: &Path,
     dir: &Path,
@@ -456,18 +359,15 @@ fn collect_dir(
                 ));
             }
         }
-        // 其余（符号链接等非常规项）：跳过
     }
 }
 
 fn main() {
-    // 参数走 OsString（`args()` 遇非 UTF-8 argv 直接 panic；路径位可能非
-    // UTF-8）。旗标与本 CLI 的字面量恒 ASCII，lossy 视图只用于旗标匹配/显示
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mut inputs: Vec<PathBuf> = Vec::new();
-    let mut format = "md".to_string();
-    #[cfg(feature = "pdf")]
-    let mut ocr = "auto".to_string();
+    let mut format = "gfm".to_string();
+    let mut okf_type = "Document".to_string();
+    let mut okf_title: Option<String> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut list_formats = false;
@@ -476,38 +376,54 @@ fn main() {
     while i < args.len() {
         let view = args[i].to_string_lossy();
         match view.as_ref() {
+            "-h" | "--help" => {
+                println!("{}", help_text());
+                return;
+            }
+            "-V" | "--version" => {
+                println!("docforge-cli {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "--format" | "-f" => {
                 i += 1;
                 format = args
                     .get(i)
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| usage());
+                    .unwrap_or_else(|| usage_err());
             }
-            "--ocr" => {
-                #[cfg(feature = "pdf")]
-                {
-                    i += 1;
-                    ocr = args
-                        .get(i)
+            "--okf-type" => {
+                i += 1;
+                okf_type = args
+                    .get(i)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| usage_err());
+            }
+            "--okf-title" => {
+                i += 1;
+                okf_title = Some(
+                    args.get(i)
                         .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| usage());
-                }
-                #[cfg(not(feature = "pdf"))]
-                {
-                    eprintln!("--ocr 需要 pdf feature");
-                    std::process::exit(1);
-                }
+                        .unwrap_or_else(|| usage_err()),
+                );
             }
             "--out" | "-o" => {
                 i += 1;
-                out_path = args.get(i).map(PathBuf::from);
+                out_path = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| usage_err()),
+                );
             }
             "--out-dir" => {
                 i += 1;
-                out_dir = args.get(i).map(PathBuf::from);
+                out_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| usage_err()),
+                );
             }
             "--list-formats" => list_formats = true,
-            s if s.starts_with('-') => usage(),
+            s if s.starts_with('-') => usage_err(),
             _ => inputs.push(PathBuf::from(&args[i])),
         }
         i += 1;
@@ -519,15 +435,13 @@ fn main() {
     }
 
     if inputs.is_empty() {
-        usage();
+        usage_err();
     }
-    if !matches!(format.as_str(), "md" | "json" | "text" | "units" | "chunks") {
-        eprintln!("未知格式：{format}（md|json|text|units|chunks）");
+    if !matches!(format.as_str(), "gfm" | "okf") {
+        eprintln!("未知输出格式：{format}（仅支持 gfm | okf）");
         std::process::exit(1);
     }
 
-    // 收集批量作业：目录递归（白名单过滤）+ 显式文件（不受白名单过滤，
-    // 兜底按纯文本解析；跨输入按 canonical 路径去重）
     let mut jobs: Vec<Job> = Vec::new();
     let mut pre_failed: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -562,8 +476,6 @@ fn main() {
     }
     jobs.sort_by(|a, b| a.input.cmp(&b.input));
 
-    // 批量判定按输入形态（多输入或含目录），与实际文件数无关：
-    // 目录输入即使只含 1 个文件也是批量（结果落盘而非 stdout）
     let batch = inputs.len() > 1 || any_dir;
     if batch && out_dir.is_none() {
         eprintln!("多输入/目录转换需要 --out-dir <目录>（单文件可 --out 或 stdout）");
@@ -578,17 +490,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    #[cfg(feature = "pdf")]
-    let engine = build_engine(&ocr);
-    #[cfg(not(feature = "pdf"))]
-    let engine = build_engine("");
+    let is_okf = format == "okf";
+    let extract_images = is_okf && (out_dir.is_some() || out_path.is_some());
+    let engine = build_engine(extract_images);
 
     let mut ok = 0usize;
     let mut bad = pre_failed.len();
     for msg in &pre_failed {
         eprintln!("{msg}");
     }
-    let out_ext = format_ext(&format);
 
     if batch {
         let out_root = out_dir.clone().unwrap_or_else(|| PathBuf::from("out"));
@@ -597,11 +507,17 @@ fn main() {
             std::process::exit(1);
         }
         let mut claimed: HashSet<String> = HashSet::new();
+        let mut okf_entries: Vec<docforge::okf::OkfIndexEntry> = Vec::new();
         let total = jobs.len();
         for (idx, job) in jobs.iter().enumerate() {
             eprintln!("[{}/{}] {}", idx + 1, total, job.input.display());
-            let name = unique_target(&mut claimed, &job.rel_dir, &job.stem, &job.orig_ext, out_ext);
-            let target = out_root.join(&job.rel_dir).join(name);
+            let stem = if is_okf {
+                docforge::okf::safe_concept_stem(&job.stem)
+            } else {
+                job.stem.clone()
+            };
+            let name = unique_target(&mut claimed, &job.rel_dir, &stem, &job.orig_ext);
+            let target = out_root.join(&job.rel_dir).join(&name);
             if let Some(parent) = target.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     eprintln!(
@@ -613,23 +529,68 @@ fn main() {
                     continue;
                 }
             }
-            if convert_one(&engine, &job.input, &format, Some(&target)) {
+            if is_okf {
+                let rel_posix = job
+                    .rel_dir
+                    .join(&name)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                match convert_one_okf(
+                    &engine,
+                    &job.input,
+                    Some(&target),
+                    Some(rel_posix),
+                    &okf_type,
+                    None,
+                ) {
+                    Some(entry) => {
+                        okf_entries.push(entry);
+                        ok += 1;
+                    }
+                    None => bad += 1,
+                }
+            } else if convert_one_gfm(&engine, &job.input, Some(&target)) {
                 ok += 1;
             } else {
                 bad += 1;
             }
         }
+        if is_okf && !okf_entries.is_empty() {
+            let bundle_title = okf_title.clone().unwrap_or_else(|| {
+                out_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Knowledge Bundle".to_string())
+            });
+            let bundle_desc = format!(
+                "Knowledge bundle generated by docforge ({} documents).",
+                okf_entries.len()
+            );
+            let indexes =
+                docforge::okf::build_bundle_indexes(&bundle_title, &bundle_desc, &okf_entries);
+            for (rel_idx, content) in indexes {
+                let dest = out_root.join(rel_idx);
+                if let Err(e) = std::fs::write(&dest, content) {
+                    eprintln!("写出 OKF 索引失败（{}）：{e}", dest.display());
+                    bad += 1;
+                }
+            }
+        }
         eprintln!("完成：成功 {ok} / 失败 {bad}");
     } else if let Some(job) = jobs.first() {
-        // 单输入：--out 文件 / --out-dir 目录 / stdout（现状保持）。
-        // jobs 为空（输入不存在，已在 pre_failed 报告）则跳过，落全败退出。
         let target: Option<PathBuf> = if let Some(root) = out_dir.as_ref() {
             if let Err(e) = std::fs::create_dir_all(root) {
                 eprintln!("创建输出目录失败（{}）：{e}", root.display());
                 std::process::exit(1);
             }
             let mut claimed = HashSet::new();
-            let name = unique_target(&mut claimed, Path::new(""), &job.stem, &job.orig_ext, out_ext);
+            let stem = if is_okf {
+                docforge::okf::safe_concept_stem(&job.stem)
+            } else {
+                job.stem.clone()
+            };
+            let name = unique_target(&mut claimed, Path::new(""), &stem, &job.orig_ext);
             Some(root.join(name))
         } else {
             out_path
@@ -642,7 +603,39 @@ fn main() {
                 }
             }
         }
-        if convert_one(&engine, &job.input, &format, target.as_deref()) {
+        if is_okf {
+            let rel_posix = target
+                .as_ref()
+                .and_then(|t| t.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            match convert_one_okf(
+                &engine,
+                &job.input,
+                target.as_deref(),
+                rel_posix,
+                &okf_type,
+                okf_title.as_deref(),
+            ) {
+                Some(entry) => {
+                    if let Some(root) = out_dir.as_ref() {
+                        let bundle_title = okf_title
+                            .clone()
+                            .unwrap_or_else(|| entry.title.clone());
+                        let bundle_desc = entry.description.clone();
+                        let indexes = docforge::okf::build_bundle_indexes(
+                            &bundle_title,
+                            &bundle_desc,
+                            &[entry],
+                        );
+                        for (rel_idx, content) in indexes {
+                            let _ = std::fs::write(root.join(rel_idx), content);
+                        }
+                    }
+                    ok += 1;
+                }
+                None => bad += 1,
+            }
+        } else if convert_one_gfm(&engine, &job.input, target.as_deref()) {
             ok += 1;
         } else {
             bad += 1;
@@ -652,9 +645,9 @@ fn main() {
     let code = if bad == 0 {
         0
     } else if ok == 0 {
-        1 // 全败（含单文件失败）
+        1
     } else {
-        2 // 部分失败
+        2
     };
     std::process::exit(code);
 }

@@ -4,6 +4,8 @@
 
 #[cfg(any(feature = "docx", feature = "pptx", feature = "xlsx"))]
 pub mod office;
+#[cfg(any(feature = "doc", feature = "ppt", feature = "xls", feature = "xlsb"))]
+pub mod legacy_office;
 #[cfg(feature = "epub")]
 pub mod epub;
 

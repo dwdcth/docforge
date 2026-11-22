@@ -303,6 +303,28 @@ impl Collector {
         }
     }
 
+    /// 插入已就绪的 LaTeX 数学片段（不经 HTML 实体二次解码）。
+    fn on_math(&mut self, tex: &str, display: bool) {
+        if self.skip_depth > 0 || tex.is_empty() {
+            return;
+        }
+        if display && self.row.is_none() {
+            self.flush(BlockKind::Paragraph);
+            self.blocks.push(Block {
+                kind: BlockKind::Paragraph,
+                content: format!("$${tex}$$"),
+                ..Default::default()
+            });
+        } else {
+            let inline = format!("${tex}$");
+            if self.row.is_some() {
+                self.cell.push_str(&inline);
+            } else {
+                self.buf.push_str(&inline);
+            }
+        }
+    }
+
     fn finish(mut self) -> Vec<Block> {
         self.flush(BlockKind::Paragraph);
         self.blocks
@@ -325,6 +347,37 @@ pub(crate) fn strip_comments(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// 从 `<math ...>` 之后定位配对的 `</math>` 结束字节偏移（支持嵌套 `<math>`）。
+fn find_math_close(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    let mut depth = 1usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rel = find_tag_end(&text[i..])?;
+        let trimmed = text[i + 1..i + rel].trim();
+        if let Some(close) = trimmed.strip_prefix('/') {
+            if tag_name(close) == "math" {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + rel + 1);
+                }
+            }
+        } else if !trimmed.starts_with('!')
+            && !trimmed.starts_with('?')
+            && !trimmed.ends_with('/')
+            && tag_name(trimmed) == "math"
+        {
+            depth += 1;
+        }
+        i = i + rel + 1;
+    }
+    None
 }
 
 /// 解析 HTML 为块序列（畸形输入尽量降级，不 panic）。
@@ -365,6 +418,16 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
                     if name == "img" {
                         // img 是 void 元素：不进开闭栈，直接产块（修补 ②）
                         collector.on_img(extract_attr(trimmed, "alt"), extract_attr(trimmed, "src"));
+                    } else if name == "math" && !trimmed.ends_with('/') {
+                        if let Some(end_idx) = find_math_close(text, i + rel + 1) {
+                            let slice = &text[i..end_idx];
+                            let (tex, display) = crate::math::mathml_xml_to_tex(slice);
+                            collector.on_math(&tex, display);
+                            i = end_idx;
+                            text_start = i;
+                            continue;
+                        }
+                        collector.start_tag(&name);
                     } else {
                         collector.start_tag(&name);
                     }
@@ -552,5 +615,14 @@ mod m2b_tests {
         assert_eq!(lists[0].ordered, Some(true), "ol 内 li 有序");
         assert_eq!(lists[1].ordered, Some(true));
         assert_eq!(lists[2].ordered, Some(false), "ul 内 li 无序");
+    }
+
+    #[test]
+    fn mathml_inline_and_display_convert_to_latex() {
+        let html = r#"<p>面积 <math><mi>A</mi><mo>=</mo><mi>π</mi><msup><mi>r</mi><mn>2</mn></msup></math> 如下</p><math display="block"><mfrac><mn>1</mn><mn>2</mn></mfrac></math>"#;
+        let blocks = parse_blocks(html);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0].content, r"面积 $A=\pi r^{2}$ 如下");
+        assert_eq!(blocks[1].content, r"$$\frac{1}{2}$$");
     }
 }

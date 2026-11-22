@@ -46,7 +46,6 @@
 //! （两者无稳定 magic 判定口径之外的需求，后端内部再按 magic 复核容器类型）。
 //! 内层全是图片的 zip 会被本后端以 corrupt + 疑似 CBZ 文案拒绝（应走 cbz）。
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -160,8 +159,10 @@ fn collect_zip(
 ) -> Result<()> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))
         .map_err(|e| DocError::corrupt(format!("ZIP 打开失败（非 ZIP）: {e}")))?;
+    crate::limits::check_entry_count(zip.len(), "archive ZIP")?;
+    let mut budget = crate::limits::ByteBudget::archive_default();
     for i in 0..zip.len() {
-        let mut f = zip
+        let f = zip
             .by_index(i)
             .map_err(|e| map_zip_err(e, format!("ZIP 条目 {i} 读取失败")))?;
         if f.is_dir() {
@@ -174,11 +175,7 @@ fn collect_zip(
         let full = format!("{prefix}{name}");
         match classify(&full) {
             c if needs_payload(&c) => {
-                let mut buf = Vec::new();
-                // ZipFile 的 Read 实现返回 io::Error（解密/解码失败在此浮出）
-                f.read_to_end(&mut buf).map_err(|e| {
-                    DocError::corrupt(format!("ZIP 条目 {name} 解压失败: {e}"))
-                })?;
+                let buf = budget.read_entry(f, &name)?;
                 absorb(&c, &full, buf, depth, flat, warns, stats);
             }
             EntryClass::Doc(ext) => {

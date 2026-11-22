@@ -39,9 +39,12 @@ pub mod emit;
 pub mod encoding;
 pub mod engine;
 pub mod error;
+pub mod limits;
+pub mod math;
 pub mod model;
 #[cfg(feature = "ocr")]
 pub mod ocr;
+pub mod okf;
 pub mod plugin;
 pub mod plugins;
 pub mod writeback;
@@ -73,6 +76,10 @@ fn default_registry() -> Registry {
     plugins::text::register_defaults(&mut registry);
     #[cfg(any(feature = "docx", feature = "pptx", feature = "xlsx"))]
     crate::backends::office::register_defaults(&mut registry);
+    #[cfg(any(feature = "doc", feature = "ppt", feature = "xls", feature = "xlsb"))]
+    crate::backends::legacy_office::register_defaults(&mut registry);
+    #[cfg(any(feature = "odt", feature = "ods", feature = "odp"))]
+    crate::backends::odf::register_defaults(&mut registry);
     #[cfg(feature = "epub")]
     crate::backends::epub::register_defaults(&mut registry);
     #[cfg(feature = "archive")]

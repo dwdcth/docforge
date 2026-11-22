@@ -79,6 +79,10 @@ fn fmt_feature_hint(fmt: &str) -> Option<&'static str> {
         "docx" => Some("docx"),
         "xlsx" => Some("xlsx"),
         "pptx" => Some("pptx"),
+        "doc" => Some("doc"),
+        "ppt" => Some("ppt"),
+        "xls" => Some("xls"),
+        "xlsb" => Some("xlsb"),
         "pdf" => Some("pdf"),
         "djvu" => Some("djvu"),
         "epub" => Some("epub"),
@@ -200,9 +204,12 @@ impl DocumentEngine {
                     break;
                 }
                 Err(e) => {
-                    // 终止码不回退：encrypted/unsupported 是确定性结论，
-                    // 不能被兜底后端（如 v1 对加密件的 corrupt）掩盖
-                    if matches!(e.code, ErrorCode::Encrypted | ErrorCode::Unsupported) {
+                    // 终止码不回退：encrypted/unsupported/resource_limit 是确定性结论，
+                    // 不能被兜底后端（如 v1 对加密件或炸弹的 corrupt）掩盖
+                    if matches!(
+                        e.code,
+                        ErrorCode::Encrypted | ErrorCode::Unsupported | ErrorCode::ResourceLimit
+                    ) {
                         return Err(e);
                     }
                     last_err = Some(e);
@@ -455,6 +462,10 @@ mod tests {
             ("docx", Some("docx")),
             ("xlsx", Some("xlsx")),
             ("pptx", Some("pptx")),
+            ("doc", Some("doc")),
+            ("ppt", Some("ppt")),
+            ("xls", Some("xls")),
+            ("xlsb", Some("xlsb")),
             ("pdf", Some("pdf")),
             ("djvu", Some("djvu")),
             ("epub", Some("epub")),

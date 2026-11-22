@@ -75,10 +75,11 @@ impl ParseCapability for PptxRawBackend {
     fn parse(&self, path: &Path) -> Result<RawDoc> {
         let mut zip = super::open_zip(path)?;
 
-        // 全量缓存所有 XML 和 rels 文件，避免 per-slide 多次 ZIP 遍历
+        // 全量缓存所有 XML 和 rels 文件，避免 per-slide 多次 ZIP 遍历（带安全字节预算）
         let mut cache: HashMap<String, String> = HashMap::new();
+        let mut budget = crate::limits::ByteBudget::archive_default();
         for i in 0..zip.len() {
-            let mut f = zip
+            let f = zip
                 .by_index(i)
                 .map_err(|e| DocError::corrupt(format!("ZIP entry error at index {i}: {e}")))?;
             // zip 9：条目名改为 Result<Cow<str>, ZipError>（非法 UTF-8 名不再静默）
@@ -87,9 +88,7 @@ impl ParseCapability for PptxRawBackend {
                 .map_err(|e| DocError::corrupt(format!("ZIP entry name error at index {i}: {e}")))?
                 .to_string();
             if name.ends_with(".xml") || name.ends_with(".rels") {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut f, &mut buf)
-                    .map_err(|e| DocError::corrupt(format!("读取 {name} 失败: {e}")))?;
+                let buf = budget.read_entry(f, &name)?;
                 let s = String::from_utf8(buf)
                     .map_err(|e| DocError::corrupt(format!("{name} 不是 UTF-8: {e}")))?;
                 cache.insert(name, s);

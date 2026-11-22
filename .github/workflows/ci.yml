@@ -41,8 +41,9 @@ jobs:
       fail-fast: false
       matrix:
         feature: [md, csv, html, rtf, encoding, json, lang-detect, pdf, ocr,
-                  docx, xlsx, pptx, epub, fb2, mobi, chm, djvu, cbz,
-                  archive, image-files, odt, ods, odp]
+                  docx, xlsx, pptx, doc, ppt, xls, xlsb, legacy-office,
+                  epub, fb2, mobi, chm, djvu, cbz,
+                  archive, image-files, odt, ods, odp, odf, cli]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

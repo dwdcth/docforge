@@ -61,6 +61,20 @@ odt = ["dep:quick-xml", "dep:zip"]
 ods = ["dep:quick-xml", "dep:zip"]
 odp = ["dep:quick-xml", "dep:zip"]
 odf = ["odt", "ods", "odp"]
+# 老式二进制 Office 家族（firecrawl/anydoc 0.2.5 MIT 源码吸收，4 细粒度 + 聚合）
+doc = ["dep:cfb", "dep:encoding_rs", "dep:flate2", "dep:log"]
+ppt = ["dep:cfb", "dep:encoding_rs", "dep:flate2", "dep:log"]
+xls = ["dep:cfb", "dep:encoding_rs", "dep:flate2", "dep:log"]
+xlsb = ["dep:zip", "dep:encoding_rs", "dep:log"]
+legacy-office = ["doc", "ppt", "xls", "xlsb"]
+# CLI 全格式能力包（纯 Rust 零 C 编译依赖，专注全格式转换 → GFM / Google OKF v0.3）
+cli = [
+    "md", "csv", "html", "rtf",
+    "encoding", "lang-detect",
+    "pdf", "docx", "xlsx", "pptx", "legacy-office", "odf",
+    "epub", "fb2", "mobi", "chm", "cbz", "djvu",
+    "archive", "image-files",
+]
 
 [dependencies.zip]
 version = "9"
@@ -150,6 +164,14 @@ optional = true
 version = "0.8"
 optional = true
 
+[dependencies.cfb]
+version = "0.14"
+optional = true
+
+[dependencies.flate2]
+version = "1"
+optional = true
+
 [[example]]
 name = "pdf_dump"
 path = "examples/pdf_dump.rs"
@@ -158,14 +180,12 @@ required-features = ["pdf"]
 [[bin]]
 name = "docforge-cli"
 path = "src/bin/docforge-cli.rs"
-required-features = ["json"]
+required-features = ["cli"]
 
-# cli 用例的 fixture 是 .md：json 单开（无文本族）时 CLI 无法解析 md——
-# 门控加上 md，该组合下测试整组跳过而不是红（历史审计发现的门控错配）
 [[test]]
 name = "cli_convert"
 path = "tests/cli_convert.rs"
-required-features = ["json", "md"]
+required-features = ["cli"]
 
 # 解析吞吐/内存基准（harness=false：自带 main，不走 libtest；
 # 跑法与数字见 BENCHMARK.md）

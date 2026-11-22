@@ -27,7 +27,6 @@
 //! `encoding` 下用 encoding_rs 解码，未开则 lossy 兜底（对齐 epub 的 `decode_entry`）。
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -785,21 +784,19 @@ fn read_fb2_bytes(path: &Path) -> Result<Vec<u8>> {
 fn fb2_from_zip(bytes: Vec<u8>) -> Result<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
         .map_err(|e| DocError::corrupt(format!("FB2 ZIP 打不开: {e}")))?;
+    crate::limits::check_entry_count(zip.len(), "FB2 ZIP")?;
     for i in 0..zip.len() {
-        let mut entry = zip
+        let entry = zip
             .by_index(i)
             .map_err(|e| DocError::corrupt(format!("FB2 ZIP 条目读取失败: {e}")))?;
         let name = entry
             .name()
-            .map_err(|e| DocError::corrupt(format!("FB2 ZIP 条目名读取失败: {e}")))?;
+            .map_err(|e| DocError::corrupt(format!("FB2 ZIP 条目名读取失败: {e}")))?
+            .to_string();
         if !name.to_ascii_lowercase().ends_with(".fb2") {
             continue;
         }
-        let mut out = Vec::new();
-        entry
-            .read_to_end(&mut out)
-            .map_err(|e| DocError::corrupt(format!("FB2 ZIP 解压失败: {e}")))?;
-        return Ok(out);
+        return crate::limits::read_bounded(entry, crate::limits::MAX_ENTRY_BYTES, &name);
     }
     Err(DocError::corrupt("FB2 ZIP 内未找到 .fb2 条目"))
 }

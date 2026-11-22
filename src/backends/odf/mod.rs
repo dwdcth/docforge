@@ -200,10 +200,8 @@ pub(crate) fn zip_read_str(
     name: &str,
 ) -> Result<Option<String>> {
     match zip.by_name(name) {
-        Ok(mut f) => {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut f, &mut buf)
-                .map_err(|e| DocError::corrupt(format!("读取 {name} 失败: {e}")))?;
+        Ok(f) => {
+            let buf = crate::limits::read_bounded(f, crate::limits::MAX_ENTRY_BYTES, name)?;
             Ok(Some(String::from_utf8(buf).map_err(|e| {
                 DocError::corrupt(format!("{name} 不是 UTF-8: {e}"))
             })?))
@@ -220,6 +218,7 @@ pub(crate) fn read_content_xml(path: &Path) -> Result<String> {
         .map_err(|e| DocError::corrupt(format!("cannot open {}: {e}", path.display())))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| DocError::corrupt(format!("ZIP open failed: {e}")))?;
+    crate::limits::check_entry_count(zip.len(), "ODF ZIP")?;
     zip_read_str(&mut zip, "content.xml")?
         .ok_or_else(|| DocError::corrupt("missing content.xml（不是 ODF 包）"))
 }
@@ -274,6 +273,21 @@ pub(crate) fn text_until<R: std::io::BufRead>(
                 tags::S => out.push_str(&" ".repeat(repeat_of(e, tags::C))),
                 tags::TAB => out.push('\t'),
                 tags::LINE_BREAK => out.push('\n'),
+                "math" => {
+                    let elem = crate::math::xml::capture_from_quick_xml(reader, e)?;
+                    let tex = crate::math::mathml_to_tex(&elem);
+                    if !tex.is_empty() {
+                        if crate::math::mathml_is_display(&elem) {
+                            out.push_str("$$");
+                            out.push_str(&tex);
+                            out.push_str("$$");
+                        } else {
+                            out.push('$');
+                            out.push_str(&tex);
+                            out.push('$');
+                        }
+                    }
+                }
                 _ => depth += 1,
             },
             Ok(Event::Empty(ref e)) => match e.name().local_name().as_ref() {
